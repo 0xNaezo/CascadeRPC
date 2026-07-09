@@ -26,6 +26,7 @@ pub struct RpcNode {
 }
 
 impl RpcClient {
+    #[must_use]
     pub fn new(node_configs: NodeConfigs) -> Self {
         let client = Client::new();
 
@@ -35,6 +36,11 @@ impl RpcClient {
         }
     }
 
+    /// Sends balance requests to all configured nodes in parallel and returns the first successful response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if all nodes fail to respond or return invalid JSON.
     pub async fn post_three_requests(&self, address: String) -> Result<RpcBalanceResponse> {
         info!(address = %address, "fetching balance");
 
@@ -79,6 +85,11 @@ impl RpcClient {
         Err(anyhow::format_err!("all nodes failed"))
     }
 
+    /// Sends a JSON-RPC request to the given URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails.
     pub async fn send_request(client: Client, body: Bytes, url: Url) -> Result<Response> {
         let result = client
             .post(url)
