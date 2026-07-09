@@ -29,9 +29,7 @@ async fn get_balance(
     State(rpc_client): State<RpcClient>,
     Path(address): Path<String>,
 ) -> Result<Json<RpcBalanceResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let client = rpc_client.client.clone();
-
-    let result = rpc_client.post_three_requests(client, address).await;
+    let result = rpc_client.post_three_requests(address).await;
 
     match result {
         Ok(response) => Ok(Json(response)),

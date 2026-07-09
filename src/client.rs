@@ -1,7 +1,9 @@
 use anyhow::Result;
+use bytes::Bytes;
 use reqwest::{Client, Response};
-use serde_json::{Value, json};
+use serde_json::json;
 use tokio::task::JoinSet;
+use tracing::info;
 use url::Url;
 
 use crate::structs::RpcBalanceResponse;
@@ -33,12 +35,8 @@ impl RpcClient {
         }
     }
 
-    pub async fn get_balance(
-        client: Client,
-        address: String, // pass the body, not the address + pass in bytes
-        url: Url,
-    ) -> Result<RpcBalanceResponse> {
-        // TODO: Avoid creating JSON every time. Do it once and convert to bytes
+    pub async fn post_three_requests(&self, address: String) -> Result<RpcBalanceResponse> {
+        info!(address = %address, "fetching balance");
 
         let body = json!({
             "jsonrpc": "2.0",
@@ -47,53 +45,47 @@ impl RpcClient {
             "params": [
                 address
             ]
-        });
+        })
+        .to_string();
 
-        let response: RpcBalanceResponse =
-            Self::send_request(client, body, url).await?.json().await?;
+        let body_bytes = Bytes::from(body);
+        let client = self.client.clone();
+        let nodes = self.node_configs.nodes.clone();
 
-        Ok(response)
-    }
-
-    pub async fn post_three_requests(
-        &self,
-        client: Client,
-        address: String,
-    ) -> Result<RpcBalanceResponse> {
         let mut set = JoinSet::new();
 
-        // immediately collect the request body and convert to bytes
+        for node in nodes {
+            let body = body_bytes.clone();
+            let client = client.clone();
+            set.spawn(async move {
+                tracing::info!("sending request node={}", node.name);
 
-        let urls: Vec<&Url> = self
-            .node_configs
-            .nodes
-            .iter()
-            .map(|node| &node.url)
-            .collect();
+                let result = Self::send_request(client, body, node.url.clone()).await;
 
-        // TODO: Unify logic, avoid two separate variables
-        for url in urls {
-            set.spawn(Self::get_balance(
-                client.clone(),
-                address.clone(),
-                url.clone(),
-            ));
+                (node.name, result)
+            });
         }
 
         while let Some(result) = set.join_next().await {
-            match result {
-                Ok(Ok(response)) => return Ok(response),
-                Ok(Err(_err)) => continue,
-                Err(_err) => continue,
-            };
+            if let Ok((node_name, Ok(response))) = result {
+                let res_struct: RpcBalanceResponse = response.json().await?;
+
+                tracing::info!("got valid response from node={}", node_name);
+
+                return Ok(res_struct);
+            }
         }
 
-        // TODO: Write a proper error message
-        Err(anyhow::format_err!("rastrat"))
+        Err(anyhow::format_err!("all nodes failed"))
     }
 
-    pub async fn send_request(client: Client, body: Value, url: Url) -> Result<Response> {
-        let result = client.post(url).json(&body).send().await?;
+    pub async fn send_request(client: Client, body: Bytes, url: Url) -> Result<Response> {
+        let result = client
+            .post(url)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await?;
 
         Ok(result)
     }
