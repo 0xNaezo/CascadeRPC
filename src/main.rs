@@ -1,5 +1,8 @@
 use anyhow::Result;
-use rpc_load_balancer::client::{NodeConfigs, RpcClient, RpcNode};
+use rpc_load_balancer::{
+    client::{NodeConfigs, RpcClient, RpcNode},
+    server,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -32,11 +35,7 @@ async fn main() -> Result<()> {
     let node_configs = NodeConfigs { nodes };
     let rpc_client = RpcClient::new(node_configs);
 
-    let result = rpc_client
-        .post_three_requests("8hfoNZCd2bK9aqCBkhg8f2L1AoL7qfHwd9tMv7x64qui".to_string())
-        .await?;
-
-    tracing::info!("{result:#?}");
+    server::init_server(rpc_client).await?;
 
     Ok(())
 }

@@ -2,6 +2,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use reqwest::{Client, Response};
 use serde_json::json;
+use std::sync::{Arc, atomic::AtomicU32};
 use tokio::task::JoinSet;
 use tracing::info;
 use url::Url;
@@ -12,6 +13,7 @@ use crate::structs::RpcBalanceResponse;
 pub struct RpcClient {
     pub client: Client,
     pub node_configs: NodeConfigs,
+    pub request_counter: Arc<AtomicU32>,
 }
 
 #[derive(Clone)]
@@ -33,6 +35,7 @@ impl RpcClient {
         Self {
             client,
             node_configs,
+            request_counter: Arc::new(AtomicU32::new(0)),
         }
     }
 
