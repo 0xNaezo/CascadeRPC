@@ -1,6 +1,6 @@
 use std::sync::atomic::Ordering;
 
-use crate::client::RpcClient;
+use crate::client::rpc::RpcClient;
 use axum::{
     Router,
     extract::{Json, State},

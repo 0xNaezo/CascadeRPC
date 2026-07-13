@@ -1,8 +1,5 @@
 use anyhow::Result;
-use rpc_load_balancer::{
-    client::{NodeConfigs, RpcClient},
-    server,
-};
+use rpc_load_balancer::{client::node::NodeConfigs, client::rpc::RpcClient, server};
 
 #[tokio::main]
 async fn main() -> Result<()> {
