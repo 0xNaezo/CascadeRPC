@@ -1,9 +1,21 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bytes::Bytes;
+use governor::{
+    Quota, RateLimiter,
+    clock::{Clock, DefaultClock},
+    middleware::NoOpMiddleware,
+    state::{InMemoryState, NotKeyed},
+};
 use reqwest::{Client, Response};
 use serde_json::json;
-use std::sync::{Arc, atomic::AtomicU32};
-use tokio::task::JoinSet;
+use std::{
+    num::NonZeroU32,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32},
+    },
+};
+use tokio::sync::{Semaphore, SemaphorePermit};
 use tracing::info;
 use url::Url;
 
@@ -21,10 +33,60 @@ pub struct NodeConfigs {
     pub nodes: Vec<RpcNode>,
 }
 
+pub type DefaultDirectRateLimiter<MW = NoOpMiddleware<<DefaultClock as Clock>::Instant>> =
+    RateLimiter<NotKeyed, InMemoryState, DefaultClock, MW>;
+
 #[derive(Clone)]
 pub struct RpcNode {
     pub name: String,
     pub url: Url,
+    pub is_live: Arc<AtomicBool>,
+    pub rate_limiting: Arc<DefaultDirectRateLimiter>,
+    pub concurrency_limiting: Arc<Semaphore>,
+}
+
+impl RpcNode {
+    /// Creates a new `RpcNode`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `rate_limiting` is 0 or `url_str` is not a valid URL.
+    pub fn new(
+        name: String,
+        url_str: &str,
+        rate_limiting: u32,
+        concurrency_limiting: usize,
+    ) -> Result<Self> {
+        let non_zero_rate_limiting = NonZeroU32::new(rate_limiting)
+            .ok_or_else(|| anyhow::anyhow!("Fatal error: RPS for node '{name}' cannot be 0"))?;
+
+        let quota = Quota::per_second(non_zero_rate_limiting);
+        let url = Url::parse(url_str)
+            .with_context(|| format!("Fatal error: invalid URL for node '{name}': {url_str}"))?;
+
+        Ok(Self {
+            name,
+            url,
+            is_live: Arc::new(AtomicBool::new(true)),
+            rate_limiting: Arc::new(RateLimiter::direct(quota)),
+            concurrency_limiting: Arc::new(Semaphore::new(concurrency_limiting)),
+        })
+    }
+
+    /// Acquires concurrency permit and checks rate limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the rate limit is exceeded for this node.
+    pub async fn acquire_and_check(&self) -> Result<SemaphorePermit<'_>> {
+        if self.rate_limiting.check().is_err() {
+            return Err(anyhow::format_err!("Rate limit exceeded for {}", self.name));
+        }
+
+        let permit = self.concurrency_limiting.acquire().await?;
+
+        Ok(permit)
+    }
 }
 
 impl RpcClient {
@@ -39,12 +101,12 @@ impl RpcClient {
         }
     }
 
-    /// Sends balance requests to all configured nodes in parallel and returns the first successful response.
+    /// Sends a balance request with fallback across nodes.
     ///
     /// # Errors
     ///
-    /// Returns an error if all nodes fail to respond or return invalid JSON.
-    pub async fn post_three_requests(&self, address: String) -> Result<RpcBalanceResponse> {
+    /// Returns an error if all RPC nodes fail or exhaust their rate limits.
+    pub async fn send_with_fallback(&self, address: String) -> Result<RpcBalanceResponse> {
         info!(address = %address, "fetching balance");
 
         let body = json!({
@@ -58,34 +120,48 @@ impl RpcClient {
         .to_string();
 
         let body_bytes = Bytes::from(body);
-        let client = self.client.clone();
-        let nodes = self.node_configs.nodes.clone();
 
-        let mut set = JoinSet::new();
+        for node in &self.node_configs.nodes {
+            let _permit = match node.acquire_and_check().await {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!("{}", e);
+                    continue;
+                }
+            };
 
-        for node in nodes {
-            let body = body_bytes.clone();
-            let client = client.clone();
-            set.spawn(async move {
-                tracing::info!("sending request node={}", node.name);
+            tracing::info!("Sending request to {}", node.name);
 
-                let result = Self::send_request(client, body, node.url.clone()).await;
+            let response =
+                match Self::send_request(self.client.clone(), body_bytes.clone(), node.url.clone())
+                    .await
+                {
+                    Ok(res) => res,
+                    Err(e) => {
+                        tracing::error!("Node {} HTTP failed: {e}", node.name);
+                        continue;
+                    }
+                };
 
-                (node.name, result)
-            });
-        }
+            let parse_res: RpcBalanceResponse = match response.json().await {
+                Ok(res) => res,
+                Err(e) => {
+                    tracing::error!("Node {} returned invalid JSON: {e}", node.name);
+                    continue;
+                }
+            };
 
-        while let Some(result) = set.join_next().await {
-            if let Ok((node_name, Ok(response))) = result {
-                let res_struct: RpcBalanceResponse = response.json().await?;
-
-                tracing::info!("got valid response from node={}", node_name);
-
-                return Ok(res_struct);
+            if let Some(err) = parse_res.error {
+                tracing::error!("Node {} returned error: {err:#?}", node.name);
+                continue;
             }
+
+            return Ok(parse_res);
         }
 
-        Err(anyhow::format_err!("all nodes failed"))
+        Err(anyhow::format_err!(
+            "All RPC nodes failed or exhausted rate limits"
+        ))
     }
 
     /// Sends a JSON-RPC request to the given URL.

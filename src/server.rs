@@ -1,10 +1,9 @@
 use std::sync::atomic::Ordering;
 
-use crate::{client::RpcClient, structs::RpcBalanceResponse};
+use crate::client::RpcClient;
 use axum::{
     Router,
-    extract::{Json, Path, State},
-    http::StatusCode,
+    extract::{Json, State},
     response::IntoResponse,
     routing::get,
 };
@@ -25,14 +24,14 @@ pub async fn init_server(rpc_client: RpcClient) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/test-speed", get(test_speed))
-        .route("/get-balance/{address}", get(get_balance))
+        //.route("/get-balance/{address}", get(get_balance))
         .with_state(rpc_client);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
 
     Ok(axum::serve(listener, app).await?)
 }
-
+/*
 async fn get_balance(
     State(rpc_client): State<RpcClient>,
     Path(address): Path<String>,
@@ -50,7 +49,7 @@ async fn get_balance(
         }
     }
 }
-
+*/
 pub async fn test_speed(State(rpc_client): State<RpcClient>) -> Json<serde_json::Value> {
     rpc_client.request_counter.fetch_add(1, Ordering::Relaxed);
 
