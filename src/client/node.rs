@@ -12,6 +12,10 @@ use std::{
 use tokio::sync::{Semaphore, SemaphorePermit};
 use url::Url;
 
+pub struct RoutingTable {
+    pub active_nodes: Vec<Arc<RpcNode>>,
+}
+
 #[derive(Clone)]
 pub struct NodeConfigs {
     pub nodes: Vec<RpcNode>,
@@ -27,6 +31,7 @@ pub struct RpcNode {
     pub is_live: Arc<AtomicBool>,
     pub rate_limiting: Arc<DefaultDirectRateLimiter>,
     pub concurrency_limiting: Arc<Semaphore>,
+    pub tier: u8,
 }
 
 impl RpcNode {
@@ -40,6 +45,7 @@ impl RpcNode {
         url_str: &str,
         rate_limiting: u32,
         concurrency_limiting: usize,
+        tier: u8,
     ) -> Result<Self> {
         let non_zero_rate_limiting = NonZeroU32::new(rate_limiting)
             .ok_or_else(|| anyhow::anyhow!("Fatal error: RPS for node '{name}' cannot be 0"))?;
@@ -54,6 +60,7 @@ impl RpcNode {
             is_live: Arc::new(AtomicBool::new(true)),
             rate_limiting: Arc::new(RateLimiter::direct(quota)),
             concurrency_limiting: Arc::new(Semaphore::new(concurrency_limiting)),
+            tier,
         })
     }
 

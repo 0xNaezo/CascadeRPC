@@ -29,3 +29,15 @@ pub struct BalanceResult {
 pub struct Context {
     pub slot: u64,
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RpcHealthResponse {
+    pub jsonrpc: String,
+    pub id: Value,
+
+    #[serde(default)]
+    pub result: Option<String>,
+
+    #[serde(default)]
+    pub error: Option<RpcError>,
+}

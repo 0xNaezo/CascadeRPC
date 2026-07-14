@@ -17,6 +17,7 @@ axum = "0.8"
 url = "2.5"
 bytes = "1.12"
 governor = "0.10"
+arc-swap = "1.9"
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }

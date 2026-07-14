@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rpc_load_balancer::{client::node::NodeConfigs, client::rpc::RpcClient, server};
+use rpc_load_balancer::{client::rpc::RpcClient, server};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -16,8 +16,7 @@ async fn main() -> Result<()> {
 
     let nodes = vec![];
 
-    let node_configs = NodeConfigs { nodes };
-    let rpc_client = RpcClient::new(node_configs);
+    let rpc_client = RpcClient::new(nodes);
 
     server::init_server(rpc_client).await?;
 

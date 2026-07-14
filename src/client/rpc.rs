@@ -1,4 +1,5 @@
 use anyhow::Result;
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use reqwest::{Client, Response};
 use serde_json::json;
@@ -6,25 +7,30 @@ use std::sync::{Arc, atomic::AtomicU32};
 use tracing::info;
 use url::Url;
 
-use crate::client::node::NodeConfigs;
+use crate::client::node::{RoutingTable, RpcNode};
 
-use crate::structs::RpcBalanceResponse;
+use crate::structs::{RpcBalanceResponse, RpcHealthResponse};
 
 #[derive(Clone)]
 pub struct RpcClient {
     pub client: Client,
-    pub node_configs: NodeConfigs,
+    pub all_nodes: Vec<Arc<RpcNode>>,
+    pub routing_table: Arc<ArcSwap<RoutingTable>>,
     pub request_counter: Arc<AtomicU32>,
 }
 
 impl RpcClient {
     #[must_use]
-    pub fn new(node_configs: NodeConfigs) -> Self {
+    pub fn new(nodes: Vec<RpcNode>) -> Self {
         let client = Client::new();
+        let all_nodes: Vec<Arc<RpcNode>> = nodes.into_iter().map(Arc::new).collect();
 
         Self {
             client,
-            node_configs,
+            routing_table: Arc::new(ArcSwap::from_pointee(RoutingTable {
+                active_nodes: all_nodes.clone(),
+            })),
+            all_nodes,
             request_counter: Arc::new(AtomicU32::new(0)),
         }
     }
@@ -49,7 +55,9 @@ impl RpcClient {
 
         let body_bytes = Bytes::from(body);
 
-        for node in &self.node_configs.nodes {
+        let active_nodes = self.routing_table.load().active_nodes.clone();
+
+        for node in active_nodes {
             let _permit = match node.acquire_and_check().await {
                 Ok(p) => p,
                 Err(e) => {
@@ -106,5 +114,31 @@ impl RpcClient {
             .await?;
 
         Ok(result)
+    }
+
+    pub async fn get_health(&self, node: &RpcNode) -> bool {
+        info!(node = %node.name, "checking node health");
+
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getHealth"
+        })
+        .to_string();
+
+        let body_bytes = Bytes::from(body);
+
+        let Ok(response) =
+            Self::send_request(self.client.clone(), body_bytes, node.url.clone()).await
+        else {
+            return false;
+        };
+
+        let result: RpcHealthResponse = match response.json().await {
+            Ok(result) => result,
+            Err(_) => return false,
+        };
+
+        result.error.is_none() && result.result.as_deref() == Some("ok")
     }
 }
