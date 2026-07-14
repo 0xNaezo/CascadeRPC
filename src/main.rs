@@ -16,7 +16,7 @@ async fn main() -> Result<()> {
 
     let nodes = vec![];
 
-    let rpc_client = RpcClient::new(nodes);
+    let rpc_client = RpcClient::new(nodes)?;
 
     server::init_server(rpc_client).await?;
 

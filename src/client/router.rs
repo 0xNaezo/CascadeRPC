@@ -1,6 +1,9 @@
+use crate::client::node::RpcNode;
 use crate::client::{node::RoutingTable, rpc::RpcClient};
 use arc_swap::ArcSwap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 pub struct LockFreeRouter {
@@ -9,21 +12,33 @@ pub struct LockFreeRouter {
 
 impl LockFreeRouter {
     pub async fn run_healthcheck_loop(rpc_client: &RpcClient) {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
 
-            let mut active_nodes = Vec::new();
-            // не будет ли замедлять выделение памяти
+        loop {
+            interval.tick().await;
+
+            let mut set = JoinSet::new();
+            let client = rpc_client.client.clone();
 
             for node in &rpc_client.all_nodes {
-                if rpc_client.get_health(node).await {
-                    active_nodes.push(Arc::clone(node));
-                } else {
+                let node = node.clone();
+                let client = client.clone();
+
+                set.spawn(async move {
+                    if RpcClient::get_health(client, &node).await {
+                        return Some(node);
+                    }
+
                     warn!("node {} unhealthy", node.name);
-                }
+                    None
+                });
             }
 
-            active_nodes.sort_unstable_by_key(|node| node.tier);
+            let result = set.join_all().await;
+            let mut active_nodes: Vec<Arc<RpcNode>> = result.into_iter().flatten().collect();
+
+            active_nodes
+                .sort_unstable_by_key(|node| (node.tier, node.latency.load(Ordering::Relaxed)));
 
             info!(
                 "healthcheck: {}/{} nodes active",

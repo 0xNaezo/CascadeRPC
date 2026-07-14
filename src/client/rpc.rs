@@ -4,6 +4,7 @@ use bytes::Bytes;
 use reqwest::{Client, Response};
 use serde_json::json;
 use std::sync::{Arc, atomic::AtomicU32};
+use std::time::Duration;
 use tracing::info;
 use url::Url;
 
@@ -20,19 +21,24 @@ pub struct RpcClient {
 }
 
 impl RpcClient {
-    #[must_use]
-    pub fn new(nodes: Vec<RpcNode>) -> Self {
-        let client = Client::new();
+    /// Builds a new [`RpcClient`] with a 2-second HTTP timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying HTTP client cannot be initialized
+    /// (e.g. TLS backend failure).
+    pub fn new(nodes: Vec<RpcNode>) -> Result<Self> {
+        let client = Client::builder().timeout(Duration::new(2, 0)).build()?;
         let all_nodes: Vec<Arc<RpcNode>> = nodes.into_iter().map(Arc::new).collect();
 
-        Self {
+        Ok(Self {
             client,
             routing_table: Arc::new(ArcSwap::from_pointee(RoutingTable {
                 active_nodes: all_nodes.clone(),
             })),
             all_nodes,
             request_counter: Arc::new(AtomicU32::new(0)),
-        }
+        })
     }
 
     /// Sends a balance request with fallback across nodes.
@@ -116,7 +122,7 @@ impl RpcClient {
         Ok(result)
     }
 
-    pub async fn get_health(&self, node: &RpcNode) -> bool {
+    pub async fn get_health(client: Client, node: &RpcNode) -> bool {
         info!(node = %node.name, "checking node health");
 
         let body = json!({
@@ -128,8 +134,7 @@ impl RpcClient {
 
         let body_bytes = Bytes::from(body);
 
-        let Ok(response) =
-            Self::send_request(self.client.clone(), body_bytes, node.url.clone()).await
+        let Ok(response) = Self::send_request(client.clone(), body_bytes, node.url.clone()).await
         else {
             return false;
         };
