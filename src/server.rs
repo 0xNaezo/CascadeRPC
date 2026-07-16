@@ -5,8 +5,10 @@ use axum::{
     Router,
     extract::{Json, State},
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
 };
+use bytes::Bytes;
+use reqwest::StatusCode;
 use serde::Serialize;
 use serde_json::json;
 
@@ -24,22 +26,22 @@ pub async fn init_server(rpc_client: RpcClient) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/test-speed", get(test_speed))
-        //.route("/get-balance/{address}", get(get_balance))
+        .route("/send-request", post(send_request))
         .with_state(rpc_client);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
 
     Ok(axum::serve(listener, app).await?)
 }
-/*
-async fn get_balance(
+
+async fn send_request(
     State(rpc_client): State<RpcClient>,
-    Path(address): Path<String>,
-) -> Result<Json<RpcBalanceResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let result = rpc_client.post_three_requests(address).await;
+    body: Bytes,
+) -> Result<Bytes, (StatusCode, Json<ErrorResponse>)> {
+    let result = rpc_client.send_with_fallback(body).await;
 
     match result {
-        Ok(response) => Ok(Json(response)),
+        Ok(response) => Ok(response),
         Err(err) => {
             let err_struct = ErrorResponse {
                 error: format!("error: {err}"),
@@ -49,7 +51,7 @@ async fn get_balance(
         }
     }
 }
-*/
+
 pub async fn test_speed(State(rpc_client): State<RpcClient>) -> Json<serde_json::Value> {
     rpc_client.request_counter.fetch_add(1, Ordering::Relaxed);
 

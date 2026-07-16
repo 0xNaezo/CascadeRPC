@@ -10,7 +10,7 @@ use url::Url;
 
 use crate::client::node::{RoutingTable, RpcNode};
 
-use crate::structs::{RpcBalanceResponse, RpcHealthResponse};
+use crate::structs::{RpcErrorOnly, RpcHealthResponse};
 
 #[derive(Clone)]
 pub struct RpcClient {
@@ -46,24 +46,12 @@ impl RpcClient {
     /// # Errors
     ///
     /// Returns an error if all RPC nodes fail or exhaust their rate limits.
-    pub async fn send_with_fallback(&self, address: String) -> Result<RpcBalanceResponse> {
-        info!(address = %address, "fetching balance");
+    pub async fn send_with_fallback(&self, body_bytes: Bytes) -> Result<Bytes> {
+        info!("Get request");
 
-        let body = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getBalance",
-            "params": [
-                address
-            ]
-        })
-        .to_string();
+        let active_nodes = self.routing_table.load();
 
-        let body_bytes = Bytes::from(body);
-
-        let active_nodes = self.routing_table.load().active_nodes.clone();
-
-        for node in active_nodes {
+        for node in &active_nodes.active_nodes {
             let _permit = match node.acquire_and_check().await {
                 Ok(p) => p,
                 Err(e) => {
@@ -85,7 +73,15 @@ impl RpcClient {
                     }
                 };
 
-            let parse_res: RpcBalanceResponse = match response.json().await {
+            let parse_byte = match response.bytes().await {
+                Ok(res) => res,
+                Err(e) => {
+                    tracing::error!("Failed to read response body from node {}: {e}", node.name);
+                    continue;
+                }
+            };
+
+            let parse_error: RpcErrorOnly = match serde_json::from_slice(parse_byte.as_ref()) {
                 Ok(res) => res,
                 Err(e) => {
                     tracing::error!("Node {} returned invalid JSON: {e}", node.name);
@@ -93,12 +89,12 @@ impl RpcClient {
                 }
             };
 
-            if let Some(err) = parse_res.error {
+            if let Some(err) = parse_error.error {
                 tracing::error!("Node {} returned error: {err:#?}", node.name);
                 continue;
             }
 
-            return Ok(parse_res);
+            return Ok(parse_byte);
         }
 
         Err(anyhow::format_err!(

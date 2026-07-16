@@ -11,8 +11,9 @@ pub struct LockFreeRouter {
 }
 
 impl LockFreeRouter {
-    pub async fn run_healthcheck_loop(rpc_client: &RpcClient) {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    pub async fn run_healthcheck_loop(rpc_client: RpcClient) {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             interval.tick().await;
