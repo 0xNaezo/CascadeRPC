@@ -31,7 +31,6 @@ pub type DefaultDirectRateLimiter<MW = NoOpMiddleware<<DefaultClock as Clock>::I
 pub struct RpcNode {
     pub name: String,
     pub url: Url,
-    pub is_live: Arc<AtomicBool>,
     pub rate_limiting: Arc<DefaultDirectRateLimiter>,
     pub concurrency_limiting: Arc<Semaphore>,
     pub tier: u8,
@@ -61,7 +60,6 @@ impl RpcNode {
         Ok(Self {
             name,
             url,
-            is_live: Arc::new(AtomicBool::new(true)),
             rate_limiting: Arc::new(RateLimiter::direct(quota)),
             concurrency_limiting: Arc::new(Semaphore::new(concurrency_limiting)),
             tier,
