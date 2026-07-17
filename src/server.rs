@@ -22,14 +22,14 @@ pub struct ErrorResponse {
 /// # Errors
 ///
 /// Returns an error if the TCP listener fails to bind or the server encounters a fatal error.
-pub async fn init_server(rpc_client: RpcClient) -> anyhow::Result<()> {
+pub async fn init_server(rpc_client: RpcClient, port: u16, host: String) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/test-speed", get(test_speed))
         .route("/send-request", post(send_request))
         .with_state(rpc_client);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+    let listener = tokio::net::TcpListener::bind(format!("{host}:{port}")).await?;
 
     Ok(axum::serve(listener, app).await?)
 }

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use rpc_load_balancer::{
     client::{node::RpcNode, router::LockFreeRouter, rpc::RpcClient},
+    config::Settings,
     server,
 };
 
@@ -14,39 +15,21 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let helius_key = std::env::var("HELIUS_API_KEY")?;
-    let alchemy_key = std::env::var("ALCHEMY_API_KEY")?;
+    let config = Settings::load()?;
 
-    let helius = RpcNode::new(
-        "helius".into(),
-        &format!("https://mainnet.heliu----s-rpc.com/?api-key={helius_key}"),
-        100,
-        10,
-        1,
-    )?;
-    let alchemy = RpcNode::new(
-        "alchemy".into(),
-        &format!("https://solana-mainnet.g.alchemy.com/v2/{alchemy_key}"),
-        100,
-        10,
-        1,
-    )?;
+    let server_config = config.server;
 
-    let public_mainnet = RpcNode::new(
-        "public-mainnet".into(),
-        "https://api.mainnet-beta.solana.com",
-        40,
-        5,
-        0,
-    )?;
-
-    let nodes = vec![helius, alchemy, public_mainnet];
+    let nodes: Vec<RpcNode> = config
+        .nodes
+        .into_iter()
+        .map(RpcNode::try_from)
+        .collect::<Result<Vec<RpcNode>, _>>()?;
 
     let rpc_client = RpcClient::new(nodes)?;
 
     tokio::spawn(LockFreeRouter::run_healthcheck_loop(rpc_client.clone()));
 
-    server::init_server(rpc_client).await?;
+    server::init_server(rpc_client, server_config.port, server_config.host).await?;
 
     Ok(())
 }

@@ -18,6 +18,7 @@ url = "2.5"
 bytes = "1.12"
 governor = "0.10"
 arc-swap = "1.9"
+config = { version = "0.15", features = ["toml"] }
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }

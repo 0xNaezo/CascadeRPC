@@ -13,8 +13,8 @@
 
 ### Configuration / operations
 
-- [ ] **Load node config from a file** - nodes are hardcoded in `main.rs` (including a broken Helius URL). Move to TOML/YAML with API keys from env.
-- [ ] **Configurable bind address** - `0.0.0.0:3000` is hardcoded in `server.rs`.
+- [x] **Load node config from a file** - nodes are hardcoded in `main.rs` (including a broken Helius URL). Move to TOML/YAML with API keys from env.
+- [x] **Configurable bind address** - `0.0.0.0:3000` is hardcoded in `server.rs`.
 - [ ] **Graceful shutdown** - handle SIGINT/SIGTERM via `axum::serve(...).with_graceful_shutdown(...)` and stop the health-check task.
 - [ ] **Real `/health` endpoint** - currently always returns `ok`; report the number of active nodes from the routing table and return 503 when it is 0.
 - [ ] **Metrics** - per-node request/error/latency counters (e.g. Prometheus via `axum-prometheus`), replacing the temporary `/test-speed` endpoint.

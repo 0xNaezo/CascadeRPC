@@ -1,0 +1,24 @@
+[server]
+host = "0.0.0.0"
+port = 3000
+
+[[nodes]]
+name = "Helius"
+url = "https://mainnet.helius-rpc.com/?api-key=$HELIUS_API_KEY"
+tier = 1
+rps_limit = 10
+max_concurrent = 4
+
+[[nodes]]
+name = "Alchemy"
+url = "https://solana-mainnet.g.alchemy.com/v2/$ALCHEMY_API_KEY"
+tier = 0
+rps_limit = 20
+max_concurrent = 8
+
+[[nodes]]
+name = "public-mainnet"
+url = "https://api.mainnet-beta.solana.com"
+tier = 2
+rps_limit = 5
+max_concurrent = 2

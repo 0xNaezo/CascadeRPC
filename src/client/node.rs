@@ -7,13 +7,12 @@ use governor::{
 };
 use std::{
     num::NonZeroU32,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU32},
-    },
+    sync::{Arc, atomic::AtomicU32},
 };
 use tokio::sync::{Semaphore, SemaphorePermit};
 use url::Url;
+
+use crate::config::ConfigNode;
 
 pub struct RoutingTable {
     pub active_nodes: Vec<Arc<RpcNode>>,
@@ -80,5 +79,13 @@ impl RpcNode {
         let permit = self.concurrency_limiting.acquire().await?;
 
         Ok(permit)
+    }
+}
+
+impl TryFrom<ConfigNode> for RpcNode {
+    type Error = anyhow::Error;
+
+    fn try_from(n: ConfigNode) -> Result<Self> {
+        Self::new(n.name, &n.url, n.rps_limit, n.max_concurrent, n.tier)
     }
 }
