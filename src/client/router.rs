@@ -26,7 +26,12 @@ impl LockFreeRouter {
                 let client = client.clone();
 
                 set.spawn(async move {
-                    if RpcClient::get_health(client, &node).await {
+                    let (health, latency) = RpcClient::get_health(client, &node).await;
+
+                    node.latency.store(latency, Ordering::Relaxed);
+
+                    if health {
+                        info!("node {} latency: {}ms", node.name, latency);
                         return Some(node);
                     }
 

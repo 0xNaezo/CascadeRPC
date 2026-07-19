@@ -118,7 +118,7 @@ impl RpcClient {
         Ok(result)
     }
 
-    pub async fn get_health(client: Client, node: &RpcNode) -> bool {
+    pub async fn get_health(client: Client, node: &RpcNode) -> (bool, u32) {
         info!(node = %node.name, "checking node health");
 
         let body = json!({
@@ -130,16 +130,23 @@ impl RpcClient {
 
         let body_bytes = Bytes::from(body);
 
+        let start_time = tokio::time::Instant::now();
+
         let Ok(response) = Self::send_request(client.clone(), body_bytes, node.url.clone()).await
         else {
-            return false;
+            return (false, u32::MAX);
         };
+
+        let latency = start_time.elapsed().as_millis() as u32;
 
         let result: RpcHealthResponse = match response.json().await {
             Ok(result) => result,
-            Err(_) => return false,
+            Err(_) => return (false, u32::MAX),
         };
 
-        result.error.is_none() && result.result.as_deref() == Some("ok")
+        (
+            result.error.is_none() && result.result.as_deref() == Some("ok"),
+            latency,
+        )
     }
 }
