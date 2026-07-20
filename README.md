@@ -4,23 +4,19 @@
 
 ### Correctness / reliability
 
-- [x] **Measure latency in health checks** - `node.latency` is never updated (always 0), so the `(tier, latency)` sort in the routing table does nothing. Time the `getHealth` request in `get_health` and store the result in the atomic.
-- [x] **Retry health checks on transient failure** - `get_health` retries up to 3 times with a 1-second interval and a 500 ms per-request timeout. A brief network blip (~3 s) doesn't evict a node. No state is stored between health-check intervals - a node that stays unhealthy for the full retry window is still dropped for the remainder of the 10 s tick. Instead of inter-interval fail counters the (cheaper) per-check retries were chosen after design review.
-- [x] **Empty routing table policy** - if all nodes fail health checks, `send_with_fallback` errors immediately. Decide: fall back to the full node list, or return 503 with Retry-After.
-- [ ] **Rotate the starting node** - every request starts with the first node in the list (best tier), so it hits its rate limit first. Add round-robin / weighted selection within a tier (`request_counter` exists but is unused for this).
-- [x] **Remove or wire up `is_live`** - the `RpcNode::is_live` field is dead code; the routing table already serves that role.
-- [x] **Distinguish retryable JSON-RPC errors** - `send_with_fallback` retries on _any_ `error` in the response, but client errors (e.g. -32602 invalid params) will fail on every node and should be returned to the caller immediately. Only retry server-side errors (e.g. -32005 rate limited).
+- [ ] **Forward upstream errors instead of generic 502** - on a non-retryable HTTP status or JSON-RPC error (e.g. -32602 invalid params), `send_with_fallback` discards the upstream response and returns `anyhow` error text, which the server wraps in a 502. The caller should receive the actual upstream status/body (a JSON-RPC error is a valid 200 response) so clients can see what was wrong with their request.
+- [ ] **Wait instead of skipping when all nodes are rate-limited** - `acquire_and_check` fails fast on the governor check, so a burst that exhausts every node's RPS budget returns "All RPC nodes failed" even though capacity frees up milliseconds later. Consider `until_ready` with a small deadline on the last node, or queueing.
 
 ### Configuration / operations
 
-- [x] **Load node config from a file** - nodes are hardcoded in `main.rs` (including a broken Helius URL). Move to TOML/YAML with API keys from env.
-- [x] **Configurable bind address** - `0.0.0.0:3000` is hardcoded in `server.rs`.
 - [ ] **Graceful shutdown** - handle SIGINT/SIGTERM via `axum::serve(...).with_graceful_shutdown(...)` and stop the health-check task.
-- [ ] **Real `/health` endpoint** - currently always returns `ok`; report the number of active nodes from the routing table and return 503 when it is 0.
+- [ ] **Real `/health` endpoint** - currently always returns `ok`; report the number of active nodes from the routing table and return 503 when it is 0 (or when serving in fail-open mode).
 - [ ] **Metrics** - per-node request/error/latency counters (e.g. Prometheus via `axum-prometheus`), replacing the temporary `/test-speed` endpoint.
+- [ ] **Configurable config path** - `config/config.toml` is hardcoded in `Settings::load`; allow overriding via CLI arg or `CONFIG_PATH` env var.
 
 ### Quality
 
-- [ ] **Tests** - none exist. Minimum: unit tests for `send_with_fallback` (fallback path, rate limiting, all nodes down) and `get_health` against mocks (`wiremock`).
-- [x] **Separate health-check timeout** - checks share the main 2 s client timeout; use a shorter one (500 ms–1 s) so a slow node isn't considered healthy.
-- [ ] **Write a proper README** - document setup, configuration, and endpoints.
+- [ ] **Tests** - none exist. Minimum: unit tests for `send_with_fallback` (fallback path, rate limiting, all nodes down, non-retryable errors), `get_health` against mocks (`wiremock`), and `resolve_env` in `config.rs`.
+- [ ] **Remove dead code** - `NodeConfigs` in `node.rs` is unused; `LockFreeRouter::table` field is never used (the struct only serves as a namespace for `run_healthcheck_loop`).
+- [ ] **Fix stale doc comment** - `init_server` docs still say "Starts the HTTP server on `0.0.0.0:3000`" though host/port are now configurable.
+- [ ] **Write a proper README** - document setup, configuration (config.toml + env vars for API keys), and endpoints.
