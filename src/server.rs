@@ -61,8 +61,56 @@ pub async fn test_speed(State(rpc_client): State<RpcClient>) -> Json<serde_json:
     Json(json!({ "request_count": rpc_client.request_counter.load(Ordering::Relaxed) }))
 }
 
-pub async fn health() -> impl IntoResponse {
-    Json(json!({ "status": "ok" }))
+#[derive(Serialize)]
+struct NodeHealth {
+    name: String,
+    tier: u8,
+    status: &'static str,
+    latency_ms: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct HealthResponse {
+    status: &'static str,
+    active_nodes: usize,
+    total_nodes: usize,
+    nodes: Vec<NodeHealth>,
+}
+
+pub async fn health(State(rpc_client): State<RpcClient>) -> impl IntoResponse {
+    let nodes: Vec<NodeHealth> = rpc_client
+        .all_nodes
+        .iter()
+        .map(|node| {
+            let is_up = node.healthy.load(Ordering::Relaxed);
+            let latency = node.latency.load(Ordering::Relaxed);
+
+            NodeHealth {
+                name: node.name.clone(),
+                tier: node.tier,
+                status: if is_up { "up" } else { "down" },
+                latency_ms: is_up.then_some(latency),
+            }
+        })
+        .collect();
+
+    let active_nodes = nodes.iter().filter(|n| n.status == "up").count();
+    let total_nodes = nodes.len();
+
+    let status = if active_nodes == 0 {
+        "critical"
+    } else if active_nodes < total_nodes {
+        "degraded"
+    } else {
+        "ok"
+    };
+
+    Json(HealthResponse {
+        status,
+        active_nodes,
+        total_nodes,
+        nodes,
+    })
 }
 
 async fn shutdown_signal() {

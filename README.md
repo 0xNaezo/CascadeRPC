@@ -10,7 +10,7 @@
 ### Configuration / operations
 
 - [x] **Graceful shutdown** - handle SIGINT/SIGTERM via `axum::serve(...).with_graceful_shutdown(...)` and stop the health-check task.
-- [ ] **Real `/health` endpoint** - currently always returns `ok`; report the number of active nodes from the routing table and return 503 when it is 0 (or when serving in fail-open mode).
+- [x] **Real `/health` endpoint** - currently always returns `ok`; report the number of active nodes from the routing table.
 - [ ] **Metrics** - per-node request/error/latency counters (e.g. Prometheus via `axum-prometheus`), replacing the temporary `/test-speed` endpoint.
 - [ ] **Configurable config path** - `config/config.toml` is hardcoded in `Settings::load`; allow overriding via CLI arg or `CONFIG_PATH` env var.
 

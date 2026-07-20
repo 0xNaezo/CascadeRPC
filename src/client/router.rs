@@ -29,6 +29,7 @@ impl LockFreeRouter {
                     let (health, latency) = RpcClient::get_health(client, &node).await;
 
                     node.latency.store(latency, Ordering::Relaxed);
+                    node.healthy.store(health, Ordering::Relaxed);
 
                     if health {
                         info!("node {} latency: {}ms", node.name, latency);

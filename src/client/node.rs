@@ -7,7 +7,10 @@ use governor::{
 };
 use std::{
     num::NonZeroU32,
-    sync::{Arc, atomic::AtomicU32},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32},
+    },
 };
 use tokio::sync::{Semaphore, SemaphorePermit};
 use url::Url;
@@ -34,6 +37,7 @@ pub struct RpcNode {
     pub concurrency_limiting: Arc<Semaphore>,
     pub tier: u8,
     pub latency: Arc<AtomicU32>,
+    pub healthy: Arc<AtomicBool>,
 }
 
 impl RpcNode {
@@ -63,6 +67,7 @@ impl RpcNode {
             concurrency_limiting: Arc::new(Semaphore::new(concurrency_limiting)),
             tier,
             latency: Arc::new(AtomicU32::new(0)),
+            healthy: Arc::new(AtomicBool::new(true)),
         })
     }
 
