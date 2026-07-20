@@ -73,6 +73,16 @@ impl RpcClient {
                     }
                 };
 
+            let is_retryable_error = Self::is_retryable_error(&response);
+
+            if !is_retryable_error {
+                return Err(anyhow::format_err!(
+                    "Node {} returned non-retryable HTTP {}",
+                    node.name,
+                    response.status().as_u16()
+                ));
+            }
+
             let parse_byte = match response.bytes().await {
                 Ok(res) => res,
                 Err(e) => {
@@ -89,9 +99,14 @@ impl RpcClient {
                 }
             };
 
-            if let Some(err) = parse_error.error {
-                tracing::error!("Node {} returned error: {err:#?}", node.name);
-                continue;
+            if let Some(err) = parse_error.error
+                && !Self::is_retryable_json_rpc_error(err.code)
+            {
+                return Err(anyhow::format_err!(
+                    "Node {} returned non-retryable JSON-RPC error {}",
+                    node.name,
+                    err.code
+                ));
             }
 
             return Ok(parse_byte);
@@ -116,6 +131,34 @@ impl RpcClient {
             .await?;
 
         Ok(result)
+    }
+
+    // false = не нужно повторять, true - нужно повторять
+    #[must_use]
+    fn is_retryable_error(response: &Response) -> bool {
+        let http_status = response.status().as_u16();
+        let not_retryable = [
+            400, 402, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413, 414, 415, 416,
+            417, 418, 421, 422, 423, 424, 425, 426, 428, 431, 451,
+        ];
+
+        if not_retryable.contains(&http_status) {
+            return false;
+        }
+
+        true
+    }
+
+    // false = не нужно повторять, true - нужно повторять
+    #[must_use]
+    fn is_retryable_json_rpc_error(error_code: i32) -> bool {
+        let not_retryable = [-32700, -32601, -32602, -32600];
+
+        if not_retryable.contains(&error_code) {
+            return false;
+        }
+
+        true
     }
 
     pub async fn get_health(client: Client, node: &RpcNode) -> (bool, u32) {
