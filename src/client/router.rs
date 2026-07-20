@@ -43,6 +43,14 @@ impl LockFreeRouter {
             let result = set.join_all().await;
             let mut active_nodes: Vec<Arc<RpcNode>> = result.into_iter().flatten().collect();
 
+            if active_nodes.is_empty() {
+                tracing::error!(
+                    "CRITICAL: All nodes failed healthcheck! Failing open (fallback to all nodes)."
+                );
+
+                active_nodes.clone_from(&rpc_client.all_nodes);
+            }
+
             active_nodes
                 .sort_unstable_by_key(|node| (node.tier, node.latency.load(Ordering::Relaxed)));
 
