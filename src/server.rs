@@ -11,6 +11,7 @@ use bytes::Bytes;
 use reqwest::StatusCode;
 use serde::Serialize;
 use serde_json::json;
+use tokio::signal;
 
 #[derive(Serialize)]
 pub struct ErrorResponse {
@@ -31,7 +32,9 @@ pub async fn init_server(rpc_client: RpcClient, port: u16, host: String) -> anyh
 
     let listener = tokio::net::TcpListener::bind(format!("{host}:{port}")).await?;
 
-    Ok(axum::serve(listener, app).await?)
+    Ok(axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?)
 }
 
 async fn send_request(
@@ -60,4 +63,38 @@ pub async fn test_speed(State(rpc_client): State<RpcClient>) -> Json<serde_json:
 
 pub async fn health() -> impl IntoResponse {
     Json(json!({ "status": "ok" }))
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(err) = signal::ctrl_c().await {
+            tracing::error!("Failed to install Ctrl+C handler: {}", err);
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(err) => {
+                tracing::error!("Failed to install SIGTERM handler: {}", err);
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {
+            tracing::info!("Received Ctrl+C (SIGINT). Shutting down gracefully...");
+        },
+        () = terminate => {
+            tracing::info!("Received SIGTERM. Shutting down gracefully...");
+        },
+    }
 }
