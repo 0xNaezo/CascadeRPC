@@ -138,8 +138,8 @@ impl RpcClient {
     fn is_retryable_error(response: &Response) -> bool {
         let http_status = response.status().as_u16();
         let not_retryable = [
-            400, 402, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413, 414, 415, 416,
-            417, 418, 421, 422, 423, 424, 425, 426, 428, 431, 451,
+            400, 402, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413, 414, 415, 416, 417, 418,
+            421, 422, 423, 424, 425, 426, 428, 431, 451,
         ];
 
         if not_retryable.contains(&http_status) {
@@ -173,23 +173,36 @@ impl RpcClient {
 
         let body_bytes = Bytes::from(body);
 
-        let start_time = tokio::time::Instant::now();
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        let Ok(response) = Self::send_request(client.clone(), body_bytes, node.url.clone()).await
-        else {
-            return (false, u32::MAX);
-        };
+        for _ in 0..3 {
+            interval.tick().await;
 
-        let latency = start_time.elapsed().as_millis() as u32;
+            let start_time = tokio::time::Instant::now();
 
-        let result: RpcHealthResponse = match response.json().await {
-            Ok(result) => result,
-            Err(_) => return (false, u32::MAX),
-        };
+            let Ok(Ok(response)) = tokio::time::timeout(
+                Duration::from_millis(500),
+                Self::send_request(client.clone(), body_bytes.clone(), node.url.clone()),
+            )
+            .await
+            else {
+                continue;
+            };
+            
+            let latency = start_time.elapsed().as_millis() as u32;
 
-        (
-            result.error.is_none() && result.result.as_deref() == Some("ok"),
-            latency,
-        )
+            let result: RpcHealthResponse = match response.json().await {
+                Ok(result) => result,
+                Err(_) => continue,
+            };
+
+            return (
+                result.error.is_none() && result.result.as_deref() == Some("ok"),
+                latency,
+            );
+        }
+
+        (false, u32::MAX)
     }
 }

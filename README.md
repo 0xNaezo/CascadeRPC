@@ -5,7 +5,7 @@
 ### Correctness / reliability
 
 - [x] **Measure latency in health checks** - `node.latency` is never updated (always 0), so the `(tier, latency)` sort in the routing table does nothing. Time the `getHealth` request in `get_health` and store the result in the atomic.
-- [ ] **Anti-flapping for health checks** - a single failed check currently drops a node for the whole interval. Evict after 2–3 consecutive failures, restore after 1 success (add a `fail_count: AtomicU32` to `RpcNode`).
+- [x] **Retry health checks on transient failure** - `get_health` retries up to 3 times with a 1-second interval and a 500 ms per-request timeout. A brief network blip (~3 s) doesn't evict a node. No state is stored between health-check intervals - a node that stays unhealthy for the full retry window is still dropped for the remainder of the 10 s tick. Instead of inter-interval fail counters the (cheaper) per-check retries were chosen after design review.
 - [ ] **Empty routing table policy** - if all nodes fail health checks, `send_with_fallback` errors immediately. Decide: fall back to the full node list, or return 503 with Retry-After.
 - [ ] **Rotate the starting node** - every request starts with the first node in the list (best tier), so it hits its rate limit first. Add round-robin / weighted selection within a tier (`request_counter` exists but is unused for this).
 - [x] **Remove or wire up `is_live`** - the `RpcNode::is_live` field is dead code; the routing table already serves that role.
@@ -22,5 +22,5 @@
 ### Quality
 
 - [ ] **Tests** - none exist. Minimum: unit tests for `send_with_fallback` (fallback path, rate limiting, all nodes down) and `get_health` against mocks (`wiremock`).
-- [ ] **Separate health-check timeout** - checks share the main 2 s client timeout; use a shorter one (500 ms–1 s) so a slow node isn't considered healthy.
+- [x] **Separate health-check timeout** - checks share the main 2 s client timeout; use a shorter one (500 ms–1 s) so a slow node isn't considered healthy.
 - [ ] **Write a proper README** - document setup, configuration, and endpoints.
