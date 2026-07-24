@@ -1,4 +1,6 @@
-use anyhow::anyhow;
+use std::env;
+
+use anyhow::{Result, anyhow};
 use config::{Config, ConfigError, File};
 use serde::Deserialize;
 use tracing::info;
@@ -15,13 +17,15 @@ impl Settings {
     /// # Errors
     ///
     /// Returns `ConfigError` if the file cannot be read or parsed.
-    pub fn load() -> Result<Self, ConfigError> {
+    pub fn load() -> Result<Self> {
         dotenvy::dotenv().ok();
 
         info!("Loading config from config/config.toml");
 
+        let config_path = env::var("CONFIG_PATH")?;
+
         let config = Config::builder()
-            .add_source(File::with_name("config/config.toml").required(true))
+            .add_source(File::with_name(&config_path).required(true))
             .build()?;
 
         let mut settings: Self = config.try_deserialize()?;
@@ -68,10 +72,9 @@ fn resolve_env(s: &str) -> Result<String, ConfigError> {
             .unwrap_or(rest.len());
         if end > 0 {
             let key = &rest[..end];
-            out.push_str(
-                &std::env::var(key)
-                    .map_err(|_| ConfigError::Foreign(anyhow!("env var {key} is required but not set").into()))?,
-            );
+            out.push_str(&std::env::var(key).map_err(|_| {
+                ConfigError::Foreign(anyhow!("env var {key} is required but not set").into())
+            })?);
             rest = &rest[end..];
         } else {
             out.push('$');
