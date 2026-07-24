@@ -5,7 +5,7 @@
 ### Correctness / reliability
 
 - [ ] **Forward upstream errors instead of generic 502** - on a non-retryable HTTP status or JSON-RPC error (e.g. -32602 invalid params), `send_with_fallback` discards the upstream response and returns `anyhow` error text, which the server wraps in a 502. The caller should receive the actual upstream status/body (a JSON-RPC error is a valid 200 response) so clients can see what was wrong with their request.
-- [ ] **Wait instead of skipping when all nodes are rate-limited** - `acquire_and_check` fails fast on the governor check, so a burst that exhausts every node's RPS budget returns "All RPC nodes failed" even though capacity frees up milliseconds later. Consider `until_ready` with a small deadline on the last node, or queueing.
+- [x] **Wait instead of skipping when all nodes are rate-limited** — `acquire_and_check` fails fast on the governor check, so a burst that exhausts every node's RPS budget returns "All RPC nodes failed" even though capacity frees up milliseconds later. When all nodes fail `acquire_and_check`, collect the minimum `wait_time` from governor's `NotUntil`, sleep for that duration, then retry the full node list. Loop until success, non-retryable error, or 1s outer timeout.
 
 ### Configuration / operations
 

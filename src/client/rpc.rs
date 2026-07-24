@@ -5,6 +5,7 @@ use reqwest::{Client, Response};
 use serde_json::json;
 use std::sync::{Arc, atomic::AtomicU32};
 use std::time::Duration;
+use tokio::time::timeout;
 use tracing::info;
 use url::Url;
 
@@ -49,72 +50,96 @@ impl RpcClient {
     pub async fn send_with_fallback(&self, body_bytes: Bytes) -> Result<Bytes> {
         info!("Get request");
 
-        let active_nodes = self.routing_table.load();
+        let result = timeout(Duration::from_secs(1), async {
+            loop {
+                let active_nodes = self.routing_table.load();
 
-        for node in &active_nodes.active_nodes {
-            let _permit = match node.acquire_and_check().await {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!("{}", e);
-                    continue;
-                }
-            };
+                let mut best_time: Option<Duration> = None;
 
-            tracing::info!("Sending request to {}", node.name);
+                for node in &active_nodes.active_nodes {
+                    let _permit = match node.acquire_and_check().await {
+                        Ok(permit) => permit,
+                        Err(time) => {
+                            best_time =
+                                Some(best_time.map_or(time, |current_best| current_best.min(time)));
 
-            let response =
-                match Self::send_request(self.client.clone(), body_bytes.clone(), node.url.clone())
+                            continue;
+                        }
+                    };
+
+                    tracing::info!("Sending request to {}", node.name);
+
+                    let response = match Self::send_request(
+                        self.client.clone(),
+                        body_bytes.clone(),
+                        node.url.clone(),
+                    )
                     .await
-                {
-                    Ok(res) => res,
-                    Err(e) => {
-                        tracing::error!("Node {} HTTP failed: {e}", node.name);
+                    {
+                        Ok(res) => res,
+                        Err(e) => {
+                            tracing::error!("Node {} HTTP failed: {e}", node.name);
+                            continue;
+                        }
+                    };
+
+                    let is_retryable_error = Self::is_retryable_error(&response);
+
+                    if !is_retryable_error {
+                        return Err(anyhow::format_err!(
+                            "Node {} returned non-retryable HTTP {}",
+                            node.name,
+                            response.status().as_u16()
+                        ));
+                    }
+
+                    let parse_byte = match response.bytes().await {
+                        Ok(res) => res,
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to read response body from node {}: {e}",
+                                node.name
+                            );
+                            continue;
+                        }
+                    };
+
+                    let parse_error: RpcErrorOnly =
+                        match serde_json::from_slice(parse_byte.as_ref()) {
+                            Ok(res) => res,
+                            Err(e) => {
+                                tracing::error!("Node {} returned invalid JSON: {e}", node.name);
+                                continue;
+                            }
+                        };
+
+                    if let Some(err) = parse_error.error {
+                        if !Self::is_retryable_json_rpc_error(err.code) {
+                            return Err(anyhow::format_err!("Client error: {}", err.code));
+                        }
+                        tracing::warn!("Retryable RPC error from {}: {}", node.name, err.code);
                         continue;
                     }
+
+                    return Ok(parse_byte);
+                }
+
+                let Some(best_time) = best_time else {
+                    return Err(anyhow::format_err!(
+                        "All nodes failed with server/network errors (no rate limits to wait for)"
+                    ));
                 };
 
-            let is_retryable_error = Self::is_retryable_error(&response);
-
-            if !is_retryable_error {
-                return Err(anyhow::format_err!(
-                    "Node {} returned non-retryable HTTP {}",
-                    node.name,
-                    response.status().as_u16()
-                ));
+                tokio::time::sleep(best_time).await;
             }
+        })
+        .await;
 
-            let parse_byte = match response.bytes().await {
-                Ok(res) => res,
-                Err(e) => {
-                    tracing::error!("Failed to read response body from node {}: {e}", node.name);
-                    continue;
-                }
-            };
-
-            let parse_error: RpcErrorOnly = match serde_json::from_slice(parse_byte.as_ref()) {
-                Ok(res) => res,
-                Err(e) => {
-                    tracing::error!("Node {} returned invalid JSON: {e}", node.name);
-                    continue;
-                }
-            };
-
-            if let Some(err) = parse_error.error
-                && !Self::is_retryable_json_rpc_error(err.code)
-            {
-                return Err(anyhow::format_err!(
-                    "Node {} returned non-retryable JSON-RPC error {}",
-                    node.name,
-                    err.code
-                ));
-            }
-
-            return Ok(parse_byte);
-        }
-
-        Err(anyhow::format_err!(
-            "All RPC nodes failed or exhausted rate limits"
-        ))
+        result.unwrap_or_else(|_| {
+            Err(anyhow::format_err!(
+                "Global timeout (1s) exceeded while retrying nodes"
+            ))
+        })
     }
 
     /// Sends a JSON-RPC request to the given URL.
@@ -133,7 +158,7 @@ impl RpcClient {
         Ok(result)
     }
 
-    // false = не нужно повторять, true - нужно повторять
+    // ponytail: false = no retry, true = retry
     #[must_use]
     fn is_retryable_error(response: &Response) -> bool {
         let http_status = response.status().as_u16();
@@ -149,7 +174,7 @@ impl RpcClient {
         true
     }
 
-    // false = не нужно повторять, true - нужно повторять
+    // ponytail: false = no retry, true = retry
     #[must_use]
     fn is_retryable_json_rpc_error(error_code: i32) -> bool {
         let not_retryable = [-32700, -32601, -32602, -32600];
@@ -189,7 +214,7 @@ impl RpcClient {
             else {
                 continue;
             };
-            
+
             let latency = start_time.elapsed().as_millis() as u32;
 
             let result: RpcHealthResponse = match response.json().await {

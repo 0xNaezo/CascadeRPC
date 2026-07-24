@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use governor::{
-    Quota, RateLimiter,
-    clock::{Clock, DefaultClock},
+    NotUntil, Quota, RateLimiter,
+    clock::{Clock, DefaultClock, QuantaInstant},
     middleware::NoOpMiddleware,
     state::{InMemoryState, NotKeyed},
 };
@@ -11,6 +11,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU32},
     },
+    time::Duration,
 };
 use tokio::sync::{Semaphore, SemaphorePermit};
 use url::Url;
@@ -76,12 +77,20 @@ impl RpcNode {
     /// # Errors
     ///
     /// Returns an error if the rate limit is exceeded for this node.
-    pub async fn acquire_and_check(&self) -> Result<SemaphorePermit<'_>> {
-        if self.rate_limiting.check().is_err() {
-            return Err(anyhow::format_err!("Rate limit exceeded for {}", self.name));
+    pub async fn acquire_and_check(&self) -> Result<SemaphorePermit<'_>, Duration> {
+        if let Err(err) = self.rate_limiting.check() {
+            let clock = DefaultClock::default();
+
+            let time = err.wait_time_from(clock.now());
+
+            return Err(time);
         }
 
-        let permit = self.concurrency_limiting.acquire().await?;
+        let permit = self
+            .concurrency_limiting
+            .acquire()
+            .await
+            .map_err(|_| Duration::MAX)?;
 
         Ok(permit)
     }
