@@ -18,7 +18,7 @@ pub struct ErrorResponse {
     pub error: String,
 }
 
-/// Starts the HTTP server on `0.0.0.0:3000` and serves RPC endpoints.
+/// Starts the HTTP server on the configured host and port and serves RPC endpoints.
 ///
 /// # Errors
 ///
