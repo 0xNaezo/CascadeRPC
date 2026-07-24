@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use governor::{
-    NotUntil, Quota, RateLimiter,
-    clock::{Clock, DefaultClock, QuantaInstant},
+    Quota, RateLimiter,
+    clock::{Clock, DefaultClock},
     middleware::NoOpMiddleware,
     state::{InMemoryState, NotKeyed},
 };
@@ -21,8 +21,6 @@ use crate::config::ConfigNode;
 pub struct RoutingTable {
     pub active_nodes: Vec<Arc<RpcNode>>,
 }
-
-
 
 pub type DefaultDirectRateLimiter<MW = NoOpMiddleware<<DefaultClock as Clock>::Instant>> =
     RateLimiter<NotKeyed, InMemoryState, DefaultClock, MW>;

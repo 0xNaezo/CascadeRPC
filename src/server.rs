@@ -13,11 +13,6 @@ use serde::Serialize;
 use serde_json::json;
 use tokio::signal;
 
-#[derive(Serialize)]
-pub struct ErrorResponse {
-    pub error: String,
-}
-
 /// Starts the HTTP server on the configured host and port and serves RPC endpoints.
 ///
 /// # Errors
@@ -40,18 +35,10 @@ pub async fn init_server(rpc_client: RpcClient, port: u16, host: String) -> anyh
 async fn send_request(
     State(rpc_client): State<RpcClient>,
     body: Bytes,
-) -> Result<Bytes, (StatusCode, Json<ErrorResponse>)> {
-    let result = rpc_client.send_with_fallback(body).await;
-
-    match result {
-        Ok(response) => Ok(response),
-        Err(err) => {
-            let err_struct = ErrorResponse {
-                error: format!("error: {err}"),
-            };
-
-            Err((StatusCode::BAD_GATEWAY, Json(err_struct)))
-        }
+) -> (StatusCode, Bytes) {
+    match rpc_client.send_with_fallback(body).await {
+        Ok((status, body)) => (status, body),
+        Err(msg) => (StatusCode::BAD_GATEWAY, msg),
     }
 }
 

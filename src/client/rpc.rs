@@ -1,7 +1,7 @@
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use reqwest::{Client, Response};
+use reqwest::{Client, Response, StatusCode};
 use serde_json::json;
 use std::sync::{Arc, atomic::AtomicU32};
 use std::time::Duration;
@@ -47,7 +47,10 @@ impl RpcClient {
     /// # Errors
     ///
     /// Returns an error if all RPC nodes fail or exhaust their rate limits.
-    pub async fn send_with_fallback(&self, body_bytes: Bytes) -> Result<Bytes> {
+    pub async fn send_with_fallback(
+        &self,
+        body_bytes: Bytes,
+    ) -> Result<(StatusCode, Bytes), Bytes> {
         info!("Get request");
 
         let result = timeout(Duration::from_secs(1), async {
@@ -83,14 +86,20 @@ impl RpcClient {
                         }
                     };
 
-                    let is_retryable_error = Self::is_retryable_error(&response);
+                    let status_code = response.status();
+                    let is_retryable_error = Self::is_retryable_error(status_code);
 
                     if !is_retryable_error {
-                        return Err(anyhow::format_err!(
-                            "Node {} returned non-retryable HTTP {}",
-                            node.name,
-                            response.status().as_u16()
-                        ));
+                        match response.bytes().await {
+                            Ok(body) => return Ok((status_code, body)),
+                            Err(e) => {
+                                tracing::error!(
+                                    "Failed to read response body from node {}: {e}",
+                                    node.name
+                                );
+                                continue;
+                            }
+                        }
                     }
 
                     let parse_byte = match response.bytes().await {
@@ -115,18 +124,18 @@ impl RpcClient {
 
                     if let Some(err) = parse_error.error {
                         if !Self::is_retryable_json_rpc_error(err.code) {
-                            return Err(anyhow::format_err!("Client error: {}", err.code));
+                            return Ok((status_code, parse_byte));
                         }
                         tracing::warn!("Retryable RPC error from {}: {}", node.name, err.code);
                         continue;
                     }
 
-                    return Ok(parse_byte);
+                    return Ok((status_code, parse_byte));
                 }
 
                 let Some(best_time) = best_time else {
-                    return Err(anyhow::format_err!(
-                        "All nodes failed with server/network errors (no rate limits to wait for)"
+                    return Err(Bytes::from(
+                        "All nodes failed with server/network errors (no rate limits to wait for)",
                     ));
                 };
 
@@ -136,8 +145,8 @@ impl RpcClient {
         .await;
 
         result.unwrap_or_else(|_| {
-            Err(anyhow::format_err!(
-                "Global timeout (1s) exceeded while retrying nodes"
+            Err(Bytes::from(
+                "Global timeout (1s) exceeded while retrying nodes",
             ))
         })
     }
@@ -160,8 +169,8 @@ impl RpcClient {
 
     // ponytail: false = no retry, true = retry
     #[must_use]
-    fn is_retryable_error(response: &Response) -> bool {
-        let http_status = response.status().as_u16();
+    fn is_retryable_error(error_code: StatusCode) -> bool {
+        let http_status = error_code.as_u16();
         let not_retryable = [
             400, 402, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413, 414, 415, 416, 417, 418,
             421, 422, 423, 424, 425, 426, 428, 431, 451,
