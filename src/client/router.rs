@@ -1,14 +1,11 @@
 use crate::client::node::RpcNode;
 use crate::client::{node::RoutingTable, rpc::RpcClient};
-use arc_swap::ArcSwap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
-pub struct LockFreeRouter {
-    pub table: ArcSwap<RoutingTable>,
-}
+pub struct LockFreeRouter;
 
 impl LockFreeRouter {
     pub async fn run_healthcheck_loop(rpc_client: RpcClient) {

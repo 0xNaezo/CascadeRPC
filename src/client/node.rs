@@ -22,10 +22,7 @@ pub struct RoutingTable {
     pub active_nodes: Vec<Arc<RpcNode>>,
 }
 
-#[derive(Clone)]
-pub struct NodeConfigs {
-    pub nodes: Vec<RpcNode>,
-}
+
 
 pub type DefaultDirectRateLimiter<MW = NoOpMiddleware<<DefaultClock as Clock>::Instant>> =
     RateLimiter<NotKeyed, InMemoryState, DefaultClock, MW>;

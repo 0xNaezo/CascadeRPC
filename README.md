@@ -17,6 +17,6 @@
 ### Quality
 
 - [ ] **Tests** - none exist. Minimum: unit tests for `send_with_fallback` (fallback path, rate limiting, all nodes down, non-retryable errors), `get_health` against mocks (`wiremock`), and `resolve_env` in `config.rs`.
-- [ ] **Remove dead code** - `NodeConfigs` in `node.rs` is unused; `LockFreeRouter::table` field is never used (the struct only serves as a namespace for `run_healthcheck_loop`).
+- [x] **Remove dead code** - `NodeConfigs` in `node.rs` is unused; `LockFreeRouter::table` field is never used (the struct only serves as a namespace for `run_healthcheck_loop`).
 - [x] **Fix stale doc comment** - `init_server` docs still say "Starts the HTTP server on `0.0.0.0:3000`" though host/port are now configurable.
 - [ ] **Write a proper README** - document setup, configuration (config.toml + env vars for API keys), and endpoints.
