@@ -45,10 +45,16 @@ impl Settings {
     }
 }
 
+const fn default_enable_metrics() -> bool {
+    true
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct ServerSettings {
     pub port: u16,
     pub host: String,
+    #[serde(default = "default_enable_metrics")]
+    pub enable_metrics: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
