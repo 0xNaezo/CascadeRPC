@@ -1,5 +1,6 @@
 use crate::client::node::RpcNode;
 use crate::client::{node::RoutingTable, rpc::RpcClient};
+use metrics::gauge;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::task::JoinSet;
@@ -27,6 +28,13 @@ impl LockFreeRouter {
 
                     node.latency.store(latency, Ordering::Relaxed);
                     node.healthy.store(health, Ordering::Relaxed);
+                    gauge!(
+                        description: "Whether an RPC node passed its latest healthcheck",
+                        "rpc_node_healthy",
+                        "node" => node.name.clone(),
+                        "tier" => node.tier.to_string(),
+                    )
+                    .set(if health { 1.0 } else { 0.0 });
 
                     if health {
                         info!("node {} latency: {}ms", node.name, latency);
@@ -40,6 +48,13 @@ impl LockFreeRouter {
 
             let result = set.join_all().await;
             let mut active_nodes: Vec<Arc<RpcNode>> = result.into_iter().flatten().collect();
+            let healthy_nodes = active_nodes.len();
+
+            gauge!(
+                description: "Number of RPC nodes that passed the latest healthcheck",
+                "rpc_healthy_nodes",
+            )
+            .set(u32::try_from(healthy_nodes).unwrap_or(u32::MAX));
 
             if active_nodes.is_empty() {
                 tracing::error!(

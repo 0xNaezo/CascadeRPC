@@ -24,6 +24,8 @@ bytes = "1.12"
 governor = "0.10"
 arc-swap = "1.9"
 config = { version = "0.15", features = ["toml"] }
+metrics = "0.24.6"
+metrics-exporter-prometheus = "0.18.3"
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }

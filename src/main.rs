@@ -29,7 +29,13 @@ async fn main() -> Result<()> {
 
     tokio::spawn(LockFreeRouter::run_healthcheck_loop(rpc_client.clone()));
 
-    server::init_server(rpc_client, server_config.port, server_config.host).await?;
+    server::init_server(
+        rpc_client,
+        server_config.port,
+        server_config.host,
+        server_config.enable_metrics,
+    )
+    .await?;
 
     Ok(())
 }

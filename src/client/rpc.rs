@@ -1,11 +1,12 @@
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
+use metrics::{Unit, counter, histogram};
 use reqwest::{Client, Response, StatusCode};
 use serde_json::json;
 use std::sync::{Arc, atomic::AtomicU32};
 use std::time::Duration;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout};
 use tracing::info;
 use url::Url;
 
@@ -53,6 +54,8 @@ impl RpcClient {
     ) -> Result<(StatusCode, Bytes), Bytes> {
         info!("Get request");
 
+        let request_started = Instant::now();
+
         let result = timeout(Duration::from_secs(1), async {
             loop {
                 let active_nodes = self.routing_table.load();
@@ -63,6 +66,7 @@ impl RpcClient {
                     let _permit = match node.acquire_and_check().await {
                         Ok(permit) => permit,
                         Err(time) => {
+                            Self::record_upstream(node, "rate_limit", 0.0);
                             best_time =
                                 Some(best_time.map_or(time, |current_best| current_best.min(time)));
 
@@ -71,6 +75,7 @@ impl RpcClient {
                     };
 
                     tracing::info!("Sending request to {}", node.name);
+                    let started = Instant::now();
 
                     let response = match Self::send_request(
                         self.client.clone(),
@@ -81,6 +86,11 @@ impl RpcClient {
                     {
                         Ok(res) => res,
                         Err(e) => {
+                            Self::record_upstream(
+                                node,
+                                "transport_error",
+                                started.elapsed().as_secs_f64(),
+                            );
                             tracing::error!("Node {} HTTP failed: {e}", node.name);
                             continue;
                         }
@@ -91,8 +101,20 @@ impl RpcClient {
 
                     if !is_retryable_error {
                         match response.bytes().await {
-                            Ok(body) => return Ok((status_code, body)),
+                            Ok(body) => {
+                                Self::record_upstream(
+                                    node,
+                                    "forwarded_http_error",
+                                    started.elapsed().as_secs_f64(),
+                                );
+                                return Ok((status_code, body));
+                            }
                             Err(e) => {
+                                Self::record_upstream(
+                                    node,
+                                    "body_error",
+                                    started.elapsed().as_secs_f64(),
+                                );
                                 tracing::error!(
                                     "Failed to read response body from node {}: {e}",
                                     node.name
@@ -105,6 +127,11 @@ impl RpcClient {
                     let parse_byte = match response.bytes().await {
                         Ok(res) => res,
                         Err(e) => {
+                            Self::record_upstream(
+                                node,
+                                "body_error",
+                                started.elapsed().as_secs_f64(),
+                            );
                             tracing::error!(
                                 "Failed to read response body from node {}: {e}",
                                 node.name
@@ -117,6 +144,11 @@ impl RpcClient {
                         match serde_json::from_slice(parse_byte.as_ref()) {
                             Ok(res) => res,
                             Err(e) => {
+                                Self::record_upstream(
+                                    node,
+                                    "invalid_json",
+                                    started.elapsed().as_secs_f64(),
+                                );
                                 tracing::error!("Node {} returned invalid JSON: {e}", node.name);
                                 continue;
                             }
@@ -124,12 +156,29 @@ impl RpcClient {
 
                     if let Some(err) = parse_error.error {
                         if !Self::is_retryable_json_rpc_error(err.code) {
+                            Self::record_upstream(
+                                node,
+                                "forwarded_rpc_error",
+                                started.elapsed().as_secs_f64(),
+                            );
                             return Ok((status_code, parse_byte));
                         }
+
+                        Self::record_upstream(
+                            node,
+                            "retryable_rpc_error",
+                            started.elapsed().as_secs_f64(),
+                        );
                         tracing::warn!("Retryable RPC error from {}: {}", node.name, err.code);
                         continue;
                     }
 
+                    let outcome = if status_code.is_success() {
+                        "success"
+                    } else {
+                        "forwarded_http_error"
+                    };
+                    Self::record_upstream(node, outcome, started.elapsed().as_secs_f64());
                     return Ok((status_code, parse_byte));
                 }
 
@@ -144,11 +193,50 @@ impl RpcClient {
         })
         .await;
 
-        result.unwrap_or_else(|_| {
-            Err(Bytes::from(
-                "Global timeout (1s) exceeded while retrying nodes",
-            ))
-        })
+        let (result, outcome) = match result {
+            Ok(Ok(response)) => (Ok(response), "forwarded"),
+            Ok(Err(message)) => (Err(message), "bad_gateway"),
+            Err(_) => (
+                Err(Bytes::from(
+                    "Global timeout (1s) exceeded while retrying nodes",
+                )),
+                "timeout",
+            ),
+        };
+
+        counter!(
+            description: "Client requests handled by the RPC load balancer",
+            "rpc_requests",
+            "outcome" => outcome,
+        )
+        .increment(1);
+        histogram!(
+            description: "End-to-end RPC load balancer request duration",
+            unit: Unit::Seconds,
+            "rpc_request_duration",
+            "outcome" => outcome,
+        )
+        .record(request_started.elapsed().as_secs_f64());
+
+        result
+    }
+
+    fn record_upstream(node: &RpcNode, outcome: &'static str, duration_seconds: f64) {
+        counter!(
+            description: "Attempts sent to upstream RPC nodes",
+            "rpc_upstream_attempts",
+            "node" => node.name.clone(),
+            "outcome" => outcome,
+        )
+        .increment(1);
+        histogram!(
+            description: "Upstream RPC attempt duration",
+            unit: Unit::Seconds,
+            "rpc_upstream_duration",
+            "node" => node.name.clone(),
+            "outcome" => outcome,
+        )
+        .record(duration_seconds);
     }
 
     /// Sends a JSON-RPC request to the given URL.

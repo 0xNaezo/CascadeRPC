@@ -8,6 +8,7 @@ use axum::{
     routing::{get, post},
 };
 use bytes::Bytes;
+use metrics_exporter_prometheus::PrometheusBuilder;
 use reqwest::StatusCode;
 use serde::Serialize;
 use serde_json::json;
@@ -18,12 +19,29 @@ use tokio::signal;
 /// # Errors
 ///
 /// Returns an error if the TCP listener fails to bind or the server encounters a fatal error.
-pub async fn init_server(rpc_client: RpcClient, port: u16, host: String) -> anyhow::Result<()> {
-    let app = Router::new()
+pub async fn init_server(
+    rpc_client: RpcClient,
+    port: u16,
+    host: String,
+    enable_metrics: bool,
+) -> anyhow::Result<()> {
+    let mut app = Router::new()
         .route("/health", get(health))
         .route("/test-speed", get(test_speed))
         .route("/send-request", post(send_request))
         .with_state(rpc_client);
+
+    if enable_metrics {
+        let builder = PrometheusBuilder::new().with_recommended_naming(true);
+        let handle = builder.install_recorder()?;
+        app = app.route(
+            "/metrics",
+            get(move || {
+                let handle = handle.clone();
+                async move { handle.render() }
+            }),
+        );
+    }
 
     let listener = tokio::net::TcpListener::bind(format!("{host}:{port}")).await?;
 
@@ -32,10 +50,7 @@ pub async fn init_server(rpc_client: RpcClient, port: u16, host: String) -> anyh
         .await?)
 }
 
-async fn send_request(
-    State(rpc_client): State<RpcClient>,
-    body: Bytes,
-) -> (StatusCode, Bytes) {
+async fn send_request(State(rpc_client): State<RpcClient>, body: Bytes) -> (StatusCode, Bytes) {
     match rpc_client.send_with_fallback(body).await {
         Ok((status, body)) => (status, body),
         Err(msg) => (StatusCode::BAD_GATEWAY, msg),
