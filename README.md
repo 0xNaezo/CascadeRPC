@@ -11,7 +11,7 @@
 
 - [x] **Graceful shutdown** - handle SIGINT/SIGTERM via `axum::serve(...).with_graceful_shutdown(...)` and stop the health-check task.
 - [x] **Real `/health` endpoint** - currently always returns `ok`; report the number of active nodes from the routing table.
-- [ ] **Metrics** - per-node request/error/latency counters (e.g. Prometheus via `axum-prometheus`), replacing the temporary `/test-speed` endpoint.
+- [x] **Metrics** - Prometheus request, upstream, latency, and node-health metrics exposed through `/metrics`; local Prometheus and Grafana configuration lives in `monitoring/`.
 - [x] **Configurable config path** - `config/config.toml` is hardcoded in `Settings::load`; allow overriding via CLI arg or `CONFIG_PATH` env var.
 
 ### Quality
