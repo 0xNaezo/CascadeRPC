@@ -4,7 +4,7 @@ use bytes::Bytes;
 use metrics::{Unit, counter, histogram};
 use reqwest::{Client, Response, StatusCode};
 use serde_json::json;
-use std::sync::{Arc, atomic::AtomicU32};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{Instant, timeout};
 use tracing::info;
@@ -19,7 +19,6 @@ pub struct RpcClient {
     pub client: Client,
     pub all_nodes: Vec<Arc<RpcNode>>,
     pub routing_table: Arc<ArcSwap<RoutingTable>>,
-    pub request_counter: Arc<AtomicU32>,
 }
 
 impl RpcClient {
@@ -39,7 +38,6 @@ impl RpcClient {
                 active_nodes: all_nodes.clone(),
             })),
             all_nodes,
-            request_counter: Arc::new(AtomicU32::new(0)),
         })
     }
 

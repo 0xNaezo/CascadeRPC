@@ -11,7 +11,6 @@ use bytes::Bytes;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use reqwest::StatusCode;
 use serde::Serialize;
-use serde_json::json;
 use tokio::signal;
 
 /// Starts the HTTP server on the configured host and port and serves RPC endpoints.
@@ -27,7 +26,6 @@ pub async fn init_server(
 ) -> anyhow::Result<()> {
     let mut app = Router::new()
         .route("/health", get(health))
-        .route("/test-speed", get(test_speed))
         .route("/send-request", post(send_request))
         .with_state(rpc_client);
 
@@ -55,12 +53,6 @@ async fn send_request(State(rpc_client): State<RpcClient>, body: Bytes) -> (Stat
         Ok((status, body)) => (status, body),
         Err(msg) => (StatusCode::BAD_GATEWAY, msg),
     }
-}
-
-pub async fn test_speed(State(rpc_client): State<RpcClient>) -> Json<serde_json::Value> {
-    rpc_client.request_counter.fetch_add(1, Ordering::Relaxed);
-
-    Json(json!({ "request_count": rpc_client.request_counter.load(Ordering::Relaxed) }))
 }
 
 #[derive(Serialize)]
