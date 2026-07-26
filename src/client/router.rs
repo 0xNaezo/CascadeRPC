@@ -1,6 +1,6 @@
 use crate::client::node::RpcNode;
 use crate::client::{node::RoutingTable, rpc::RpcClient};
-use metrics::gauge;
+use metrics::{Unit, gauge, histogram};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::task::JoinSet;
@@ -24,7 +24,18 @@ impl LockFreeRouter {
                 let client = client.clone();
 
                 set.spawn(async move {
+                    let started = tokio::time::Instant::now();
                     let (health, latency) = RpcClient::get_health(client, &node).await;
+                    let outcome = if health { "healthy" } else { "unhealthy" };
+
+                    histogram!(
+                        description: "Time spent completing an RPC node healthcheck",
+                        unit: Unit::Seconds,
+                        "rpc_healthcheck_duration",
+                        "node" => node.name.clone(),
+                        "outcome" => outcome,
+                    )
+                    .record(started.elapsed().as_secs_f64());
 
                     node.latency.store(latency, Ordering::Relaxed);
                     node.healthy.store(health, Ordering::Relaxed);
