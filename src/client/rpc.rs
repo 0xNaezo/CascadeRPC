@@ -1,7 +1,7 @@
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use metrics::{Unit, counter, histogram};
+use metrics::{Unit, counter, gauge, histogram};
 use reqwest::{Client, Response, StatusCode};
 use serde_json::json;
 use std::sync::Arc;
@@ -186,7 +186,13 @@ impl RpcClient {
                     ));
                 };
 
+                let sleep_queue_size = gauge!(
+                    description: "Number of requests currently sleeping while all RPC nodes are rate-limited",
+                    "rpc_sleep_queue_size"
+                );
+                sleep_queue_size.increment(1);
                 tokio::time::sleep(best_time).await;
+                sleep_queue_size.decrement(1);
             }
         })
         .await;
