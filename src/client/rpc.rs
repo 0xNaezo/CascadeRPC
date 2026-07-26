@@ -7,7 +7,7 @@ use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{Instant, timeout};
-use tracing::info;
+use tracing::{debug, trace};
 use url::Url;
 
 use crate::client::node::{RoutingTable, RpcNode};
@@ -65,8 +65,6 @@ impl RpcClient {
         &self,
         body_bytes: Bytes,
     ) -> Result<(StatusCode, Bytes), Bytes> {
-        info!("Get request");
-
         let request_started = Instant::now();
 
         let result = timeout(Duration::from_secs(1), async {
@@ -87,7 +85,7 @@ impl RpcClient {
                         }
                     };
 
-                    tracing::info!("Sending request to {}", node.name);
+                    trace!(node = %node.name, "sending request");
                     let started = Instant::now();
 
                     let response = match Self::send_request(
@@ -104,7 +102,7 @@ impl RpcClient {
                                 "transport_error",
                                 started.elapsed().as_secs_f64(),
                             );
-                            tracing::error!("Node {} HTTP failed: {e}", node.name);
+                            debug!(node = %node.name, error = %e, "upstream HTTP request failed");
                             continue;
                         }
                     };
@@ -128,9 +126,10 @@ impl RpcClient {
                                     "body_error",
                                     started.elapsed().as_secs_f64(),
                                 );
-                                tracing::error!(
-                                    "Failed to read response body from node {}: {e}",
-                                    node.name
+                                debug!(
+                                    node = %node.name,
+                                    error = %e,
+                                    "failed to read upstream response body"
                                 );
                                 continue;
                             }
@@ -145,9 +144,10 @@ impl RpcClient {
                                 "body_error",
                                 started.elapsed().as_secs_f64(),
                             );
-                            tracing::error!(
-                                "Failed to read response body from node {}: {e}",
-                                node.name
+                            debug!(
+                                node = %node.name,
+                                error = %e,
+                                "failed to read upstream response body"
                             );
                             continue;
                         }
@@ -162,7 +162,11 @@ impl RpcClient {
                                     "invalid_json",
                                     started.elapsed().as_secs_f64(),
                                 );
-                                tracing::error!("Node {} returned invalid JSON: {e}", node.name);
+                                debug!(
+                                    node = %node.name,
+                                    error = %e,
+                                    "upstream returned invalid JSON"
+                                );
                                 continue;
                             }
                         };
@@ -182,7 +186,11 @@ impl RpcClient {
                             "retryable_rpc_error",
                             started.elapsed().as_secs_f64(),
                         );
-                        tracing::warn!("Retryable RPC error from {}: {}", node.name, err.code);
+                        debug!(
+                            node = %node.name,
+                            code = err.code,
+                            "upstream returned retryable RPC error"
+                        );
                         continue;
                     }
 
@@ -301,7 +309,7 @@ impl RpcClient {
     }
 
     pub async fn get_health(client: Client, node: &RpcNode) -> (bool, u32) {
-        info!(node = %node.name, "checking node health");
+        debug!(node = %node.name, "checking node health");
 
         let body = json!({
             "jsonrpc": "2.0",
