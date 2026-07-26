@@ -1,0 +1,48 @@
+# Use with mock_node binary for load-balancer stress testing.
+# Run: CONFIG_PATH=config/mock_nodes.toml cargo run --release
+[server]
+host = "0.0.0.0"
+port = 3000
+enable_metrics = true
+
+[[nodes]]
+name = "Helius-1"
+url = "http://127.0.0.1:8891"
+tier = 0
+rps_limit = 30000
+max_concurrent = 10000
+
+[[nodes]]
+name = "Helius-2"
+url = "http://127.0.0.1:8892"
+tier = 0
+rps_limit = 30000
+max_concurrent = 10000
+
+[[nodes]]
+name = "Alchemy-1"
+url = "http://127.0.0.1:8893"
+tier = 1
+rps_limit = 25000
+max_concurrent = 7500
+
+[[nodes]]
+name = "Alchemy-2"
+url = "http://127.0.0.1:8894"
+tier = 1
+rps_limit = 25000
+max_concurrent = 7500
+
+[[nodes]]
+name = "Triton-1"
+url = "http://127.0.0.1:8895"
+tier = 2
+rps_limit = 20000
+max_concurrent = 5000
+
+[[nodes]]
+name = "public-mirror"
+url = "http://127.0.0.1:8896"
+tier = 2
+rps_limit = 15000
+max_concurrent = 4000
