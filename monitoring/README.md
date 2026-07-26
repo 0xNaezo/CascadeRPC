@@ -13,23 +13,16 @@ CONFIG_PATH=config/config.toml cargo run --release
 ```
 
 Set any API-key environment variables referenced by `config/config.toml` before
-starting the process. Keep `server.enable_metrics = true`.
+starting the process. Metrics are disabled by default for security; set `server.enable_metrics = true` only behind an internal network boundary.
 
-In another terminal, start monitoring:
+In another terminal, start monitoring (a strong `GRAFANA_ADMIN_PASSWORD` is required):
 
 ```bash
-docker compose -f monitoring/docker-compose.yml up -d
+GRAFANA_ADMIN_PASSWORD=<your-password> docker compose -f monitoring/docker-compose.yml up -d
 ```
 
 - Prometheus: <http://localhost:9090>
 - Grafana: <http://localhost:3001>
-- Grafana login: `admin` / `admin`
-
-Override the local Grafana password when needed:
-
-```bash
-GRAFANA_ADMIN_PASSWORD=change-me docker compose -f monitoring/docker-compose.yml up -d
-```
 
 The Prometheus datasource and `RPC Load Balancer` dashboard are provisioned
 automatically.
@@ -37,7 +30,8 @@ automatically.
 ## Verify
 
 ```bash
-curl --fail http://localhost:3000/metrics
+# requires server.enable_metrics = true
+# curl --fail http://localhost:3000/metrics
 curl --fail http://localhost:9090/-/ready
 curl --fail http://localhost:3001/api/health
 docker compose -f monitoring/docker-compose.yml ps
