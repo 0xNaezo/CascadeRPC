@@ -4,7 +4,7 @@ use metrics::{Unit, gauge, histogram};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::task::JoinSet;
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 
 pub struct LockFreeRouter;
 
@@ -12,6 +12,7 @@ impl LockFreeRouter {
     pub async fn run_healthcheck_loop(rpc_client: RpcClient) {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut all_nodes_unhealthy = false;
 
         loop {
             interval.tick().await;
@@ -38,7 +39,7 @@ impl LockFreeRouter {
                     .record(started.elapsed().as_secs_f64());
 
                     node.latency.store(latency, Ordering::Relaxed);
-                    node.healthy.store(health, Ordering::Relaxed);
+                    let was_healthy = node.healthy.swap(health, Ordering::Relaxed);
                     gauge!(
                         description: "Whether an RPC node passed its latest healthcheck",
                         "rpc_node_healthy",
@@ -48,11 +49,16 @@ impl LockFreeRouter {
                     .set(if health { 1.0 } else { 0.0 });
 
                     if health {
-                        info!("node {} latency: {}ms", node.name, latency);
+                        debug!(node = %node.name, latency_ms = latency, "node healthy");
+                        if !was_healthy {
+                            info!(node = %node.name, "node recovered");
+                        }
                         return Some(node);
                     }
 
-                    warn!("node {} unhealthy", node.name);
+                    if was_healthy {
+                        warn!(node = %node.name, "node became unhealthy");
+                    }
                     None
                 });
             }
@@ -67,21 +73,23 @@ impl LockFreeRouter {
             )
             .set(u32::try_from(healthy_nodes).unwrap_or(u32::MAX));
 
-            if active_nodes.is_empty() {
-                tracing::error!(
-                    "CRITICAL: All nodes failed healthcheck! Failing open (fallback to all nodes)."
-                );
+            let no_healthy_nodes = active_nodes.is_empty();
+            if no_healthy_nodes {
+                if !all_nodes_unhealthy {
+                    error!("all nodes failed healthcheck; failing open");
+                }
 
                 active_nodes.clone_from(&rpc_client.all_nodes);
             }
+            all_nodes_unhealthy = no_healthy_nodes;
 
             active_nodes
                 .sort_unstable_by_key(|node| (node.tier, node.latency.load(Ordering::Relaxed)));
 
-            info!(
-                "healthcheck: {}/{} nodes active",
-                active_nodes.len(),
-                rpc_client.all_nodes.len()
+            debug!(
+                healthy_nodes,
+                total_nodes = rpc_client.all_nodes.len(),
+                "healthcheck completed"
             );
 
             rpc_client
