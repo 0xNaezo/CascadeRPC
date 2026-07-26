@@ -14,6 +14,21 @@ use crate::client::node::{RoutingTable, RpcNode};
 
 use crate::structs::{RpcErrorOnly, RpcHealthResponse};
 
+struct GaugeGuard(metrics::Gauge);
+
+impl GaugeGuard {
+    fn new(gauge: metrics::Gauge) -> Self {
+        gauge.increment(1);
+        Self(gauge)
+    }
+}
+
+impl Drop for GaugeGuard {
+    fn drop(&mut self) {
+        self.0.decrement(1);
+    }
+}
+
 #[derive(Clone)]
 pub struct RpcClient {
     pub client: Client,
@@ -186,13 +201,11 @@ impl RpcClient {
                     ));
                 };
 
-                let sleep_queue_size = gauge!(
+                let _guard = GaugeGuard::new(gauge!(
                     description: "Number of requests currently sleeping while all RPC nodes are rate-limited",
                     "rpc_sleep_queue_size"
-                );
-                sleep_queue_size.increment(1);
+                ));
                 tokio::time::sleep(best_time).await;
-                sleep_queue_size.decrement(1);
             }
         })
         .await;
