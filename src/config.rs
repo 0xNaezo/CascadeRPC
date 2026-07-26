@@ -46,7 +46,7 @@ impl Settings {
 }
 
 const fn default_enable_metrics() -> bool {
-    true
+    false
 }
 
 #[derive(Debug, Deserialize, Clone)]
