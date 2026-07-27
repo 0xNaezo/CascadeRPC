@@ -67,11 +67,11 @@ impl RpcNode {
         })
     }
 
-    /// Acquires concurrency permit and checks rate limit.
+    /// Checks rate limit, then acquires concurrency permit.
     ///
     /// # Errors
     ///
-    /// Returns an error if the rate limit is exceeded for this node.
+    /// Returns the minimum wait time if the rate limit is exceeded.
     pub async fn acquire_and_check(&self) -> Result<SemaphorePermit<'_>, Duration> {
         if let Err(err) = self.rate_limiting.check() {
             let clock = DefaultClock::default();

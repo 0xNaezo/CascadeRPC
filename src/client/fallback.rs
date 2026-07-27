@@ -10,7 +10,7 @@ use crate::client::rpc::{GaugeGuard, RpcClient};
 use crate::structs::RpcErrorOnly;
 
 impl RpcClient {
-    /// Sends a balance request with fallback across nodes.
+    /// Sends a JSON-RPC request with fallback across nodes.
     ///
     /// # Errors
     ///

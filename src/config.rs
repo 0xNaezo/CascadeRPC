@@ -12,11 +12,11 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// Load settings from `config/local.toml`.
+    /// Load settings from `CONFIG_PATH` (default `config/config.toml`).
     ///
     /// # Errors
     ///
-    /// Returns `ConfigError` if the file cannot be read or parsed.
+    /// Returns an error if the file cannot be read or parsed.
     pub fn load() -> Result<Self> {
         dotenvy::dotenv().ok();
 
