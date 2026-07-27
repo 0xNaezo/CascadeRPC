@@ -7,8 +7,6 @@ pub struct RpcErrorOnly {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RpcHealthResponse {
-    // pub jsonrpc: String,
-    // pub id: Value,
     #[serde(default)]
     pub result: Option<String>,
 

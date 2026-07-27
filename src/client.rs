@@ -1,3 +1,5 @@
+mod fallback;
+mod health;
 pub mod node;
 pub mod router;
 pub mod rpc;
