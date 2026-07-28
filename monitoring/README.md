@@ -24,7 +24,7 @@ GRAFANA_ADMIN_PASSWORD=<your-password> docker compose -f monitoring/docker-compo
 - Prometheus: <http://localhost:9090>
 - Grafana: <http://localhost:3001>
 
-The Prometheus datasource and `RPC Load Balancer` dashboard are provisioned
+The Prometheus datasource and `CascadeRPC` dashboard are provisioned
 automatically.
 
 ## Verify

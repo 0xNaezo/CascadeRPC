@@ -1207,7 +1207,7 @@
   },
   "timepicker": {},
   "timezone": "browser",
-  "title": "RPC Load Balancer",
+  "title": "CascadeRPC",
   "uid": "rpc-load-balancer",
   "version": 3,
   "weekStart": "monday"

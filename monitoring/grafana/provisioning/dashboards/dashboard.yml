@@ -1,9 +1,9 @@
 apiVersion: 1
 
 providers:
-  - name: RPC Load Balancer
+  - name: CascadeRPC
     orgId: 1
-    folder: RPC Load Balancer
+    folder: CascadeRPC
     type: file
     disableDeletion: false
     editable: false

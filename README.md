@@ -1,6 +1,6 @@
-# RPC Load Balancer
+# CascadeRPC
 
-High-performance JSON-RPC reverse proxy for Solana, written in Rust: lock-free routing, tier-based smart spillover, and **sub-millisecond proxy overhead at 113,000 RPS**. Designed for Solana's heavy RPC workloads, but agnostic enough to proxy any JSON-RPC standard (EVM, etc.).
+High-performance JSON-RPC reverse proxy for Web3 & Web2, written in Rust: lock-free routing, tier-based smart spillover, and **sub-millisecond proxy overhead at 113,000 RPS**. Agnostic enough to proxy any JSON-RPC standard (Ethereum, EVM, REST, etc.).
 
 ---
 
@@ -117,7 +117,7 @@ See [`monitoring/README.md`](monitoring/README.md) for the local Prometheus + Gr
 Requires Rust (edition 2024).
 
 ```bash
-git clone <repo-url> && cd RPC-Load-Balancer
+git clone <repo-url> && cd CascadeRPC
 
 # 1. Configure nodes
 cp config/config.example.toml config/config.toml
@@ -166,7 +166,7 @@ CONFIG_PATH=config/mock_nodes.toml cargo run --release
 GRAFANA_ADMIN_PASSWORD=<password> docker compose -f monitoring/docker-compose.yml up -d
 ```
 
-Then drive load at `POST /send-request` and watch the `RPC Load Balancer` dashboard. The numbers above were produced with `oha` at 500–800 concurrent connections.
+Then drive load at `POST /send-request` and watch the `CascadeRPC` dashboard. The numbers above were produced with `oha` at 500–800 concurrent connections.
 
 > **Note:** Generating 100k+ RPS from a single machine will exhaust your OS file descriptors and TCP ephemeral ports. Before running the load generator, increase your limits:
 >
