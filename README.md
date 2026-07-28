@@ -8,6 +8,14 @@ High-performance JSON-RPC reverse proxy for Solana, written in Rust: lock-free r
 
 Test bench: single Linux host (loopback), 6 mock RPC nodes (`src/bin/mock_node.rs`) with hardcoded response latencies, config from `config/mock_nodes.toml`, `--release` build. Metrics scraped by Prometheus from `/metrics` and rendered by the bundled Grafana dashboard.
 
+**Hardware:**
+
+- **CPU:** Intel® Core™ Ultra 5 Processor 125H (14 cores, 18 threads)
+- **RAM:** 16 GB LPDDR5X 7467 MHz (soldered)
+- **OS:** Arch Linux
+- **Network:** `localhost` loopback — client, proxy, and all 6 mock nodes share the same CPU
+- **Load generator:** [`oha`](https://github.com/hatoo/oha) (500–800 concurrent connections)
+
 ### Run 1 - Raw throughput (no artificial node latency)
 
 ![Benchmark without node latency](docs/benchmark-no-latency.png)
@@ -26,14 +34,28 @@ Test bench: single Linux host (loopback), 6 mock RPC nodes (`src/bin/mock_node.r
 
 **Traffic distribution at peak (spillover).** The algorithm spread 113k successful req/s across nodes strictly by tier priority:
 
+<table>
+<tr>
+<td>
+
 | Tier | Node | req/s |
 | --- | --- | --- |
 | 0 | Helius-2 | 31.7K |
 | 0 | Helius-1 | 31.0K |
 | 1 | Alchemy-1 | 25.7K |
+
+</td>
+<td>
+
+| Tier | Node | req/s |
+| --- | --- | --- |
 | 1 | Alchemy-2 | 23.0K |
 | 2 | public-mirror | 1.05K |
 | 2 | Triton-1 | 0 |
+
+</td>
+</tr>
+</table>
 
 **Rate-limit exhaustion (rejected locally, zero network cost).** Requests the balancer bounced off a node's exhausted token bucket without ever touching the network: Helius-2 - 75.2K/s, Helius-1 - 56.9K/s, Alchemy-1 - 24.5K/s, Alchemy-2 - 1.47K/s. Provider limits stay respected; excess traffic cascades down the tiers instead of collecting 429s.
 
@@ -158,7 +180,7 @@ CONFIG_PATH=config/mock_nodes.toml cargo run --release
 GRAFANA_ADMIN_PASSWORD=<password> docker compose -f monitoring/docker-compose.yml up -d
 ```
 
-Then drive load at `POST /send-request` with your generator of choice (the numbers above were produced with a Tokio-based load generator saturating the loopback) and watch the `RPC Load Balancer` dashboard.
+Then drive load at `POST /send-request` and watch the `RPC Load Balancer` dashboard. The numbers above were produced with `oha` at 500–800 concurrent connections.
 
 > **Note:** Generating 100k+ RPS from a single machine will exhaust your OS file descriptors and TCP ephemeral ports. Before running the load generator, increase your limits:
 > ```bash
