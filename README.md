@@ -20,13 +20,13 @@ Test bench: single Linux host (loopback), 6 mock RPC nodes (`src/bin/mock_node.r
 
 ![Benchmark without node latency](docs/benchmark-no-latency.png)
 
-| Metric | Value |
-| --- | --- |
+| Metric                  | Value           |
+| ----------------------- | --------------- |
 | Peak throughput (burst) | **113,000 RPS** |
-| Steady-state plateau | ~101,000 RPS |
-| End-to-end latency p50 | 2.55 ms |
-| End-to-end latency p95 | 4.61 ms |
-| End-to-end latency p99 | 5.74 ms |
+| Steady-state plateau    | ~101,000 RPS    |
+| End-to-end latency p50  | 2.55 ms         |
+| End-to-end latency p95  | 4.61 ms         |
+| End-to-end latency p99  | 5.74 ms         |
 
 99% of client requests complete in under 6 milliseconds - at over 100k RPS.
 
@@ -34,28 +34,14 @@ Test bench: single Linux host (loopback), 6 mock RPC nodes (`src/bin/mock_node.r
 
 **Traffic distribution at peak (spillover).** The algorithm spread 113k successful req/s across nodes strictly by tier priority:
 
-<table style="border: none; background: none; width: 100%;">
-<tr>
-<td style="border: none; background: none; vertical-align: top; width: 50%;">
-
-| Tier | Node | req/s |
-| --- | --- | --- |
-| 0 | Helius-2 | 31.7K |
-| 0 | Helius-1 | 31.0K |
-| 1 | Alchemy-1 | 25.7K |
-
-</td>
-<td style="border: none; background: none; vertical-align: top; width: 50%; text-align: right;">
-
-| Tier | Node | req/s |
-| --- | --- | --- |
-| 1 | Alchemy-2 | 23.0K |
-| 2 | public-mirror | 1.05K |
-| 2 | Triton-1 | 0 |
-
-</td>
-</tr>
-</table>
+| Tier | Node          | req/s |
+| ---- | ------------- | ----- |
+| 0    | Helius-2      | 31.7K |
+| 0    | Helius-1      | 31.0K |
+| 1    | Alchemy-1     | 25.7K |
+| 1    | Alchemy-2     | 23.0K |
+| 2    | public-mirror | 1.05K |
+| 2    | Triton-1      | 0     |
 
 **Rate-limit exhaustion (rejected locally, zero network cost).** Requests the balancer bounced off a node's exhausted token bucket without ever touching the network: Helius-2 - 75.2K/s, Helius-1 - 56.9K/s, Alchemy-1 - 24.5K/s, Alchemy-2 - 1.47K/s. Provider limits stay respected; excess traffic cascades down the tiers instead of collecting 429s.
 
@@ -65,12 +51,12 @@ Test bench: single Linux host (loopback), 6 mock RPC nodes (`src/bin/mock_node.r
 
 Mock node delays: Helius-1 - 3 ms, Helius-2 - 5 ms, Alchemy-1 - 7 ms.
 
-| Metric | Value |
-| --- | --- |
+| Metric                             | Value          |
+| ---------------------------------- | -------------- |
 | Sustained peak (forwarded success) | **71,900 RPS** |
-| End-to-end latency p50 | 6.14 ms |
-| End-to-end latency p95 | 8.82 ms |
-| End-to-end latency p99 | 9.57 ms |
+| End-to-end latency p50             | 6.14 ms        |
+| End-to-end latency p95             | 8.82 ms        |
+| End-to-end latency p99             | 9.57 ms        |
 
 The drop from 113k to 71k RPS is Little's Law at work: artificial delay keeps connections open longer, so the same concurrency yields fewer requests per second - expected, not a regression.
 
@@ -78,11 +64,11 @@ The gap between the median request and the worst 1% is only **~3.4 ms**. No garb
 
 **Proxy overhead under load.** Measured upstream p95 from the mock servers themselves:
 
-| Node | Hardcoded delay | Upstream p95 |
-| --- | --- | --- |
-| Helius-1 | 3 ms | 5.87 ms |
-| Helius-2 | 5 ms | 7.83 ms |
-| Alchemy-1 | 7 ms | 9.60 ms |
+| Node      | Hardcoded delay | Upstream p95 |
+| --------- | --------------- | ------------ |
+| Helius-1  | 3 ms            | 5.87 ms      |
+| Helius-2  | 5 ms            | 7.83 ms      |
+| Alchemy-1 | 7 ms            | 9.60 ms      |
 
 (The mock servers and the OS loopback add their own micro-latency at 70k RPS.) Most traffic (60k of 71k) went through Helius-1/2, which returned in ~6–7 ms - while the client-facing end-to-end p50 was 6.14 ms. The balancer's own work - parsing, the lock-free `arc-swap` table read, limit checks, byte forwarding - stays **under one millisecond**.
 
@@ -98,7 +84,7 @@ The gap between the median request and the worst 1% is only **~3.4 ms**. No garb
 - **Concurrent burst health probing.** Every 10 s a `JoinSet` probes all nodes in parallel (3 attempts, 500 ms timeout each), then sorts survivors by `(tier, measured latency)` and publishes the new table.
 - **Smart fallback state machine.** Per request:
   1. **Fail-fast** - walk the sorted node list; skip any node whose token bucket is empty (no network call, remember its earliest-refill time) or that fails with a retryable error.
-  2. **Earliest-available wait** - if *every* node is rate-limited, sleep exactly until the soonest bucket refills (minimum `NotUntil` from `governor`), not a fixed backoff.
+  2. **Earliest-available wait** - if _every_ node is rate-limited, sleep exactly until the soonest bucket refills (minimum `NotUntil` from `governor`), not a fixed backoff.
   3. **Retry** - reload the routing table and loop, bounded by a 1 s global deadline.
 
   Non-retryable upstream responses (e.g. HTTP 400, JSON-RPC `-32602 invalid params`) are forwarded to the client verbatim instead of being masked as a generic 502.
@@ -109,7 +95,7 @@ The gap between the median request and the worst 1% is only **~3.4 ms**. No garb
 - **Token-bucket rate limiting per node** (`governor`) - provider RPS limits enforced locally, before any network I/O.
 - **Per-node concurrency caps** (`tokio::sync::Semaphore`) - bounds in-flight requests per upstream.
 - **Anti-flapping health checks** - 3 probes per cycle before declaring a node healthy; state transitions logged once, not spammed.
-- **Fail-open** - if *all* nodes fail their health checks (e.g. a monitoring artifact), the balancer keeps routing to the full node list rather than going dark.
+- **Fail-open** - if _all_ nodes fail their health checks (e.g. a monitoring artifact), the balancer keeps routing to the full node list rather than going dark.
 - **Graceful shutdown** - SIGINT/SIGTERM drain via `axum`'s graceful shutdown.
 - **Config via TOML + env** - API keys are injected with `$VAR` substitution in URLs, never stored in config files.
 
@@ -183,6 +169,7 @@ GRAFANA_ADMIN_PASSWORD=<password> docker compose -f monitoring/docker-compose.ym
 Then drive load at `POST /send-request` and watch the `RPC Load Balancer` dashboard. The numbers above were produced with `oha` at 500–800 concurrent connections.
 
 > **Note:** Generating 100k+ RPS from a single machine will exhaust your OS file descriptors and TCP ephemeral ports. Before running the load generator, increase your limits:
+>
 > ```bash
 > ulimit -n 65535
 > ```
@@ -201,11 +188,11 @@ oha -z 30s -c 400 --no-tui http://localhost:3000/send-request -m POST \
 
 ## Endpoints
 
-| Method | Path | Description |
-| --- | --- | --- |
-| `POST` | `/send-request` | Proxy a JSON-RPC request through the balancer |
-| `GET` | `/health` | Balancer + per-node health JSON |
-| `GET` | `/metrics` | Prometheus metrics (when `enable_metrics = true`) |
+| Method | Path            | Description                                       |
+| ------ | --------------- | ------------------------------------------------- |
+| `POST` | `/send-request` | Proxy a JSON-RPC request through the balancer     |
+| `GET`  | `/health`       | Balancer + per-node health JSON                   |
+| `GET`  | `/metrics`      | Prometheus metrics (when `enable_metrics = true`) |
 
 ## License
 
