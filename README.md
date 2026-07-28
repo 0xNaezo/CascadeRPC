@@ -34,9 +34,9 @@ Test bench: single Linux host (loopback), 6 mock RPC nodes (`src/bin/mock_node.r
 
 **Traffic distribution at peak (spillover).** The algorithm spread 113k successful req/s across nodes strictly by tier priority:
 
-<table>
+<table style="border: none; background: none; width: 100%;">
 <tr>
-<td>
+<td style="border: none; background: none; vertical-align: top; width: 50%;">
 
 | Tier | Node | req/s |
 | --- | --- | --- |
@@ -45,7 +45,7 @@ Test bench: single Linux host (loopback), 6 mock RPC nodes (`src/bin/mock_node.r
 | 1 | Alchemy-1 | 25.7K |
 
 </td>
-<td>
+<td style="border: none; background: none; vertical-align: top; width: 50%; text-align: right;">
 
 | Tier | Node | req/s |
 | --- | --- | --- |
