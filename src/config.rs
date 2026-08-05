@@ -89,3 +89,66 @@ fn resolve_env(s: &str) -> Result<String, ConfigError> {
     out.push_str(rest);
     Ok(out)
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::resolve_env;
+
+    #[test]
+    fn plain_string_no_dollar_returns_as_is() {
+        assert_eq!(
+            resolve_env("https://example.com/v1").unwrap(),
+            "https://example.com/v1"
+        );
+    }
+
+    #[test]
+    fn empty_string_returns_empty() {
+        assert_eq!(resolve_env("").unwrap(), "");
+    }
+
+    #[test]
+    fn env_var_substituted_from_environment() {
+        // CARGO_PKG_NAME is always set by cargo during tests (= crate name).
+        assert_eq!(resolve_env("$CARGO_PKG_NAME").unwrap(), "rpc-load-balancer");
+    }
+
+    #[test]
+    fn env_var_substituted_with_surrounding_text() {
+        // CARGO_PKG_VERSION (= "0.1.0") avoids unsafe std::env::set_var races.
+        assert_eq!(
+            resolve_env("https://api.$CARGO_PKG_VERSION/v1").unwrap(),
+            "https://api.0.1.0/v1"
+        );
+    }
+
+    #[test]
+    fn double_dollar_preserved() {
+        // $$: neither $ is followed by a valid var-name char, so both pass through.
+        assert_eq!(resolve_env("$$").unwrap(), "$$");
+    }
+
+    #[test]
+    fn trailing_dollar_preserved() {
+        assert_eq!(resolve_env("prefix$").unwrap(), "prefix$");
+    }
+
+    #[test]
+    fn brace_var_not_substituted() {
+        // ${VAR}: '{' is not alphanumeric, so '$' has no valid name after it
+        // and is pushed literally; '{VAR}' follows as plain text.
+        assert_eq!(
+            resolve_env("${CARGO_PKG_NAME}").unwrap(),
+            "${CARGO_PKG_NAME}"
+        );
+    }
+
+    #[test]
+    fn missing_env_var_returns_error() {
+        assert!(
+            resolve_env("$RPC_LB_TEST_DEFINITELY_UNSET_VAR_XYZ123").is_err(),
+            "missing env var should error"
+        );
+    }
+}

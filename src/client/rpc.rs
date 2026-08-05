@@ -114,3 +114,54 @@ impl RpcClient {
         true
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retryable_error_true_for_5xx_and_429() {
+        assert!(RpcClient::is_retryable_error(StatusCode::TOO_MANY_REQUESTS));
+        assert!(RpcClient::is_retryable_error(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(RpcClient::is_retryable_error(StatusCode::BAD_GATEWAY));
+        assert!(RpcClient::is_retryable_error(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(RpcClient::is_retryable_error(StatusCode::GATEWAY_TIMEOUT));
+    }
+
+    #[test]
+    fn retryable_error_true_for_success() {
+        assert!(RpcClient::is_retryable_error(StatusCode::OK));
+    }
+
+    #[test]
+    fn retryable_error_false_for_not_retryable_list() {
+        let not_retryable = [
+            400, 402, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413, 414, 415, 416, 417, 418,
+            421, 422, 423, 424, 425, 426, 428, 431, 451,
+        ];
+        for code in not_retryable {
+            assert!(
+                !RpcClient::is_retryable_error(StatusCode::from_u16(code).unwrap()),
+                "expected {code} to be not-retryable"
+            );
+        }
+    }
+
+    #[test]
+    fn retryable_jsonrpc_false_for_not_retryable_codes() {
+        for code in [-32700, -32601, -32602, -32600] {
+            assert!(
+                !RpcClient::is_retryable_json_rpc_error(code),
+                "expected {code} to be not-retryable"
+            );
+        }
+    }
+
+    #[test]
+    fn retryable_jsonrpc_true_for_server_internal_and_zero() {
+        assert!(RpcClient::is_retryable_json_rpc_error(-32000)); // server error
+        assert!(RpcClient::is_retryable_json_rpc_error(-32603)); // internal error
+        assert!(RpcClient::is_retryable_json_rpc_error(0)); // no error
+    }
+}
