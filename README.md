@@ -1,6 +1,6 @@
 # CascadeRPC
 
-High-performance JSON-RPC reverse proxy for Web3 & Web2, written in Rust: lock-free routing, tier-based smart spillover, and **sub-millisecond proxy overhead at 113,000 RPS**. Agnostic enough to proxy any JSON-RPC standard (Ethereum, EVM, REST, etc.).
+High-performance JSON-RPC reverse proxy for Web3 & Web2, written in Rust: lock-free routing, tier-based smart spillover, and **~1.4 ms proxy overhead at 113,000 RPS**. Agnostic enough to proxy any JSON-RPC standard (Ethereum, EVM, REST, etc.).
 
 ---
 
@@ -30,7 +30,7 @@ Test bench: single Linux host (loopback), 6 mock RPC nodes (`src/bin/mock_node.r
 
 99% of client requests complete in under 6 milliseconds - at over 100k RPS.
 
-**Proxy overhead.** The fastest node (Helius-1) has a hardcoded 3.00 ms mock delay; its measured upstream p95 is 4.42 ms. So JSON parsing, the lock-free routing-table read, rate-limit checks, node selection, and byte proxying together cost **~1.42 ms**.
+**Proxy overhead.** Measured with Helius-1's mock delay pinned at 3.00 ms (a separate calibration run — the throughput run above uses zero node latency), its upstream p95 was 4.42 ms. So JSON parsing, the lock-free routing-table read, rate-limit checks, node selection, and byte proxying add **~1.42 ms** at p95 — an upper bound on the balancer's own work, since the mock server's tail queueing is included.
 
 **Traffic distribution at peak (spillover).** The algorithm spread 113k successful req/s across nodes strictly by tier priority:
 
@@ -70,7 +70,7 @@ The gap between the median request and the worst 1% is only **~3.4 ms**. No garb
 | Helius-2  | 5 ms            | 7.83 ms      |
 | Alchemy-1 | 7 ms            | 9.60 ms      |
 
-(The mock servers and the OS loopback add their own micro-latency at 70k RPS.) Most traffic (60k of 71k) went through Helius-1/2, which returned in ~6–7 ms - while the client-facing end-to-end p50 was 6.14 ms. The balancer's own work - parsing, the lock-free `arc-swap` table read, limit checks, byte forwarding - stays **under one millisecond**.
+(The mock servers and the OS loopback add their own micro-latency at 70k RPS, so the ~2.6–2.9 ms gaps above are a p95 upper bound on the balancer's share, not a direct measurement.) Most traffic (60k of 71k) went through Helius-1/2, which returned in ~6–7 ms - while the client-facing end-to-end p50 was 6.14 ms, so at the median the balancer's own work - parsing, the lock-free `arc-swap` table read, limit checks, byte forwarding - stays **under one millisecond**.
 
 **Cascading spillover.** Both Tier 0 nodes hit their 30k RPS caps exactly (Helius-2 - 30.2K, Helius-1 - 30.0K); Tier 1 absorbed the overflow (Alchemy-1 - 11.7K).
 
