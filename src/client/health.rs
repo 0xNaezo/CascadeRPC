@@ -6,7 +6,7 @@ use tracing::debug;
 
 use crate::client::node::RpcNode;
 use crate::client::rpc::RpcClient;
-use crate::structs::RpcHealthResponse;
+use crate::structs::balancer_structs::RpcHealthResponse;
 
 impl RpcClient {
     pub async fn get_health(client: Client, node: &RpcNode) -> (bool, u32) {
