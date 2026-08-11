@@ -1,0 +1,65 @@
+[routing]
+
+# Accounts
+getAccountInfo = 1
+getBalance = 1
+getLargestAccounts = 1
+getMinimumBalanceForRentExemption = 1
+getMultipleAccounts = 1
+getProgramAccounts = 1
+
+# Tokens
+getTokenAccountBalance = 1
+getTokenAccountsByDelegate = 1
+getTokenAccountsByOwner = 1
+getTokenLargestAccounts = 1
+getTokenSupply = 1
+
+# Transactions
+getFeeForMessage = 1
+getLatestBlockhash = 1
+getRecentPrioritizationFees = 1
+getSignaturesForAddress = 1
+getSignatureStatuses = 1
+getTransaction = 1
+getTransactionCount = 1
+isBlockhashValid = 1
+requestAirdrop = 1
+sendTransaction = 1
+simulateTransaction = 1
+
+# Blocks
+getBlock = 1
+getBlockCommitment = 1
+getBlockHeight = 1
+getBlockProduction = 1
+getBlocks = 1
+getBlocksWithLimit = 1
+getBlockTime = 1
+getFirstAvailableBlock = 1
+getRecentPerformanceSamples = 1
+minimumLedgerSlot = 1
+
+# Cluster
+getClusterNodes = 1
+getEpochInfo = 1
+getEpochSchedule = 1
+getGenesisHash = 1
+getHealth = 1
+getHighestSnapshotSlot = 1
+getIdentity = 1
+getLeaderSchedule = 1
+getMaxRetransmitSlot = 1
+getMaxShredInsertSlot = 1
+getSlot = 1
+getSlotLeader = 1
+getSlotLeaders = 1
+getVersion = 1
+getVoteAccounts = 1
+
+# Economics
+getInflationGovernor = 1
+getInflationRate = 1
+getInflationReward = 1
+getStakeMinimumDelegation = 1
+getSupply = 1

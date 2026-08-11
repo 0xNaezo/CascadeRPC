@@ -6,7 +6,7 @@ High-performance JSON-RPC reverse proxy for Web3 & Web2, written in Rust: lock-f
 
 ## Benchmarks
 
-Test bench: single Linux host (loopback), 6 mock RPC nodes (`src/bin/mock_node.rs`) with hardcoded response latencies, config from `config/mock_nodes.toml`, `--release` build. Metrics scraped by Prometheus from `/metrics` and rendered by the bundled Grafana dashboard.
+Test bench: single Linux host (loopback), 6 mock RPC nodes (`src/bin/mock_node.rs`) with hardcoded response latencies, config from `config/balancer_config/mock_nodes.toml`, `--release` build. Metrics scraped by Prometheus from `/metrics` and rendered by the bundled Grafana dashboard.
 
 **Hardware:**
 
@@ -120,14 +120,14 @@ Requires Rust (edition 2024).
 git clone <repo-url> && cd CascadeRPC
 
 # 1. Configure nodes
-cp config/config.example.toml config/config.toml
+cp config/balancer_config/config.example.toml config/balancer_config/config.toml
 cp .env.example .env            # put your API keys here
 
 # 2. Run
-CONFIG_PATH=config/config.toml cargo run --release
+CONFIG_PATH=config/balancer_config/config.toml cargo run --release
 ```
 
-Config format (`config/config.toml`):
+Config format (`config/balancer_config/config.toml`):
 
 ```toml
 [server]
@@ -160,7 +160,7 @@ curl -s http://localhost:3000/health | jq
 cargo run --release --bin mock_node
 
 # Terminal 2: balancer pointed at the mocks
-CONFIG_PATH=config/mock_nodes.toml cargo run --release
+CONFIG_PATH=config/balancer_config/mock_nodes.toml cargo run --release
 
 # Terminal 3: monitoring stack (Grafana on :3001, Prometheus on :9090)
 GRAFANA_ADMIN_PASSWORD=<password> docker compose -f monitoring/docker-compose.yml up -d
