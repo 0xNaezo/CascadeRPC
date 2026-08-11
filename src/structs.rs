@@ -1,2 +1,2 @@
-pub mod balancer_structs;
-pub mod provider_structs;
+pub mod balancer;
+pub mod provider;
