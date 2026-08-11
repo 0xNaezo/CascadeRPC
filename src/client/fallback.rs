@@ -7,7 +7,7 @@ use tokio::time::{Instant, timeout};
 use tracing::{debug, trace};
 
 use crate::client::rpc::{GaugeGuard, RpcClient};
-use crate::structs::balancer_structs::RpcErrorOnly;
+use crate::structs::balancer::RpcErrorOnly;
 
 impl RpcClient {
     /// Sends a JSON-RPC request with fallback across nodes.

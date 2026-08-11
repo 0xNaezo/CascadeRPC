@@ -1,7 +1,7 @@
 use anyhow::Result;
 use rpc_load_balancer::{
     client::{node::RpcNode, router::LockFreeRouter, rpc::RpcClient},
-    config::Settings,
+    config::balancer::Settings,
     server,
 };
 
