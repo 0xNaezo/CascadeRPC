@@ -1,0 +1,113 @@
+# [routing]
+# default_unknown_cost = 100 # разная для разных провайдеров
+
+[routing]
+
+# Solana standard JSON-RPC methods
+getAccountInfo = 10
+getBalance = 10
+getBlockProduction = 10
+getBlocks = 10
+getGenesisHash = 10
+getMinimumBalanceForRentExemption = 10
+getPriorityFeeEstimate = 10
+getRecentPrioritizationFees = 10
+getTokenAccountsByDelegate = 10
+getTokenAccountsByOwner = 10
+getBlockCommitment = 20
+getBlockHeight = 20
+getBlocksWithLimit = 20
+getBlockTime = 20
+getClusterNodes = 20
+getEpochInfo = 20
+getEpochSchedule = 20
+getFeeForMessage = 20
+getHealth = 20
+getHighestSnapshotSlot = 20
+getIdentity = 20
+getInflationGovernor = 20
+getInflationRate = 20
+getLatestBlockhash = 20
+getLeaderSchedule = 20
+getMaxRetransmitSlot = 20
+getMaxShredInsertSlot = 20
+getMultipleAccounts = 20
+getProgramAccounts = 20
+getRecentPerformanceSamples = 20
+getSignatureStatuses = 20
+getSlot = 20
+getSlotLeader = 20
+getSlotLeaders = 20
+getStakeActivation = 20
+getTokenAccountBalance = 20
+getTokenLargestAccounts = 20
+getTokenSupply = 20
+getTransactionCount = 20
+getVersion = 20
+getVoteAccounts = 20
+isBlockhashValid = 20
+minimumLedgerSlot = 20
+requestAirdrop = 20
+sendStakedTransaction = 20
+sendTransaction = 20
+simulateBundle = 20
+simulateTransaction = 20
+getBlock = 40
+getFirstAvailableBlock = 40
+getInflationReward = 40
+getSignaturesForAddress = 40
+getTransaction = 40
+getTransactionsForAddress = 100
+getSupply = 160
+getLargestAccounts = 3000
+
+# Solana DAS APIs (NFT/Token)
+
+getAsset = 160
+getAssetProof = 160
+getAssetSignatures = 160
+getNftEditions = 160
+getTokenAccounts = 160
+getAssetProofs = 480
+getAssets = 480
+getAssetsByAuthority = 480
+getAssetsByCreator = 480
+getAssetsByGroup = 480
+getAssetsByOwner = 480
+searchAssets = 480
+
+# Solana Photon APIs (ZK Compression)
+
+getCompressedAccount = 120
+getCompressedAccountProof = 120
+getCompressedAccountsByOwner = 120
+getCompressedBalance = 120
+getCompressedBalanceByOwner = 120
+getCompressedMintTokenHolders = 120
+getCompressedTokenAccountBalance = 120
+getCompressedTokenAccountsByDelegate = 120
+getCompressedTokenAccountsByOwner = 120
+getCompressedTokenBalancesByOwner = 120
+getCompressedTokenBalancesByOwnerV2 = 120
+getCompressionSignaturesForAccount = 120
+getCompressionSignaturesForAddress = 120
+getCompressionSignaturesForOwner = 120
+getCompressionSignaturesForTokenOwner = 120
+getIndexerHealth = 120
+getIndexerSlot = 120
+getLatestCompressionSignatures = 120
+getLatestNonVotingSignatures = 120
+getMultipleCompressedAccountProofs = 120
+getMultipleCompressedAccounts = 120
+getMultipleNewAddressProofs = 120
+getMultipleNewAddressProofsV2 = 120
+getTransactionWithCompressionInfo = 120
+getValidityProof = 1200
+getValidityProofV2 = 1200
+
+# Solana Jito Bundles and Transactions
+
+getBundleStatuses = 40
+getInflightBundleStatuses = 40
+getTipAccounts = 40
+sendBundle = 40

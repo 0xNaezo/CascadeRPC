@@ -1,7 +1,7 @@
 [server]
 host = "0.0.0.0"
 port = 3000
-enable_metrics = false  # only enable behind internal network boundary
+enable_metrics = false # only enable behind internal network boundary
 
 [[nodes]]
 name = "Helius"
@@ -9,6 +9,8 @@ url = "https://mainnet.helius-rpc.com/?api-key=$HELIUS_API_KEY"
 tier = 1
 rps_limit = 10
 max_concurrent = 4
+monthly_limit = 50_000_000
+billing_type = "compute_units"
 
 [[nodes]]
 name = "Alchemy"
@@ -16,6 +18,9 @@ url = "https://solana-mainnet.g.alchemy.com/v2/$ALCHEMY_API_KEY"
 tier = 0
 rps_limit = 20
 max_concurrent = 8
+monthly_limit = 20_000_000
+billing_type = "compute_units"
+
 
 [[nodes]]
 name = "public-mainnet"
@@ -23,3 +28,5 @@ url = "https://api.mainnet-beta.solana.com"
 tier = 2
 rps_limit = 5
 max_concurrent = 2
+monthly_limit = 0
+billing_type = "requests"

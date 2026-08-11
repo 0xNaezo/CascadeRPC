@@ -8,11 +8,11 @@ run in Docker and reach it through `host.docker.internal`.
 From the repository root, prepare and run the load balancer:
 
 ```bash
-cp config/config.example.toml config/config.toml
-CONFIG_PATH=config/config.toml cargo run --release
+cp config/balancer_config/config.example.toml config/balancer_config/config.toml
+CONFIG_PATH=config/balancer_config/config.toml cargo run --release
 ```
 
-Set any API-key environment variables referenced by `config/config.toml` before
+Set any API-key environment variables referenced by `config/balancer_config/config.toml` before
 starting the process. Metrics are disabled by default for security; set `server.enable_metrics = true` only behind an internal network boundary.
 
 In another terminal, start monitoring (a strong `GRAFANA_ADMIN_PASSWORD` is required):

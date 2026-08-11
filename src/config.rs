@@ -12,7 +12,7 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// Load settings from `CONFIG_PATH` (default `config/config.toml`).
+    /// Load settings from `CONFIG_PATH` (default `config/balancer_config/config.toml`).
     ///
     /// # Errors
     ///
@@ -20,7 +20,7 @@ impl Settings {
     pub fn load() -> Result<Self> {
         dotenvy::dotenv().ok();
 
-        info!("Loading config from config/config.toml");
+        info!("Loading config from config/balancer_config/config.toml");
 
         let config_path = env::var("CONFIG_PATH")?;
 
@@ -32,6 +32,9 @@ impl Settings {
 
         for node in &mut settings.nodes {
             node.url = resolve_env(&node.url)?;
+            if node.monthly_limit == 0 {
+                node.monthly_limit = u64::MAX;
+            }
         }
 
         info!(
@@ -64,6 +67,8 @@ pub struct ConfigNode {
     pub tier: u8,
     pub rps_limit: u32,
     pub max_concurrent: usize,
+    pub monthly_limit: u64,
+    pub billing_type: String,
 }
 
 fn resolve_env(s: &str) -> Result<String, ConfigError> {
