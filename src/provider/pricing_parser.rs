@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use config::{Config, File};
 use serde::Deserialize;
 
-use crate::provider::ProviderCostTable;
+use crate::provider::cost_table::ProviderCostTable;
 
 #[derive(Debug, Deserialize)]
 struct ProviderRouting {
@@ -83,7 +83,7 @@ pub fn load_from_dir(dir: &Path) -> Result<HashMap<String, HashMap<String, u32>>
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::{load_from_dir, load_from_path};
-    use crate::structs::provider::RpcMethod;
+    use crate::protocol::methods::RpcMethod;
     use std::path::Path;
 
     #[test]
