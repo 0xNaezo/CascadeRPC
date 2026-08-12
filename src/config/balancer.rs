@@ -12,7 +12,7 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// Load settings from `CONFIG_PATH` (default `config/balancer_config/config.toml`).
+    /// Load settings from `CONFIG_PATH` (required).
     ///
     /// # Errors
     ///

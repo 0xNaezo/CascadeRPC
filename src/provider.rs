@@ -17,10 +17,10 @@ impl Default for ProviderCostTable {
 
 impl ProviderCostTable {
     #[must_use]
-    pub fn init(config_metods: HashMap<String, u32>) -> Self {
+    pub fn new(config_methods: HashMap<String, u32>) -> Self {
         let mut costs = [u32::MAX; RpcMethod::Count as usize];
 
-        for (name, price) in config_metods {
+        for (name, price) in config_methods {
             // temporarily skip methods not in the enum; they will be added later
             if let Some(id) = get_standard_method_id(name.as_bytes())
             // guard against unknown methods and out-of-bounds indices

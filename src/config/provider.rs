@@ -29,7 +29,7 @@ fn parse_file(path: &str) -> Result<HashMap<String, u32>> {
 }
 
 /// Loads routing cost tables for all providers from `PROVIDER_CONFIG_DIR`
-/// (default `config/provider_config`).
+/// (required).
 ///
 /// Keys are provider names (file names without `.toml`), values are
 /// `method -> cost` maps from each file's `[routing]` table.
@@ -38,8 +38,7 @@ fn parse_file(path: &str) -> Result<HashMap<String, u32>> {
 ///
 /// Returns an error if the directory cannot be read or any TOML file fails to parse.
 pub fn load_all() -> Result<HashMap<String, HashMap<String, u32>>> {
-    let dir =
-        env::var("PROVIDER_CONFIG_DIR").unwrap_or_else(|_| "config/provider_config".to_owned());
+    let dir = env::var("PROVIDER_CONFIG_DIR")?;
 
     load_from_dir(Path::new(&dir))
 }
@@ -50,7 +49,7 @@ pub fn load_all() -> Result<HashMap<String, HashMap<String, u32>>> {
 ///
 /// Returns an error if the file cannot be read or parsed.
 pub fn load_from_path(path: &str) -> Result<ProviderCostTable> {
-    Ok(ProviderCostTable::init(parse_file(path)?))
+    Ok(ProviderCostTable::new(parse_file(path)?))
 }
 
 /// Loads routing cost tables from all `*.toml` files in `dir`.
