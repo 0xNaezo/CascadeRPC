@@ -13,6 +13,7 @@ rps_limit = 30000
 max_concurrent = 10000
 monthly_limit = 0
 billing_type = "requests"
+provider_pricing_path = "config/provider_config/helius.toml"
 
 [[nodes]]
 name = "Helius-2"
@@ -22,6 +23,7 @@ rps_limit = 30000
 max_concurrent = 10000
 monthly_limit = 0
 billing_type = "requests"
+provider_pricing_path = "config/provider_config/helius.toml"
 
 [[nodes]]
 name = "Alchemy-1"
@@ -31,6 +33,7 @@ rps_limit = 25000
 max_concurrent = 7500
 monthly_limit = 0
 billing_type = "requests"
+provider_pricing_path = "config/provider_config/alchemy.toml"
 
 [[nodes]]
 name = "Alchemy-2"
@@ -40,6 +43,7 @@ rps_limit = 25000
 max_concurrent = 7500
 monthly_limit = 0
 billing_type = "requests"
+provider_pricing_path = "config/provider_config/alchemy.toml"
 
 [[nodes]]
 name = "Triton-1"
@@ -49,6 +53,7 @@ rps_limit = 20000
 max_concurrent = 5000
 monthly_limit = 0
 billing_type = "requests"
+provider_pricing_path = "config/provider_config/solana.toml"
 
 [[nodes]]
 name = "public-mirror"
@@ -58,3 +63,4 @@ rps_limit = 15000
 max_concurrent = 4000
 monthly_limit = 0
 billing_type = "requests"
+provider_pricing_path = "config/provider_config/solana.toml"

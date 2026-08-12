@@ -120,6 +120,7 @@ pub enum RpcMethod {
     Count,
 }
 
+#[must_use]
 pub fn get_standard_method_id(method_bytes: &[u8]) -> Option<usize> {
     Some(match method_bytes {
         b"StakedConnections" => RpcMethod::StakedConnections,

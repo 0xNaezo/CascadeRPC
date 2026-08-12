@@ -123,9 +123,13 @@ mod tests {
     #[test]
     fn retryable_error_true_for_5xx_and_429() {
         assert!(RpcClient::is_retryable_error(StatusCode::TOO_MANY_REQUESTS));
-        assert!(RpcClient::is_retryable_error(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(RpcClient::is_retryable_error(
+            StatusCode::INTERNAL_SERVER_ERROR
+        ));
         assert!(RpcClient::is_retryable_error(StatusCode::BAD_GATEWAY));
-        assert!(RpcClient::is_retryable_error(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(RpcClient::is_retryable_error(
+            StatusCode::SERVICE_UNAVAILABLE
+        ));
         assert!(RpcClient::is_retryable_error(StatusCode::GATEWAY_TIMEOUT));
     }
 
