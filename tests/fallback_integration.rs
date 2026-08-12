@@ -8,8 +8,8 @@ use axum::{Router, extract::State, response::IntoResponse, routing::post};
 use bytes::Bytes;
 use reqwest::StatusCode;
 use rpc_load_balancer::{
-    client::{node::RpcNode, rpc::RpcClient},
-    provider::ProviderCostTable,
+    core::{rpc::RpcClient, node::RpcNode},
+    provider::cost_table::ProviderCostTable,
 };
 
 struct MockState {
@@ -72,7 +72,7 @@ async fn success_path() {
     let client = build_client(node);
 
     let (status, body) = client
-        .send_with_fallback(Bytes::from(OK_BODY))
+        .send(Bytes::from(OK_BODY))
         .await
         .unwrap();
 
@@ -88,7 +88,7 @@ async fn non_retryable_http_error_passthrough() {
     let client = build_client(node);
 
     let (status, body) = client
-        .send_with_fallback(Bytes::from(OK_BODY))
+        .send(Bytes::from(OK_BODY))
         .await
         .unwrap();
 
@@ -104,7 +104,7 @@ async fn non_retryable_jsonrpc_error_passthrough() {
     let client = build_client(node);
 
     let (status, body) = client
-        .send_with_fallback(Bytes::from(OK_BODY))
+        .send(Bytes::from(OK_BODY))
         .await
         .unwrap();
 
@@ -125,13 +125,13 @@ async fn tier_spillover_on_rate_limit() {
     let client = RpcClient::new(vec![node_t0, node_t1]).unwrap();
 
     let (s1, _) = client
-        .send_with_fallback(Bytes::from(OK_BODY))
+        .send(Bytes::from(OK_BODY))
         .await
         .unwrap();
     assert_eq!(s1, StatusCode::OK);
 
     let (s2, _) = client
-        .send_with_fallback(Bytes::from(OK_BODY))
+        .send(Bytes::from(OK_BODY))
         .await
         .unwrap();
     assert_eq!(s2, StatusCode::OK);
@@ -152,7 +152,7 @@ async fn retryable_jsonrpc_error_exhausts_nodes_then_fails() {
     let client = build_client(node);
 
     let err = client
-        .send_with_fallback(Bytes::from(OK_BODY))
+        .send(Bytes::from(OK_BODY))
         .await
         .expect_err("retryable error with no rate-limit wait should fail fast");
     let err_str = String::from_utf8_lossy(&err);
@@ -174,7 +174,7 @@ async fn all_transport_errors_no_wait() {
     let client = build_client(node);
 
     let err = client
-        .send_with_fallback(Bytes::from(OK_BODY))
+        .send(Bytes::from(OK_BODY))
         .await
         .expect_err("transport failure should produce an error, not a 502");
     let err_str = String::from_utf8_lossy(&err);
@@ -194,7 +194,7 @@ async fn fallback_success_on_retryable_rpc_error() {
     let client = RpcClient::new(vec![node_a, node_b]).unwrap();
 
     let (status, body) = client
-        .send_with_fallback(Bytes::from(OK_BODY))
+        .send(Bytes::from(OK_BODY))
         .await
         .unwrap();
 
@@ -219,7 +219,7 @@ async fn fallback_success_on_transport_error() {
     let client = RpcClient::new(vec![node_a, node_b]).unwrap();
 
     let (status, body) = client
-        .send_with_fallback(Bytes::from(OK_BODY))
+        .send(Bytes::from(OK_BODY))
         .await
         .unwrap();
 
@@ -242,7 +242,7 @@ async fn sleep_and_retry_after_rate_limit_exhaustion() {
     }
 
     let (status, _) = client
-        .send_with_fallback(Bytes::from(OK_BODY))
+        .send(Bytes::from(OK_BODY))
         .await
         .unwrap();
 
@@ -257,7 +257,7 @@ async fn global_timeout_fails_fast() {
     let client = build_client(node);
 
     let err = client
-        .send_with_fallback(Bytes::from(OK_BODY))
+        .send(Bytes::from(OK_BODY))
         .await
         .expect_err("a node slower than the 1s budget should time out");
     let err_str = String::from_utf8_lossy(&err);
@@ -274,7 +274,7 @@ async fn invalid_json_upstream_fails() {
     let client = build_client(node);
 
     let err = client
-        .send_with_fallback(Bytes::from(OK_BODY))
+        .send(Bytes::from(OK_BODY))
         .await
         .expect_err("unparseable upstream body should fail the request");
     let err_str = String::from_utf8_lossy(&err);

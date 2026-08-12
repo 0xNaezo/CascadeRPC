@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
 
-use crate::client::node::{RoutingTable, RpcNode};
+use crate::core::node::{RoutingTable, RpcNode};
 
 pub struct GaugeGuard(metrics::Gauge);
 

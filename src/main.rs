@@ -1,7 +1,9 @@
 use anyhow::Result;
 use rpc_load_balancer::{
-    client::{node::RpcNode, router::LockFreeRouter, rpc::RpcClient},
-    config::{balancer::Settings, provider},
+    core::{
+        healthcheck::HealthCheckLoop, rpc::RpcClient, node::RpcNode,
+    },
+    provider::{load_config::Settings, pricing_parser},
     server,
 };
 
@@ -23,7 +25,7 @@ async fn main() -> Result<()> {
         .nodes
         .into_iter()
         .map(|n| {
-            let costs = provider::load_from_path(&n.provider_pricing_path)?;
+            let costs = pricing_parser::load_from_path(&n.provider_pricing_path)?;
 
             RpcNode::new(
                 n.name,
@@ -40,7 +42,7 @@ async fn main() -> Result<()> {
 
     let rpc_client = RpcClient::new(nodes)?;
 
-    tokio::spawn(LockFreeRouter::run_healthcheck_loop(rpc_client.clone()));
+    tokio::spawn(HealthCheckLoop::run_healthcheck_loop(rpc_client.clone()));
 
     server::init_server(
         rpc_client,

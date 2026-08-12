@@ -6,8 +6,8 @@ use std::time::Duration;
 use tokio::time::{Instant, timeout};
 use tracing::{debug, trace};
 
-use crate::client::rpc::{GaugeGuard, RpcClient};
-use crate::structs::balancer::RpcErrorOnly;
+use crate::core::rpc::{GaugeGuard, RpcClient};
+use crate::protocol::rpc_payload::RpcErrorOnly;
 
 impl RpcClient {
     /// Sends a JSON-RPC request with fallback across nodes.
@@ -15,7 +15,7 @@ impl RpcClient {
     /// # Errors
     ///
     /// Returns an error if all RPC nodes fail or exhaust their rate limits.
-    pub async fn send_with_fallback(
+    pub async fn send(
         &self,
         body_bytes: Bytes,
     ) -> Result<(StatusCode, Bytes), Bytes> {

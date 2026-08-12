@@ -1,14 +1,14 @@
-use crate::client::node::RpcNode;
-use crate::client::{node::RoutingTable, rpc::RpcClient};
+use crate::core::node::RpcNode;
+use crate::core::{node::RoutingTable, rpc::RpcClient};
 use metrics::{Unit, gauge, histogram};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
-pub struct LockFreeRouter;
+pub struct HealthCheckLoop;
 
-impl LockFreeRouter {
+impl HealthCheckLoop {
     pub async fn run_healthcheck_loop(rpc_client: RpcClient) {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

@@ -16,7 +16,7 @@ use std::{
 use tokio::sync::{Semaphore, SemaphorePermit};
 use url::Url;
 
-use crate::provider::ProviderCostTable;
+use crate::provider::cost_table::ProviderCostTable;
 
 pub struct RoutingTable {
     pub active_nodes: Vec<Arc<RpcNode>>,

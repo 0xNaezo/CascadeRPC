@@ -4,9 +4,9 @@ use serde_json::json;
 use std::time::Duration;
 use tracing::debug;
 
-use crate::client::node::RpcNode;
-use crate::client::rpc::RpcClient;
-use crate::structs::balancer::RpcHealthResponse;
+use crate::core::node::RpcNode;
+use crate::core::rpc::RpcClient;
+use crate::protocol::rpc_payload::RpcHealthResponse;
 
 impl RpcClient {
     pub async fn get_health(client: Client, node: &RpcNode) -> (bool, u32) {
