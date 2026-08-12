@@ -32,6 +32,7 @@ impl Settings {
 
         for node in &mut settings.nodes {
             node.url = resolve_env(&node.url)?;
+
             if node.monthly_limit == 0 {
                 node.monthly_limit = u64::MAX;
             }
@@ -69,6 +70,7 @@ pub struct ConfigNode {
     pub max_concurrent: usize,
     pub monthly_limit: u64,
     pub billing_type: String,
+    pub provider_pricing_path: String,
 }
 
 fn resolve_env(s: &str) -> Result<String, ConfigError> {

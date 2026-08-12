@@ -1,7 +1,7 @@
 use anyhow::Result;
 use rpc_load_balancer::{
     client::{node::RpcNode, router::LockFreeRouter, rpc::RpcClient},
-    config::balancer::Settings,
+    config::{balancer::Settings, provider},
     server,
 };
 
@@ -22,7 +22,20 @@ async fn main() -> Result<()> {
     let nodes: Vec<RpcNode> = config
         .nodes
         .into_iter()
-        .map(RpcNode::try_from)
+        .map(|n| {
+            let costs = provider::load_from_path(&n.provider_pricing_path)?;
+
+            RpcNode::new(
+                n.name,
+                &n.url,
+                n.rps_limit,
+                n.max_concurrent,
+                n.tier,
+                costs,
+                n.monthly_limit,
+                n.billing_type,
+            )
+        })
         .collect::<Result<Vec<RpcNode>, _>>()?;
 
     let rpc_client = RpcClient::new(nodes)?;

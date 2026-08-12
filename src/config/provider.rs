@@ -6,9 +6,26 @@ use anyhow::{Context, Result};
 use config::{Config, File};
 use serde::Deserialize;
 
+use crate::provider::ProviderCostTable;
+
 #[derive(Debug, Deserialize)]
 struct ProviderRouting {
-    routing: HashMap<String, u64>,
+    routing: HashMap<String, u32>,
+}
+
+/// Parses a single provider config file into a `method -> cost` map.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read or parsed.
+fn parse_file(path: &str) -> Result<HashMap<String, u32>> {
+    let config = Config::builder()
+        .add_source(File::with_name(path).required(true))
+        .build()?;
+
+    let parsed: ProviderRouting = config.try_deserialize()?;
+
+    Ok(parsed.routing)
 }
 
 /// Loads routing cost tables for all providers from `PROVIDER_CONFIG_DIR`
@@ -20,11 +37,20 @@ struct ProviderRouting {
 /// # Errors
 ///
 /// Returns an error if the directory cannot be read or any TOML file fails to parse.
-pub fn load_all() -> Result<HashMap<String, HashMap<String, u64>>> {
+pub fn load_all() -> Result<HashMap<String, HashMap<String, u32>>> {
     let dir =
         env::var("PROVIDER_CONFIG_DIR").unwrap_or_else(|_| "config/provider_config".to_owned());
 
     load_from_dir(Path::new(&dir))
+}
+
+/// Loads the routing cost table from a single provider config file.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read or parsed.
+pub fn load_from_path(path: &str) -> Result<ProviderCostTable> {
+    Ok(ProviderCostTable::init(parse_file(path)?))
 }
 
 /// Loads routing cost tables from all `*.toml` files in `dir`.
@@ -32,7 +58,7 @@ pub fn load_all() -> Result<HashMap<String, HashMap<String, u64>>> {
 /// # Errors
 ///
 /// Returns an error if the directory cannot be read or any TOML file fails to parse.
-pub fn load_from_dir(dir: &Path) -> Result<HashMap<String, HashMap<String, u64>>> {
+pub fn load_from_dir(dir: &Path) -> Result<HashMap<String, HashMap<String, u32>>> {
     let mut out = HashMap::new();
 
     for entry in std::fs::read_dir(dir)
@@ -48,12 +74,7 @@ pub fn load_from_dir(dir: &Path) -> Result<HashMap<String, HashMap<String, u64>>
             .context("config file without a name")?
             .to_string_lossy();
 
-        let config = Config::builder()
-            .add_source(File::with_name(&path.to_string_lossy()).required(true))
-            .build()?;
-
-        let parsed: ProviderRouting = config.try_deserialize()?;
-        out.insert(provider.into_owned(), parsed.routing);
+        out.insert(provider.into_owned(), parse_file(&path.to_string_lossy())?);
     }
 
     Ok(out)
@@ -62,7 +83,8 @@ pub fn load_from_dir(dir: &Path) -> Result<HashMap<String, HashMap<String, u64>>
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::load_from_dir;
+    use super::{load_from_dir, load_from_path};
+    use crate::structs::provider::RpcMethod;
     use std::path::Path;
 
     #[test]
@@ -78,5 +100,12 @@ mod tests {
         assert_eq!(alchemy["getBalance"], 10);
         assert_eq!(alchemy["getLargestAccounts"], 3000);
         assert_eq!(alchemy["sendTransaction"], 20);
+    }
+
+    #[test]
+    fn parses_single_provider_config() {
+        let table = load_from_path("config/provider_config/helius.toml").unwrap();
+
+        assert_eq!(table.cost(RpcMethod::GetBalance), 1);
     }
 }

@@ -16,7 +16,7 @@ use std::{
 use tokio::sync::{Semaphore, SemaphorePermit};
 use url::Url;
 
-use crate::config::balancer::ConfigNode;
+use crate::provider::ProviderCostTable;
 
 pub struct RoutingTable {
     pub active_nodes: Vec<Arc<RpcNode>>,
@@ -25,7 +25,7 @@ pub struct RoutingTable {
 pub type DefaultDirectRateLimiter<MW = NoOpMiddleware<<DefaultClock as Clock>::Instant>> =
     RateLimiter<NotKeyed, InMemoryState, DefaultClock, MW>;
 
-#[derive(Clone)]
+#[derive(Clone)] 
 pub struct RpcNode {
     pub name: String,
     pub url: Url,
@@ -34,6 +34,9 @@ pub struct RpcNode {
     pub tier: u8,
     pub latency: Arc<AtomicU32>,
     pub healthy: Arc<AtomicBool>,
+    pub method_costs: Arc<ProviderCostTable>,
+    pub monthly_limit: u64,
+    pub billing_type: String,
 }
 
 impl RpcNode {
@@ -48,6 +51,9 @@ impl RpcNode {
         rate_limiting: u32,
         concurrency_limiting: usize,
         tier: u8,
+        method_costs: ProviderCostTable,
+        monthly_limit: u64,
+        billing_type: String,
     ) -> Result<Self> {
         let non_zero_rate_limiting = NonZeroU32::new(rate_limiting)
             .ok_or_else(|| anyhow::anyhow!("Fatal error: RPS for node '{name}' cannot be 0"))?;
@@ -64,6 +70,9 @@ impl RpcNode {
             tier,
             latency: Arc::new(AtomicU32::new(0)),
             healthy: Arc::new(AtomicBool::new(true)),
+            method_costs: Arc::new(method_costs),
+            monthly_limit,
+            billing_type,
         })
     }
 
@@ -88,13 +97,5 @@ impl RpcNode {
             .map_err(|_| Duration::MAX)?;
 
         Ok(permit)
-    }
-}
-
-impl TryFrom<ConfigNode> for RpcNode {
-    type Error = anyhow::Error;
-
-    fn try_from(n: ConfigNode) -> Result<Self> {
-        Self::new(n.name, &n.url, n.rps_limit, n.max_concurrent, n.tier)
     }
 }

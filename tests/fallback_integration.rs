@@ -7,7 +7,10 @@ use std::time::Duration;
 use axum::{Router, extract::State, response::IntoResponse, routing::post};
 use bytes::Bytes;
 use reqwest::StatusCode;
-use rpc_load_balancer::client::{node::RpcNode, rpc::RpcClient};
+use rpc_load_balancer::{
+    client::{node::RpcNode, rpc::RpcClient},
+    provider::ProviderCostTable,
+};
 
 struct MockState {
     status: u16,
@@ -65,7 +68,7 @@ const SERVER_ERROR_BODY: &str =
 #[tokio::test]
 async fn success_path() {
     let (url, count) = spawn_mock(200, OK_BODY).await;
-    let node = RpcNode::new("A".to_string(), &url, 100, 10, 0).unwrap();
+    let node = RpcNode::new("A".to_string(), &url, 100, 10, 0, ProviderCostTable::default(), u64::MAX, "requests".to_string()).unwrap();
     let client = build_client(node);
 
     let (status, body) = client
@@ -81,7 +84,7 @@ async fn success_path() {
 #[tokio::test]
 async fn non_retryable_http_error_passthrough() {
     let (url, count) = spawn_mock(400, "bad request body").await;
-    let node = RpcNode::new("A".to_string(), &url, 100, 10, 0).unwrap();
+    let node = RpcNode::new("A".to_string(), &url, 100, 10, 0, ProviderCostTable::default(), u64::MAX, "requests".to_string()).unwrap();
     let client = build_client(node);
 
     let (status, body) = client
@@ -97,7 +100,7 @@ async fn non_retryable_http_error_passthrough() {
 #[tokio::test]
 async fn non_retryable_jsonrpc_error_passthrough() {
     let (url, count) = spawn_mock(200, INVALID_PARAMS_BODY).await;
-    let node = RpcNode::new("A".to_string(), &url, 100, 10, 0).unwrap();
+    let node = RpcNode::new("A".to_string(), &url, 100, 10, 0, ProviderCostTable::default(), u64::MAX, "requests".to_string()).unwrap();
     let client = build_client(node);
 
     let (status, body) = client
@@ -117,8 +120,8 @@ async fn tier_spillover_on_rate_limit() {
 
     // Tier 0 rps=1: one token, consumed by the first request.
     // Tier 1 rps=100: ample headroom to absorb the spillover from the second request.
-    let node_t0 = RpcNode::new("T0".to_string(), &url_t0, 1, 10, 0).unwrap();
-    let node_t1 = RpcNode::new("T1".to_string(), &url_t1, 100, 10, 1).unwrap();
+    let node_t0 = RpcNode::new("T0".to_string(), &url_t0, 1, 10, 0, ProviderCostTable::default(), u64::MAX, "requests".to_string()).unwrap();
+    let node_t1 = RpcNode::new("T1".to_string(), &url_t1, 100, 10, 1, ProviderCostTable::default(), u64::MAX, "requests".to_string()).unwrap();
     let client = RpcClient::new(vec![node_t0, node_t1]).unwrap();
 
     let (s1, _) = client
@@ -145,7 +148,7 @@ async fn retryable_jsonrpc_error_exhausts_nodes_then_fails() {
     // pressure to schedule a wait the for-loop ends with best_time=None,
     // surfacing the "All nodes failed" error path fast rather than retrying.
     let (url, _) = spawn_mock(200, SERVER_ERROR_BODY).await;
-    let node = RpcNode::new("A".to_string(), &url, 100, 10, 0).unwrap();
+    let node = RpcNode::new("A".to_string(), &url, 100, 10, 0, ProviderCostTable::default(), u64::MAX, "requests".to_string()).unwrap();
     let client = build_client(node);
 
     let err = client
@@ -167,7 +170,7 @@ async fn all_transport_errors_no_wait() {
     drop(listener);
     let url = format!("http://{addr}");
 
-    let node = RpcNode::new("dead".to_string(), &url, 100, 10, 0).unwrap();
+    let node = RpcNode::new("dead".to_string(), &url, 100, 10, 0, ProviderCostTable::default(), u64::MAX, "requests".to_string()).unwrap();
     let client = build_client(node);
 
     let err = client
@@ -186,8 +189,8 @@ async fn fallback_success_on_retryable_rpc_error() {
     let (url_a, count_a) = spawn_mock(200, SERVER_ERROR_BODY).await;
     let (url_b, count_b) = spawn_mock(200, OK_BODY).await;
 
-    let node_a = RpcNode::new("A".to_string(), &url_a, 100, 10, 0).unwrap();
-    let node_b = RpcNode::new("B".to_string(), &url_b, 100, 10, 0).unwrap();
+    let node_a = RpcNode::new("A".to_string(), &url_a, 100, 10, 0, ProviderCostTable::default(), u64::MAX, "requests".to_string()).unwrap();
+    let node_b = RpcNode::new("B".to_string(), &url_b, 100, 10, 0, ProviderCostTable::default(), u64::MAX, "requests".to_string()).unwrap();
     let client = RpcClient::new(vec![node_a, node_b]).unwrap();
 
     let (status, body) = client
@@ -211,8 +214,8 @@ async fn fallback_success_on_transport_error() {
 
     let (url_b, count_b) = spawn_mock(200, OK_BODY).await;
 
-    let node_a = RpcNode::new("A".to_string(), &dead_url, 100, 10, 0).unwrap();
-    let node_b = RpcNode::new("B".to_string(), &url_b, 100, 10, 0).unwrap();
+    let node_a = RpcNode::new("A".to_string(), &dead_url, 100, 10, 0, ProviderCostTable::default(), u64::MAX, "requests".to_string()).unwrap();
+    let node_b = RpcNode::new("B".to_string(), &url_b, 100, 10, 0, ProviderCostTable::default(), u64::MAX, "requests".to_string()).unwrap();
     let client = RpcClient::new(vec![node_a, node_b]).unwrap();
 
     let (status, body) = client
@@ -228,7 +231,7 @@ async fn fallback_success_on_transport_error() {
 #[tokio::test]
 async fn sleep_and_retry_after_rate_limit_exhaustion() {
     let (url, count) = spawn_mock(200, OK_BODY).await;
-    let node = RpcNode::new("A".to_string(), &url, 10, 10, 0).unwrap();
+    let node = RpcNode::new("A".to_string(), &url, 10, 10, 0, ProviderCostTable::default(), u64::MAX, "requests".to_string()).unwrap();
     let client = build_client(node.clone());
 
     // Burn the 10-token burst directly (no HTTP), leaving the bucket empty.
@@ -250,7 +253,7 @@ async fn sleep_and_retry_after_rate_limit_exhaustion() {
 #[tokio::test]
 async fn global_timeout_fails_fast() {
     let (url, _) = spawn_mock_latency(200, OK_BODY, Duration::from_millis(1500)).await;
-    let node = RpcNode::new("slow".to_string(), &url, 100, 10, 0).unwrap();
+    let node = RpcNode::new("slow".to_string(), &url, 100, 10, 0, ProviderCostTable::default(), u64::MAX, "requests".to_string()).unwrap();
     let client = build_client(node);
 
     let err = client
@@ -267,7 +270,7 @@ async fn global_timeout_fails_fast() {
 #[tokio::test]
 async fn invalid_json_upstream_fails() {
     let (url, _) = spawn_mock(200, "not json").await;
-    let node = RpcNode::new("A".to_string(), &url, 100, 10, 0).unwrap();
+    let node = RpcNode::new("A".to_string(), &url, 100, 10, 0, ProviderCostTable::default(), u64::MAX, "requests".to_string()).unwrap();
     let client = build_client(node);
 
     let err = client
