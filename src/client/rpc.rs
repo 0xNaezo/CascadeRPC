@@ -86,7 +86,6 @@ impl RpcClient {
         Ok(result)
     }
 
-    // ponytail: false = no retry, true = retry
     #[must_use]
     pub fn is_retryable_error(error_code: StatusCode) -> bool {
         let http_status = error_code.as_u16();
@@ -102,7 +101,6 @@ impl RpcClient {
         true
     }
 
-    // ponytail: false = no retry, true = retry
     #[must_use]
     pub fn is_retryable_json_rpc_error(error_code: i32) -> bool {
         let not_retryable = [-32700, -32601, -32602, -32600];
