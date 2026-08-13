@@ -7,7 +7,8 @@ use tokio::time::{Instant, timeout};
 use tracing::{debug, trace};
 
 use crate::core::rpc::{GaugeGuard, RpcClient};
-use crate::protocol::rpc_payload::RpcErrorOnly;
+use crate::protocol::methods::get_standard_method_id;
+use crate::protocol::rpc_payload::{MethodExtractor, RpcErrorOnly};
 
 impl RpcClient {
     /// Sends a JSON-RPC request with fallback across nodes.
@@ -15,11 +16,18 @@ impl RpcClient {
     /// # Errors
     ///
     /// Returns an error if all RPC nodes fail or exhaust their rate limits.
-    pub async fn send(
-        &self,
-        body_bytes: Bytes,
-    ) -> Result<(StatusCode, Bytes), Bytes> {
+    pub async fn send(&self, body_bytes: Bytes) -> Result<(StatusCode, Bytes), Bytes> {
         let request_started = Instant::now();
+
+        let method: MethodExtractor = match serde_json::from_slice(&body_bytes) {
+            Ok(res) => res,
+            Err(_) => {
+                return Err(Bytes::from_static(
+                    br#"{"jsonrpc":"2.0","error":{"code":-32700,"message":"Parse error"},"id":null}"#,
+                ));
+            }
+        };
+        let method = method.method;
 
         let result = timeout(Duration::from_secs(1), async {
             loop {
@@ -38,6 +46,21 @@ impl RpcClient {
                             continue;
                         }
                     };
+
+                    let used = self.nodes_usage.get_node_usage(&node.name);
+
+                    if used.get() > node.spillover_threshold {
+                        continue;
+                    }
+
+                    let method_id = get_standard_method_id(method.as_bytes());
+                    let method_cost = node.method_costs.cost(method_id);
+
+                    if method_cost == u32::MAX {
+                        continue;
+                    }
+
+                    self.nodes_usage.add_node_usage(&node.name, u64::from(method_cost));
 
                     trace!(node = %node.name, "sending request");
                     let started = Instant::now();

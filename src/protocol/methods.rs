@@ -121,8 +121,8 @@ pub enum RpcMethod {
 }
 
 #[must_use]
-pub fn get_standard_method_id(method_bytes: &[u8]) -> Option<usize> {
-    Some(match method_bytes {
+pub fn get_standard_method_id(method_bytes: &[u8]) -> usize {
+    (match method_bytes {
         b"StakedConnections" => RpcMethod::StakedConnections,
         b"batchIdentityLookup" => RpcMethod::BatchIdentityLookup,
         b"createWebhook" => RpcMethod::CreateWebhook,
@@ -241,6 +241,6 @@ pub fn get_standard_method_id(method_bytes: &[u8]) -> Option<usize> {
         b"walletHistory" => RpcMethod::WalletHistory,
         b"walletIdentity" => RpcMethod::WalletIdentity,
         b"webhookEvent" => RpcMethod::WebhookEvent,
-        _ => return None, // Unknown
+        _ => RpcMethod::Unknown,
     } as usize)
 }

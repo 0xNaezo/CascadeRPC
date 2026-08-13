@@ -34,6 +34,7 @@ pub struct NewNode {
     pub method_costs: ProviderCostTable,
     pub monthly_limit: u64,
     pub billing_type: String,
+    pub spillover_percent: u8,
 }
 
 #[derive(Clone)]
@@ -48,6 +49,7 @@ pub struct RpcNode {
     pub method_costs: Arc<ProviderCostTable>,
     pub monthly_limit: u64,
     pub billing_type: String,
+    pub spillover_threshold: u64,
 }
 
 impl RpcNode {
@@ -69,6 +71,10 @@ impl RpcNode {
             )
         })?;
 
+        // u128 multiply avoids overflow when monthly_limit == u64::MAX (unlimited nodes).
+        let spillover_threshold =
+            ((config.monthly_limit as u128) * u128::from(config.spillover_percent) / 100) as u64;
+
         Ok(Self {
             name: config.name,
             url,
@@ -80,6 +86,7 @@ impl RpcNode {
             method_costs: Arc::new(config.method_costs),
             monthly_limit: config.monthly_limit,
             billing_type: config.billing_type,
+            spillover_threshold,
         })
     }
 
@@ -104,5 +111,41 @@ impl RpcNode {
             .map_err(|_| Duration::MAX)?;
 
         Ok(permit)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn dummy_node(monthly_limit: u64, spillover_percent: u8) -> RpcNode {
+        RpcNode::new(NewNode {
+            name: "test".into(),
+            url: "http://localhost:9".into(),
+            rps_limit: 1,
+            max_concurrent: 1,
+            tier: 0,
+            method_costs: ProviderCostTable::default(),
+            monthly_limit,
+            billing_type: "credits".into(),
+            spillover_percent,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn spillover_threshold_basic() {
+        assert_eq!(dummy_node(1000, 95).spillover_threshold, 950);
+        assert_eq!(dummy_node(1000, 100).spillover_threshold, 1000);
+        assert_eq!(dummy_node(1000, 1).spillover_threshold, 10);
+    }
+
+    #[test]
+    fn spillover_threshold_no_overflow_at_max() {
+        // Regression: monthly_limit == u64::MAX * 95 panicked in the old
+        // `monthly_limit * 95` code. u128 path must not overflow.
+        let node = dummy_node(u64::MAX, 95);
+        assert!(node.spillover_threshold < u64::MAX);
     }
 }
