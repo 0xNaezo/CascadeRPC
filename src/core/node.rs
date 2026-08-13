@@ -25,7 +25,18 @@ pub struct RoutingTable {
 pub type DefaultDirectRateLimiter<MW = NoOpMiddleware<<DefaultClock as Clock>::Instant>> =
     RateLimiter<NotKeyed, InMemoryState, DefaultClock, MW>;
 
-#[derive(Clone)] 
+pub struct NewNode {
+    pub name: String,
+    pub url: String,
+    pub rps_limit: u32,
+    pub max_concurrent: usize,
+    pub tier: u8,
+    pub method_costs: ProviderCostTable,
+    pub monthly_limit: u64,
+    pub billing_type: String,
+}
+
+#[derive(Clone)]
 pub struct RpcNode {
     pub name: String,
     pub url: Url,
@@ -44,35 +55,31 @@ impl RpcNode {
     ///
     /// # Errors
     ///
-    /// Returns an error if `rate_limiting` is 0 or `url_str` is not a valid URL.
-    pub fn new(
-        name: String,
-        url_str: &str,
-        rate_limiting: u32,
-        concurrency_limiting: usize,
-        tier: u8,
-        method_costs: ProviderCostTable,
-        monthly_limit: u64,
-        billing_type: String,
-    ) -> Result<Self> {
-        let non_zero_rate_limiting = NonZeroU32::new(rate_limiting)
-            .ok_or_else(|| anyhow::anyhow!("Fatal error: RPS for node '{name}' cannot be 0"))?;
+    /// Returns an error if `rps_limit` is 0 or `url` is not a valid URL.
+    pub fn new(config: NewNode) -> Result<Self> {
+        let non_zero_rate_limiting = NonZeroU32::new(config.rps_limit).ok_or_else(|| {
+            anyhow::anyhow!("Fatal error: RPS for node '{}' cannot be 0", config.name)
+        })?;
 
         let quota = Quota::per_second(non_zero_rate_limiting);
-        let url = Url::parse(url_str)
-            .with_context(|| format!("Fatal error: invalid URL for node '{name}': {url_str}"))?;
+        let url = Url::parse(&config.url).with_context(|| {
+            format!(
+                "Fatal error: invalid URL for node '{}': {}",
+                config.name, config.url
+            )
+        })?;
 
         Ok(Self {
-            name,
+            name: config.name,
             url,
             rate_limiting: Arc::new(RateLimiter::direct(quota)),
-            concurrency_limiting: Arc::new(Semaphore::new(concurrency_limiting)),
-            tier,
+            concurrency_limiting: Arc::new(Semaphore::new(config.max_concurrent)),
+            tier: config.tier,
             latency: Arc::new(AtomicU32::new(0)),
             healthy: Arc::new(AtomicBool::new(true)),
-            method_costs: Arc::new(method_costs),
-            monthly_limit,
-            billing_type,
+            method_costs: Arc::new(config.method_costs),
+            monthly_limit: config.monthly_limit,
+            billing_type: config.billing_type,
         })
     }
 
