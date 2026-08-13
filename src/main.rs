@@ -1,7 +1,9 @@
 use anyhow::Result;
 use rpc_load_balancer::{
     core::{
-        healthcheck::HealthCheckLoop, rpc::RpcClient, node::{RpcNode, NewNode},
+        healthcheck::HealthCheckLoop,
+        node::{NewNode, RpcNode},
+        rpc::RpcClient,
     },
     provider::{load_config::Settings, pricing_parser},
     server,
@@ -25,7 +27,8 @@ async fn main() -> Result<()> {
         .nodes
         .into_iter()
         .map(|n| {
-            let costs = pricing_parser::load_from_path(&n.provider_pricing_path)?;
+            let (costs, spillover_percent) =
+                pricing_parser::load_from_path(&n.provider_pricing_path)?;
 
             RpcNode::new(NewNode {
                 name: n.name,
@@ -36,6 +39,7 @@ async fn main() -> Result<()> {
                 method_costs: costs,
                 monthly_limit: n.monthly_limit,
                 billing_type: n.billing_type,
+                spillover_percent,
             })
         })
         .collect::<Result<Vec<RpcNode>, _>>()?;

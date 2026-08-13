@@ -22,9 +22,9 @@ pub struct RpcError {
 }
 
 #[derive(Deserialize)]
-struct MethodExtractor<'a> {
+pub struct MethodExtractor<'a> {
     #[serde(borrow)]
-    method: &'a str,
+    pub method: &'a str,
 }
 
 pub enum IncomingPayload<'a> {

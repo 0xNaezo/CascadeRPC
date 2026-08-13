@@ -1,4 +1,10 @@
+[limits]
+
+spillover_percent = 95
+
 [routing]
+
+Unknown = 1
 
 # Solana standard JSON-RPC methods
 getAccountInfo = 1

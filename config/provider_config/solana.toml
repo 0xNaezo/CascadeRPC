@@ -1,5 +1,7 @@
 [routing]
 
+Unknown = 1
+
 # Accounts
 getAccountInfo = 1
 getBalance = 1

@@ -7,7 +7,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
 
-use crate::core::node::{RoutingTable, RpcNode};
+use crate::{
+    core::node::{RoutingTable, RpcNode},
+    quotas::GlobalQuotaState,
+};
 
 pub struct GaugeGuard(metrics::Gauge);
 
@@ -30,6 +33,7 @@ pub struct RpcClient {
     pub client: Client,
     pub all_nodes: Vec<Arc<RpcNode>>,
     pub routing_table: Arc<ArcSwap<RoutingTable>>,
+    pub nodes_usage: Arc<GlobalQuotaState>,
 }
 
 impl RpcClient {
@@ -41,6 +45,10 @@ impl RpcClient {
     /// (e.g. TLS backend failure).
     pub fn new(nodes: Vec<RpcNode>) -> Result<Self> {
         let client = Client::builder().timeout(Duration::new(2, 0)).build()?;
+
+        let nodes_name: Vec<String> = nodes.iter().map(|node| node.name.clone()).collect();
+        let nodes_usage = Arc::new(GlobalQuotaState::new(nodes_name));
+
         let all_nodes: Vec<Arc<RpcNode>> = nodes.into_iter().map(Arc::new).collect();
 
         Ok(Self {
@@ -48,6 +56,7 @@ impl RpcClient {
             routing_table: Arc::new(ArcSwap::from_pointee(RoutingTable {
                 active_nodes: all_nodes.clone(),
             })),
+            nodes_usage,
             all_nodes,
         })
     }

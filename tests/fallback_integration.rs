@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -62,7 +63,13 @@ fn build_client(node: RpcNode) -> RpcClient {
     RpcClient::new(vec![node]).unwrap()
 }
 
-const OK_BODY: &str = r#"{"jsonrpc":"2.0","result":"ok","id":1}"#;
+/// Cost table that prices `getBalance` (the method in `OK_BODY`), so nodes
+/// aren't skipped by the u32::MAX "can't implement" guard.
+fn priced_table() -> ProviderCostTable {
+    ProviderCostTable::new(HashMap::from([("getBalance".to_string(), 1)]))
+}
+
+const OK_BODY: &str = r#"{"jsonrpc":"2.0","method":"getBalance","result":"ok","id":1}"#;
 const INVALID_PARAMS_BODY: &str =
     r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"invalid params"}}"#;
 const SERVER_ERROR_BODY: &str =
@@ -77,9 +84,10 @@ async fn success_path() {
         rps_limit: 100,
         max_concurrent: 10,
         tier: 0,
-        method_costs: ProviderCostTable::default(),
+        method_costs: priced_table(),
         monthly_limit: u64::MAX,
         billing_type: "requests".to_string(),
+        spillover_percent: 100,
     })
     .unwrap();
     let client = build_client(node);
@@ -100,9 +108,10 @@ async fn non_retryable_http_error_passthrough() {
         rps_limit: 100,
         max_concurrent: 10,
         tier: 0,
-        method_costs: ProviderCostTable::default(),
+        method_costs: priced_table(),
         monthly_limit: u64::MAX,
         billing_type: "requests".to_string(),
+        spillover_percent: 100,
     })
     .unwrap();
     let client = build_client(node);
@@ -123,9 +132,10 @@ async fn non_retryable_jsonrpc_error_passthrough() {
         rps_limit: 100,
         max_concurrent: 10,
         tier: 0,
-        method_costs: ProviderCostTable::default(),
+        method_costs: priced_table(),
         monthly_limit: u64::MAX,
         billing_type: "requests".to_string(),
+        spillover_percent: 100,
     })
     .unwrap();
     let client = build_client(node);
@@ -150,9 +160,10 @@ async fn tier_spillover_on_rate_limit() {
         rps_limit: 1,
         max_concurrent: 10,
         tier: 0,
-        method_costs: ProviderCostTable::default(),
+        method_costs: priced_table(),
         monthly_limit: u64::MAX,
         billing_type: "requests".to_string(),
+        spillover_percent: 100,
     })
     .unwrap();
     let node_t1 = RpcNode::new(NewNode {
@@ -161,9 +172,10 @@ async fn tier_spillover_on_rate_limit() {
         rps_limit: 100,
         max_concurrent: 10,
         tier: 1,
-        method_costs: ProviderCostTable::default(),
+        method_costs: priced_table(),
         monthly_limit: u64::MAX,
         billing_type: "requests".to_string(),
+        spillover_percent: 100,
     })
     .unwrap();
     let client = RpcClient::new(vec![node_t0, node_t1]).unwrap();
@@ -192,9 +204,10 @@ async fn retryable_jsonrpc_error_exhausts_nodes_then_fails() {
         rps_limit: 100,
         max_concurrent: 10,
         tier: 0,
-        method_costs: ProviderCostTable::default(),
+        method_costs: priced_table(),
         monthly_limit: u64::MAX,
         billing_type: "requests".to_string(),
+        spillover_percent: 100,
     })
     .unwrap();
     let client = build_client(node);
@@ -224,9 +237,10 @@ async fn all_transport_errors_no_wait() {
         rps_limit: 100,
         max_concurrent: 10,
         tier: 0,
-        method_costs: ProviderCostTable::default(),
+        method_costs: priced_table(),
         monthly_limit: u64::MAX,
         billing_type: "requests".to_string(),
+        spillover_percent: 100,
     })
     .unwrap();
     let client = build_client(node);
@@ -237,9 +251,40 @@ async fn all_transport_errors_no_wait() {
         .expect_err("transport failure should produce an error, not a 502");
     let err_str = String::from_utf8_lossy(&err);
     assert!(
+        err_str.contains("All nodes failed"),
+        "unexpected error: {err_str}"
+    );
+}
+
+#[tokio::test]
+async fn unsupported_method_skips_node() {
+    // Default table prices nothing → cost() returns u32::MAX → node is skipped
+    // before the request is sent.
+    let (url, count) = spawn_mock(200, OK_BODY).await;
+    let node = RpcNode::new(NewNode {
+        name: "A".to_string(),
+        url: url.clone(),
+        rps_limit: 100,
+        max_concurrent: 10,
+        tier: 0,
+        method_costs: ProviderCostTable::default(),
+        monthly_limit: u64::MAX,
+        billing_type: "requests".to_string(),
+        spillover_percent: 100,
+    })
+    .unwrap();
+    let client = build_client(node);
+
+    let err = client
+        .send(Bytes::from(OK_BODY))
+        .await
+        .expect_err("unsupported method should skip the node");
+    let err_str = String::from_utf8_lossy(&err);
+    assert!(
         err_str.contains("no rate limits"),
         "unexpected error: {err_str}"
     );
+    assert_eq!(count.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test]
@@ -253,9 +298,10 @@ async fn fallback_success_on_retryable_rpc_error() {
         rps_limit: 100,
         max_concurrent: 10,
         tier: 0,
-        method_costs: ProviderCostTable::default(),
+        method_costs: priced_table(),
         monthly_limit: u64::MAX,
         billing_type: "requests".to_string(),
+        spillover_percent: 100,
     })
     .unwrap();
     let node_b = RpcNode::new(NewNode {
@@ -264,9 +310,10 @@ async fn fallback_success_on_retryable_rpc_error() {
         rps_limit: 100,
         max_concurrent: 10,
         tier: 0,
-        method_costs: ProviderCostTable::default(),
+        method_costs: priced_table(),
         monthly_limit: u64::MAX,
         billing_type: "requests".to_string(),
+        spillover_percent: 100,
     })
     .unwrap();
     let client = RpcClient::new(vec![node_a, node_b]).unwrap();
@@ -295,9 +342,10 @@ async fn fallback_success_on_transport_error() {
         rps_limit: 100,
         max_concurrent: 10,
         tier: 0,
-        method_costs: ProviderCostTable::default(),
+        method_costs: priced_table(),
         monthly_limit: u64::MAX,
         billing_type: "requests".to_string(),
+        spillover_percent: 100,
     })
     .unwrap();
     let node_b = RpcNode::new(NewNode {
@@ -306,9 +354,10 @@ async fn fallback_success_on_transport_error() {
         rps_limit: 100,
         max_concurrent: 10,
         tier: 0,
-        method_costs: ProviderCostTable::default(),
+        method_costs: priced_table(),
         monthly_limit: u64::MAX,
         billing_type: "requests".to_string(),
+        spillover_percent: 100,
     })
     .unwrap();
     let client = RpcClient::new(vec![node_a, node_b]).unwrap();
@@ -329,9 +378,10 @@ async fn sleep_and_retry_after_rate_limit_exhaustion() {
         rps_limit: 10,
         max_concurrent: 10,
         tier: 0,
-        method_costs: ProviderCostTable::default(),
+        method_costs: priced_table(),
         monthly_limit: u64::MAX,
         billing_type: "requests".to_string(),
+        spillover_percent: 100,
     })
     .unwrap();
     let client = build_client(node.clone());
@@ -358,9 +408,10 @@ async fn global_timeout_fails_fast() {
         rps_limit: 100,
         max_concurrent: 10,
         tier: 0,
-        method_costs: ProviderCostTable::default(),
+        method_costs: priced_table(),
         monthly_limit: u64::MAX,
         billing_type: "requests".to_string(),
+        spillover_percent: 100,
     })
     .unwrap();
     let client = build_client(node);
@@ -385,9 +436,10 @@ async fn invalid_json_upstream_fails() {
         rps_limit: 100,
         max_concurrent: 10,
         tier: 0,
-        method_costs: ProviderCostTable::default(),
+        method_costs: priced_table(),
         monthly_limit: u64::MAX,
         billing_type: "requests".to_string(),
+        spillover_percent: 100,
     })
     .unwrap();
     let client = build_client(node);

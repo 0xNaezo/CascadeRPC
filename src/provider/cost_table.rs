@@ -21,16 +21,11 @@ impl ProviderCostTable {
         let mut costs = [u32::MAX; RpcMethod::Count as usize];
 
         for (name, price) in config_methods {
-            // temporarily skip methods not in the enum; they will be added later
-            if let Some(id) = get_standard_method_id(name.as_bytes())
-            // guard against unknown methods and out-of-bounds indices
-                && id != 0
-                && id < costs.len()
-            {
+            // guard against overwriting the Unknown slot
+            let id = get_standard_method_id(name.as_bytes());
+            if id != 0 {
                 costs[id] = price;
             }
-
-            // store unknown methods
         }
 
         Self { costs }
@@ -38,7 +33,14 @@ impl ProviderCostTable {
 
     #[inline]
     #[must_use]
-    pub const fn cost(&self, method: RpcMethod) -> u32 {
-        self.costs[method as usize]
+    pub const fn cost(&self, id: usize) -> u32 {
+        // stub for custom methods not in the enum — they resolve to the
+        // Unknown slot (0), which is never priced and stays u32::MAX ("node can't
+        // do it"). Add a HashMap<String, u32> branch here when custom methods land.
+        if id < self.costs.len() {
+            self.costs[id]
+        } else {
+            u32::MAX
+        }
     }
 }
