@@ -212,7 +212,7 @@ async fn retryable_jsonrpc_error_exhausts_nodes_then_fails() {
     .unwrap();
     let client = build_client(node);
 
-    let err = client
+    let (_, err) = client
         .send(Bytes::from(OK_BODY))
         .await
         .expect_err("retryable error with no rate-limit wait should fail fast");
@@ -245,11 +245,12 @@ async fn all_transport_errors_no_wait() {
     .unwrap();
     let client = build_client(node);
 
-    let err = client
+    let (status, err) = client
         .send(Bytes::from(OK_BODY))
         .await
         .expect_err("transport failure should produce an error, not a 502");
     let err_str = String::from_utf8_lossy(&err);
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert!(
         err_str.contains("All nodes failed"),
         "unexpected error: {err_str}"
@@ -275,7 +276,7 @@ async fn unsupported_method_skips_node() {
     .unwrap();
     let client = build_client(node);
 
-    let err = client
+    let (_, err) = client
         .send(Bytes::from(OK_BODY))
         .await
         .expect_err("unsupported method should skip the node");
@@ -416,11 +417,12 @@ async fn global_timeout_fails_fast() {
     .unwrap();
     let client = build_client(node);
 
-    let err = client
+    let (status, err) = client
         .send(Bytes::from(OK_BODY))
         .await
         .expect_err("a node slower than the 1s budget should time out");
     let err_str = String::from_utf8_lossy(&err);
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
     assert!(
         err_str.contains("Global timeout"),
         "unexpected error: {err_str}"
@@ -444,7 +446,7 @@ async fn invalid_json_upstream_fails() {
     .unwrap();
     let client = build_client(node);
 
-    let err = client
+    let (_, err) = client
         .send(Bytes::from(OK_BODY))
         .await
         .expect_err("unparseable upstream body should fail the request");

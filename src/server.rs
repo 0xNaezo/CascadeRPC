@@ -50,8 +50,7 @@ pub async fn init_server(
 
 async fn send_request(State(rpc_client): State<RpcClient>, body: Bytes) -> (StatusCode, Bytes) {
     match rpc_client.send(body).await {
-        Ok((status, body)) => (status, body),
-        Err(msg) => (StatusCode::BAD_GATEWAY, msg),
+        Ok(response) | Err(response) => response,
     }
 }
 
