@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt / clippy / test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      # Lint levels come from [lints.clippy] in Cargo.toml: unwrap_used,
+      # expect_used and panic are `deny` and fail the job; pedantic + nursery
+      # are `warn` and only report.
+      #
+      # Deliberately no `RUSTFLAGS: -D warnings`: it would promote four
+      # pre-existing pedantic warnings (health.rs:41, node.rs:76 x2,
+      # methods.rs:124) into failures. Clear those, then add the flag here.
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features
+
+      # Tests bind ephemeral loopback ports and read the provider configs via
+      # CARGO_MANIFEST_DIR, so no fixtures, .env or CONFIG_PATH are needed.
+      - name: Tests
+        run: cargo test --all-targets
