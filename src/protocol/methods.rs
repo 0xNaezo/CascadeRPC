@@ -244,3 +244,171 @@ pub fn get_standard_method_id(method_bytes: &[u8]) -> usize {
         _ => RpcMethod::Unknown,
     } as usize)
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use crate::provider::pricing_parser::load_from_dir;
+    use std::collections::{HashMap, HashSet};
+    use std::path::Path;
+
+    const PROVIDER_CONFIG_DIR: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/config/provider_config");
+
+    fn id(name: &str) -> usize {
+        get_standard_method_id(name.as_bytes())
+    }
+
+    /// Every method name priced by a shipped provider config, per provider.
+    /// `Unknown` is filtered out: it is a real key in helius.toml and is meant
+    /// to resolve to slot 0.
+    fn provider_method_names() -> HashMap<String, Vec<String>> {
+        load_from_dir(Path::new(PROVIDER_CONFIG_DIR))
+            .expect("shipped provider configs must parse")
+            .into_iter()
+            .map(|(provider, methods)| {
+                let mut names: Vec<String> = methods
+                    .into_keys()
+                    .filter(|name| name != "Unknown")
+                    .collect();
+                names.sort();
+                (provider, names)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_method_in_the_shipped_configs_resolves() {
+        // A name the lookup does not know resolves to slot 0, which
+        // `ProviderCostTable::new` refuses to price — so the provider silently
+        // loses the ability to serve that method.
+        let providers = provider_method_names();
+        assert!(!providers.is_empty(), "no provider configs were loaded");
+
+        for (provider, names) in providers {
+            assert!(!names.is_empty(), "{provider} priced no methods");
+
+            for name in names {
+                assert_ne!(
+                    id(&name),
+                    RpcMethod::Unknown as usize,
+                    "{provider} prices `{name}`, but the method lookup does not know it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn distinct_method_names_never_share_an_id() {
+        // Guards the hand-written match against copy-paste: two arms pointing
+        // at the same variant would make one method inherit the other's price.
+        let mut seen: HashMap<usize, String> = HashMap::new();
+
+        for names in provider_method_names().into_values() {
+            for name in names {
+                let method_id = id(&name);
+
+                if let Some(previous) = seen.insert(method_id, name.clone()) {
+                    assert_eq!(
+                        previous, name,
+                        "`{previous}` and `{name}` both resolve to id {method_id}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_resolved_id_fits_the_cost_table() {
+        // `ProviderCostTable` indexes a fixed [u32; Count] array with these ids.
+        for names in provider_method_names().into_values() {
+            for name in names {
+                assert!(
+                    id(&name) < RpcMethod::Count as usize,
+                    "`{name}` resolves outside the cost table"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn known_methods_map_to_expected_variants() {
+        // Transcribed from the Solana / Helius / Jito RPC docs rather than from
+        // the match above, so a wrong arm shows up as a mismatch here.
+        let expected = [
+            ("getAccountInfo", RpcMethod::GetAccountInfo as usize),
+            ("getBalance", RpcMethod::GetBalance as usize),
+            ("getBlockHeight", RpcMethod::GetBlockHeight as usize),
+            ("getEpochInfo", RpcMethod::GetEpochInfo as usize),
+            ("getHealth", RpcMethod::GetHealth as usize),
+            ("getLatestBlockhash", RpcMethod::GetLatestBlockhash as usize),
+            (
+                "getMultipleAccounts",
+                RpcMethod::GetMultipleAccounts as usize,
+            ),
+            ("getProgramAccounts", RpcMethod::GetProgramAccounts as usize),
+            (
+                "getSignatureStatuses",
+                RpcMethod::GetSignatureStatuses as usize,
+            ),
+            (
+                "getSignaturesForAddress",
+                RpcMethod::GetSignaturesForAddress as usize,
+            ),
+            ("getSlot", RpcMethod::GetSlot as usize),
+            (
+                "getTokenAccountsByOwner",
+                RpcMethod::GetTokenAccountsByOwner as usize,
+            ),
+            ("getTransaction", RpcMethod::GetTransaction as usize),
+            (
+                "getTransactionCount",
+                RpcMethod::GetTransactionCount as usize,
+            ),
+            ("sendTransaction", RpcMethod::SendTransaction as usize),
+            (
+                "simulateTransaction",
+                RpcMethod::SimulateTransaction as usize,
+            ),
+            ("getAsset", RpcMethod::GetAsset as usize),
+            ("getAssetsByOwner", RpcMethod::GetAssetsByOwner as usize),
+            (
+                "getPriorityFeeEstimate",
+                RpcMethod::GetPriorityFeeEstimate as usize,
+            ),
+            ("sendBundle", RpcMethod::SendBundle as usize),
+            ("getTipAccounts", RpcMethod::GetTipAccounts as usize),
+        ];
+
+        for (name, expected_id) in expected {
+            assert_eq!(id(name), expected_id, "wrong id for `{name}`");
+        }
+
+        // The table itself must not contain duplicates, or the assertions above
+        // would pass while hiding a collision.
+        let unique: HashSet<usize> = expected.iter().map(|(_, method_id)| *method_id).collect();
+        assert_eq!(unique.len(), expected.len());
+    }
+
+    #[test]
+    fn unrecognized_names_resolve_to_unknown() {
+        for name in [
+            "",
+            "fooBar",
+            "getBalanace",     // typo
+            "GETBALANCE",      // lookup is case-sensitive
+            "getbalance",      //
+            " getBalance",     // untrimmed
+            "getBalance ",     //
+            "eth_getBalance",  // wrong chain
+            "getBalance\u{0}", // trailing NUL
+        ] {
+            assert_eq!(
+                id(name),
+                RpcMethod::Unknown as usize,
+                "`{name}` should not resolve"
+            );
+        }
+    }
+}
