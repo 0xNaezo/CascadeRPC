@@ -9,7 +9,7 @@ use url::Url;
 
 use crate::{
     core::node::{RoutingTable, RpcNode},
-    quotas::GlobalQuotaState,
+    quotas::{GlobalQuotaState, MAX_NODES},
 };
 
 pub struct GaugeGuard(metrics::Gauge);
@@ -43,11 +43,21 @@ impl RpcClient {
     ///
     /// Returns an error if the underlying HTTP client cannot be initialized
     /// (e.g. TLS backend failure).
-    pub fn new(nodes: Vec<RpcNode>) -> Result<Self> {
+    pub fn new(mut nodes: Vec<RpcNode>) -> Result<Self> {
         let client = Client::builder().timeout(Duration::new(2, 0)).build()?;
 
-        let nodes_name: Vec<String> = nodes.iter().map(|node| node.name.clone()).collect();
-        let nodes_usage = Arc::new(GlobalQuotaState::new(nodes_name));
+        if nodes.len() > MAX_NODES {
+            anyhow::bail!(
+                "Fatal error: at most {MAX_NODES} nodes are supported, config has {}",
+                nodes.len()
+            );
+        }
+
+        for (id, node) in nodes.iter_mut().enumerate() {
+            node.id = id;
+        }
+
+        let nodes_usage = Arc::new(GlobalQuotaState::default());
 
         let all_nodes: Vec<Arc<RpcNode>> = nodes.into_iter().map(Arc::new).collect();
 
@@ -126,6 +136,46 @@ impl RpcClient {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::core::node::NewNode;
+    use crate::provider::cost_table::ProviderCostTable;
+
+    fn nodes(count: usize) -> Vec<RpcNode> {
+        (0..count)
+            .map(|i| {
+                RpcNode::new(NewNode {
+                    name: format!("node{i}"),
+                    url: "http://localhost:9".into(),
+                    rps_limit: 1,
+                    max_concurrent: 1,
+                    tier: 0,
+                    method_costs: ProviderCostTable::default(),
+                    monthly_limit: u64::MAX,
+                    billing_type: "credits".into(),
+                    spillover_percent: 100,
+                })
+                .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn new_assigns_dense_ids_in_config_order() {
+        // The quota array is indexed by these ids; a gap or a duplicate would
+        // make two nodes share one counter.
+        let client = RpcClient::new(nodes(3)).unwrap();
+
+        let ids: Vec<usize> = client.all_nodes.iter().map(|node| node.id).collect();
+
+        assert_eq!(ids, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn new_rejects_more_nodes_than_quota_slots() {
+        // Without this guard the extra node carries an id past the end of the
+        // array and `usage()` panics on the request hot path.
+        assert!(RpcClient::new(nodes(MAX_NODES + 1)).is_err());
+        assert!(RpcClient::new(nodes(MAX_NODES)).is_ok());
+    }
 
     #[test]
     fn retryable_error_true_for_5xx_and_429() {

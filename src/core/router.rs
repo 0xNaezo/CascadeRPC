@@ -180,7 +180,7 @@ impl RpcClient {
             }
         };
 
-        let used = self.nodes_usage.get_node_usage(&node.name);
+        let used = self.nodes_usage.usage(node.id);
 
         if used.get() > node.spillover_threshold {
             return Admission::Skip;

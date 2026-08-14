@@ -15,14 +15,24 @@ use common::{
     spawn_mock,
 };
 
+/// Quota slot of a node, resolved by name so the tests below stay readable.
+fn node_id(client: &RpcClient, name: &str) -> usize {
+    client
+        .all_nodes
+        .iter()
+        .find(|node| node.name == name)
+        .expect("node was never given to build_client")
+        .id
+}
+
 /// Current booked usage for a node.
 fn usage(client: &RpcClient, name: &str) -> u64 {
-    client.nodes_usage.get_node_usage(name).get()
+    client.nodes_usage.usage(node_id(client, name)).get()
 }
 
 /// Books `amount` against a node, simulating traffic already served this month.
 fn seed_usage(client: &RpcClient, name: &str, amount: u64) {
-    client.nodes_usage.get_node_usage(name).add(amount);
+    client.nodes_usage.usage(node_id(client, name)).add(amount);
 }
 
 #[tokio::test]

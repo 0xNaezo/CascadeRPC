@@ -39,6 +39,7 @@ pub struct NewNode {
 
 #[derive(Clone)]
 pub struct RpcNode {
+    pub id: usize,
     pub name: String,
     pub url: Url,
     pub rate_limiting: Arc<DefaultDirectRateLimiter>,
@@ -76,6 +77,7 @@ impl RpcNode {
             ((config.monthly_limit as u128) * u128::from(config.spillover_percent) / 100) as u64;
 
         Ok(Self {
+            id: 0,
             name: config.name,
             url,
             rate_limiting: Arc::new(RateLimiter::direct(quota)),
