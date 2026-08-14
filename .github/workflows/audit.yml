@@ -1,0 +1,52 @@
+name: Audit
+
+# Dependency-only workflow: runs when the dependency graph changes, i.e. on
+# Cargo.toml (declared deps) or Cargo.lock (resolved versions, what cargo-audit
+# actually reads). The config/**/*.toml files are runtime config, not deps, so
+# they deliberately do not trigger this job.
+#
+# No `schedule:` trigger by request — new RUSTSEC advisories against unchanged
+# deps will therefore only surface on the next Cargo.toml/lock edit or a manual
+# run from the Actions tab.
+on:
+  push:
+    branches: [main]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/audit.yml
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/audit.yml
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Prebuilt binary instead of `cargo install cargo-audit` (~2 min build).
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # Reads Cargo.lock against the RustSec advisory DB. Fails on
+      # vulnerabilities; `--deny warnings` also fails on unmaintained/yanked
+      # crates and unsound advisories.
+      - name: Audit dependencies
+        run: cargo audit --deny warnings
