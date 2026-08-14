@@ -12,11 +12,54 @@ use crate::protocol::methods::get_standard_method_id;
 use crate::protocol::rpc_payload::{MethodExtractor, RpcErrorOnly};
 
 const GLOBAL_TIMEOUT: Duration = Duration::from_secs(1);
-const PARSE_ERROR_BODY: &[u8] =
-    br#"{"jsonrpc":"2.0","error":{"code":-32700,"message":"Parse error"},"id":null}"#;
-const ALL_NODES_FAILED_BODY: &[u8] =
-    b"All nodes failed with server/network errors (no rate limits to wait for)";
-const GLOBAL_TIMEOUT_BODY: &[u8] = b"Global timeout (1s) exceeded while retrying nodes";
+
+/// Failure produced by the balancer itself, as opposed to a response forwarded
+/// from an upstream node.
+#[derive(Debug, Clone, Copy)]
+enum RouteError {
+    /// Client sent a body that is not a JSON-RPC request.
+    BadRequest,
+    /// Every node failed with a server/network error and none is merely
+    /// rate-limited, so there is nothing to wait for.
+    AllNodesFailed,
+    /// The global budget expired while retrying nodes.
+    Timeout,
+}
+
+impl RouteError {
+    const fn status(self) -> StatusCode {
+        match self {
+            Self::BadRequest => StatusCode::BAD_REQUEST,
+            Self::AllNodesFailed => StatusCode::BAD_GATEWAY,
+            Self::Timeout => StatusCode::GATEWAY_TIMEOUT,
+        }
+    }
+
+    const fn body(self) -> &'static [u8] {
+        match self {
+            Self::BadRequest => {
+                br#"{"jsonrpc":"2.0","error":{"code":-32700,"message":"Parse error"},"id":null}"#
+            }
+            Self::AllNodesFailed => {
+                b"All nodes failed with server/network errors (no rate limits to wait for)"
+            }
+            Self::Timeout => b"Global timeout (1s) exceeded while retrying nodes",
+        }
+    }
+
+    /// Value of the `outcome` label in `rpc_requests` / `rpc_request_duration`.
+    const fn outcome(self) -> &'static str {
+        match self {
+            Self::BadRequest => "bad_request",
+            Self::AllNodesFailed => "bad_gateway",
+            Self::Timeout => "timeout",
+        }
+    }
+
+    const fn response(self) -> (StatusCode, Bytes) {
+        (self.status(), Bytes::from_static(self.body()))
+    }
+}
 
 /// Whether a node may take the request right now.
 enum Admission<'a> {
@@ -39,36 +82,48 @@ enum Attempt {
 impl RpcClient {
     /// Sends a JSON-RPC request with fallback across nodes.
     ///
+    /// Both halves of the result carry the status to answer the client with:
+    /// on success it is the upstream's own status, on failure the one the
+    /// balancer picked for the reason it failed.
+    ///
     /// # Errors
     ///
-    /// Returns an error if all RPC nodes fail or exhaust their rate limits.
-    pub async fn send(&self, body_bytes: Bytes) -> Result<(StatusCode, Bytes), Bytes> {
+    /// Returns `400` with a JSON-RPC parse error if the body is not a JSON-RPC
+    /// request, `502` if all RPC nodes fail, and `504` if the global timeout
+    /// expires while retrying nodes.
+    pub async fn send(
+        &self,
+        body_bytes: Bytes,
+    ) -> Result<(StatusCode, Bytes), (StatusCode, Bytes)> {
         let request_started = Instant::now();
 
-        let method = match Self::extract_method(&body_bytes) {
-            Ok(method) => method,
-            Err(response) => return Err(response),
+        let result = self.dispatch(&body_bytes).await;
+
+        let outcome = match result {
+            Ok(_) => "forwarded",
+            Err(error) => error.outcome(),
         };
-        let method_id = get_standard_method_id(method.as_bytes());
-
-        let result = timeout(GLOBAL_TIMEOUT, self.route(&body_bytes, method_id)).await;
-
-        let (result, outcome) = match result {
-            Ok(Ok(response)) => (Ok(response), "forwarded"),
-            Ok(Err(message)) => (Err(message), "bad_gateway"),
-            Err(_) => (Err(Bytes::from_static(GLOBAL_TIMEOUT_BODY)), "timeout"),
-        };
-
         Self::record_request(outcome, request_started);
 
-        result
+        result.map_err(RouteError::response)
+    }
+
+    /// Resolves the method, then walks the nodes under the global time budget.
+    async fn dispatch(&self, body_bytes: &Bytes) -> Result<(StatusCode, Bytes), RouteError> {
+        let method = Self::extract_method(body_bytes)?;
+        let method_id = get_standard_method_id(method.as_bytes());
+
+        // `?` peels off the timeout layer; what is left is the routing outcome.
+        timeout(GLOBAL_TIMEOUT, self.route(body_bytes, method_id))
+            .await
+            .map_err(|_| RouteError::Timeout)?
     }
 
     /// Extracts the JSON-RPC method name from the raw request body.
-    fn extract_method(body_bytes: &[u8]) -> Result<&str, Bytes> {
+    fn extract_method(body_bytes: &[u8]) -> Result<&str, RouteError> {
         serde_json::from_slice::<MethodExtractor<'_>>(body_bytes)
             .map(|extractor| extractor.method)
-            .map_err(|_| Bytes::from_static(PARSE_ERROR_BODY))
+            .map_err(|_| RouteError::BadRequest)
     }
 
     /// Walks the routing table, retrying across nodes until one answers or all
@@ -78,7 +133,7 @@ impl RpcClient {
         &self,
         body_bytes: &Bytes,
         method_id: usize,
-    ) -> Result<(StatusCode, Bytes), Bytes> {
+    ) -> Result<(StatusCode, Bytes), RouteError> {
         loop {
             let active_nodes = self.routing_table.load();
 
@@ -106,7 +161,7 @@ impl RpcClient {
             }
 
             let Some(best_time) = best_time else {
-                return Err(Bytes::from_static(ALL_NODES_FAILED_BODY));
+                return Err(RouteError::AllNodesFailed);
             };
 
             Self::wait_rate_limited(best_time).await;
