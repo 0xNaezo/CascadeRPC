@@ -6,6 +6,7 @@ use rpc_load_balancer::{
         rpc::RpcClient,
     },
     provider::{load_config::Settings, pricing_parser},
+    quotas::persistence,
     server,
 };
 
@@ -47,6 +48,7 @@ async fn main() -> Result<()> {
     let rpc_client = RpcClient::new(nodes)?;
 
     tokio::spawn(HealthCheckLoop::run_healthcheck_loop(rpc_client.clone()));
+    tokio::spawn(persistence::start_disk_flusher(rpc_client.clone()));
 
     server::init_server(
         rpc_client,
