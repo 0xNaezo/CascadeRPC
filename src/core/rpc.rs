@@ -9,7 +9,7 @@ use url::Url;
 
 use crate::{
     core::node::{RoutingTable, RpcNode},
-    quotas::{GlobalQuotaState, MAX_NODES},
+    quotas::state::{GlobalQuotaState, MAX_NODES},
 };
 
 pub struct GaugeGuard(metrics::Gauge);
