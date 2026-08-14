@@ -1,7 +1,6 @@
-use std::{
-    collections::HashMap,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+pub const MAX_NODES: usize = 64;
 
 #[repr(align(64))] // align to one cache line to avoid False Sharing
 pub struct PaddedCounter(pub AtomicU64);
@@ -16,31 +15,30 @@ impl PaddedCounter {
 }
 
 pub struct GlobalQuotaState {
-    pub nodes: HashMap<String, PaddedCounter>, // String - Node.name
+    nodes: [PaddedCounter; MAX_NODES],
+}
+
+impl Default for GlobalQuotaState {
+    fn default() -> Self {
+        Self {
+            nodes: std::array::from_fn(|_| PaddedCounter(AtomicU64::new(0))),
+        }
+    }
 }
 
 impl GlobalQuotaState {
+    /// Usage counter of the node with this id.
+    ///
+    /// `id` is handed out by `RpcClient::new`, which rejects configs with more
+    /// than [`MAX_NODES`] nodes, so the index is in range by construction.
+    ///
+    /// ponytail: id is the node's position in the config; a hot reload must
+    /// match nodes by name, or reordering the TOML hands a node someone
+    /// else's counter.
+    #[inline]
     #[must_use]
-    pub fn new(node_names: Vec<String>) -> Self {
-        let nodes: HashMap<String, PaddedCounter> = node_names
-            .into_iter()
-            .map(|name| (name, PaddedCounter(AtomicU64::new(0))))
-            .collect();
-
-        Self { nodes }
-    }
-
-    #[must_use]
-    pub fn get_node_usage(&self, node_name: &str) -> &PaddedCounter {
-        self.nodes.get(node_name).unwrap_or_else(|| {
-            unreachable!("nodes_usage built from the same node list as routing table (rpc.rs:49)")
-        })
-    }
-
-    pub fn add_node_usage(&self, node_name: &str, val: u64) {
-        if let Some(counter) = self.nodes.get(node_name) {
-            counter.add(val);
-        }
+    pub const fn usage(&self, id: usize) -> &PaddedCounter {
+        &self.nodes[id]
     }
 }
 
@@ -49,66 +47,53 @@ impl GlobalQuotaState {
 mod tests {
     use super::*;
 
-    fn state() -> GlobalQuotaState {
-        GlobalQuotaState::new(vec!["A".to_string(), "B".to_string()])
-    }
-
     #[test]
-    fn new_initializes_every_counter_to_zero() {
-        let state = state();
+    fn default_initializes_every_counter_to_zero() {
+        let state = GlobalQuotaState::default();
 
-        assert_eq!(state.nodes.len(), 2);
-        assert_eq!(state.get_node_usage("A").get(), 0);
-        assert_eq!(state.get_node_usage("B").get(), 0);
+        for id in 0..MAX_NODES {
+            assert_eq!(state.usage(id).get(), 0, "slot {id} should start empty");
+        }
     }
 
     #[test]
     fn add_accumulates_per_node() {
-        let state = state();
+        let state = GlobalQuotaState::default();
 
-        state.get_node_usage("A").add(10);
-        state.get_node_usage("A").add(5);
-        state.add_node_usage("B", 7);
+        state.usage(0).add(10);
+        state.usage(0).add(5);
+        state.usage(1).add(7);
 
-        assert_eq!(state.get_node_usage("A").get(), 15);
-        assert_eq!(state.get_node_usage("B").get(), 7);
+        assert_eq!(state.usage(0).get(), 15);
+        assert_eq!(state.usage(1).get(), 7);
     }
 
     #[test]
     fn concurrent_adds_lose_nothing() {
         // Relaxed ordering still guarantees atomicity of each fetch_add, so the
         // total is exact even though the interleaving is not.
-        let state = state();
+        let state = GlobalQuotaState::default();
 
         std::thread::scope(|scope| {
             for _ in 0..8 {
                 scope.spawn(|| {
                     for _ in 0..10_000 {
-                        state.get_node_usage("A").add(1);
+                        state.usage(0).add(1);
                     }
                 });
             }
         });
 
-        assert_eq!(state.get_node_usage("A").get(), 80_000);
-        assert_eq!(state.get_node_usage("B").get(), 0);
+        assert_eq!(state.usage(0).get(), 80_000);
+        assert_eq!(state.usage(1).get(), 0);
     }
 
     #[test]
-    fn add_node_usage_silently_ignores_unknown_nodes() {
-        let state = state();
-
-        state.add_node_usage("nope", 100);
-
-        assert_eq!(state.get_node_usage("A").get(), 0);
-    }
-
-    #[test]
-    #[should_panic(expected = "nodes_usage built from")]
-    fn get_node_usage_panics_on_unknown_node() {
-        // Asymmetric with `add_node_usage`, which no-ops on the same input.
-        // This path is reachable from the request hot path (router.rs admit).
-        let _ = state().get_node_usage("nope");
+    #[should_panic(expected = "index out of bounds")]
+    fn usage_past_the_last_slot_panics() {
+        // Reachable only if a caller hands out an id `RpcClient::new` never
+        // issued; the config-size guard there is what keeps this unreachable.
+        let _ = GlobalQuotaState::default().usage(MAX_NODES);
     }
 
     #[test]
@@ -117,5 +102,16 @@ mod tests {
         // share a cache line, or every quota increment ping-pongs between cores.
         assert_eq!(std::mem::align_of::<PaddedCounter>(), 64);
         assert_eq!(std::mem::size_of::<PaddedCounter>(), 64);
+    }
+
+    #[test]
+    fn counters_stay_one_per_cache_line_in_the_array() {
+        // Guards the whole point of the array: no packing, no shared lines
+        // between two nodes' counters.
+        assert_eq!(
+            std::mem::size_of::<GlobalQuotaState>(),
+            MAX_NODES * 64,
+            "counters must not share cache lines"
+        );
     }
 }
