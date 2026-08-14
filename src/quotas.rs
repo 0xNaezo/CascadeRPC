@@ -43,3 +43,79 @@ impl GlobalQuotaState {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    fn state() -> GlobalQuotaState {
+        GlobalQuotaState::new(vec!["A".to_string(), "B".to_string()])
+    }
+
+    #[test]
+    fn new_initializes_every_counter_to_zero() {
+        let state = state();
+
+        assert_eq!(state.nodes.len(), 2);
+        assert_eq!(state.get_node_usage("A").get(), 0);
+        assert_eq!(state.get_node_usage("B").get(), 0);
+    }
+
+    #[test]
+    fn add_accumulates_per_node() {
+        let state = state();
+
+        state.get_node_usage("A").add(10);
+        state.get_node_usage("A").add(5);
+        state.add_node_usage("B", 7);
+
+        assert_eq!(state.get_node_usage("A").get(), 15);
+        assert_eq!(state.get_node_usage("B").get(), 7);
+    }
+
+    #[test]
+    fn concurrent_adds_lose_nothing() {
+        // Relaxed ordering still guarantees atomicity of each fetch_add, so the
+        // total is exact even though the interleaving is not.
+        let state = state();
+
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..10_000 {
+                        state.get_node_usage("A").add(1);
+                    }
+                });
+            }
+        });
+
+        assert_eq!(state.get_node_usage("A").get(), 80_000);
+        assert_eq!(state.get_node_usage("B").get(), 0);
+    }
+
+    #[test]
+    fn add_node_usage_silently_ignores_unknown_nodes() {
+        let state = state();
+
+        state.add_node_usage("nope", 100);
+
+        assert_eq!(state.get_node_usage("A").get(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "nodes_usage built from")]
+    fn get_node_usage_panics_on_unknown_node() {
+        // Asymmetric with `add_node_usage`, which no-ops on the same input.
+        // This path is reachable from the request hot path (router.rs admit).
+        let _ = state().get_node_usage("nope");
+    }
+
+    #[test]
+    fn counter_occupies_a_whole_cache_line() {
+        // The padding is the point of the type: two nodes' counters must not
+        // share a cache line, or every quota increment ping-pongs between cores.
+        assert_eq!(std::mem::align_of::<PaddedCounter>(), 64);
+        assert_eq!(std::mem::size_of::<PaddedCounter>(), 64);
+    }
+}
