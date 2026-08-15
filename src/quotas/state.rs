@@ -12,6 +12,15 @@ impl PaddedCounter {
     pub fn get(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
     }
+
+    /// Overwrites the counter, discarding whatever it held.
+    ///
+    /// Only for seeding usage from disk before the server starts serving. The
+    /// request path must use [`PaddedCounter::add`]: a `set` there would drop
+    /// every increment that landed between the read and the store.
+    pub fn set(&self, val: u64) {
+        self.0.store(val, Ordering::Relaxed);
+    }
 }
 
 pub struct GlobalQuotaState {
