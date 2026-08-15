@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
+use std::fs::read_to_string;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::to_vec_pretty;
+use std::io::ErrorKind;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tracing::warn;
@@ -32,16 +34,24 @@ pub async fn start_disk_flusher(rpc_client: RpcClient) {
     loop {
         interval.tick().await;
 
-        let usage = snapshot(&rpc_client.all_nodes, &rpc_client.nodes_usage);
+        flush(&rpc_client).await;
+    }
+}
 
-        match to_vec_pretty(&usage) {
-            Ok(bytes) => {
-                if let Err(e) = write_atomic_async(&bytes).await {
-                    warn!(error = %e, "quota flush failed");
-                }
+/// Writes the current usage of every node to [`FINAL_PATH`].
+///
+/// Failures are logged rather than returned: the periodic caller retries on the
+/// next tick, and the shutdown caller has no one left to report to.
+pub async fn flush(rpc_client: &RpcClient) {
+    let usage = snapshot(&rpc_client.all_nodes, &rpc_client.nodes_usage);
+
+    match to_vec_pretty(&usage) {
+        Ok(bytes) => {
+            if let Err(e) = write_atomic_async(&bytes).await {
+                warn!(error = %e, "quota flush failed");
             }
-            Err(e) => warn!(error = %e, "quota serialization failed"),
         }
+        Err(e) => warn!(error = %e, "quota serialization failed"),
     }
 }
 
@@ -69,6 +79,32 @@ async fn write_atomic_async(data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Reads back the usage counters written by the last flush.
+///
+/// [`FINAL_PATH`] is relative to the working directory, same as on the write
+/// side: starting the balancer from a different directory starts it from zero.
+///
+/// A missing file is the normal first start and yields an empty map. A file
+/// that exists but cannot be read or parsed is fatal instead: starting from
+/// zero would let the balancer spend an already-spent monthly quota a second
+/// time, so the operator has to delete the file to say that is what they want.
+///
+/// # Errors
+///
+/// Returns an error if [`FINAL_PATH`] exists but cannot be read or parsed.
+pub fn restore() -> Result<BTreeMap<String, u64>> {
+    let content = match read_to_string(FINAL_PATH) {
+        Ok(data) => data,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            return Ok(BTreeMap::new());
+        }
+        Err(err) => return Err(err).with_context(|| format!("cannot read {FINAL_PATH}")),
+    };
+
+    serde_json::from_str(&content)
+        .with_context(|| format!("{FINAL_PATH} is corrupt; delete it to start from zero usage"))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -92,6 +128,26 @@ mod tests {
         .unwrap();
         node.id = id;
         Arc::new(node)
+    }
+
+    #[test]
+    fn a_flushed_snapshot_parses_back_into_the_same_usage() {
+        // The halves of the round trip are written apart: `snapshot` serializes
+        // `&str` keys, `restore` deserializes `String` ones. This pins the file
+        // format the two of them have to keep agreeing on.
+        let usage = GlobalQuotaState::default();
+        usage.usage(0).add(42);
+        usage.usage(1).add(7);
+
+        let nodes = [node(0, "helius"), node(1, "quicknode")];
+        let flushed = to_vec_pretty(&snapshot(&nodes, &usage)).unwrap();
+
+        let parsed: BTreeMap<String, u64> = serde_json::from_slice(&flushed).unwrap();
+
+        assert_eq!(
+            parsed,
+            BTreeMap::from([("helius".to_owned(), 42), ("quicknode".to_owned(), 7)])
+        );
     }
 
     #[test]

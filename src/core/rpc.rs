@@ -3,8 +3,8 @@ use arc_swap::ArcSwap;
 use bytes::Bytes;
 use metrics::{Unit, counter, histogram};
 use reqwest::{Client, Response, StatusCode};
-use std::sync::Arc;
 use std::time::Duration;
+use std::{collections::BTreeMap, sync::Arc};
 use url::Url;
 
 use crate::{
@@ -69,6 +69,23 @@ impl RpcClient {
             nodes_usage,
             all_nodes,
         })
+    }
+
+    /// Seeds the usage counters from a previous run's flush.
+    ///
+    /// Entries are matched by node name, the same key the flusher writes, so a
+    /// reordered config still restores each node its own usage. A name with no
+    /// node is dropped (it left the config) and a node with no entry keeps its
+    /// zero (it is new to the config).
+    ///
+    /// Overwrites the counters, so it must run before the healthcheck loop, the
+    /// flusher and the server are started.
+    pub fn load_quotas(&self, quotas: &BTreeMap<String, u64>) {
+        for node in &self.all_nodes {
+            if let Some(&quota) = quotas.get(&node.name) {
+                self.nodes_usage.usage(node.id).set(quota);
+            }
+        }
     }
 
     pub fn record_upstream(node: &RpcNode, outcome: &'static str, duration_seconds: f64) {
@@ -175,6 +192,58 @@ mod tests {
         // array and `usage()` panics on the request hot path.
         assert!(RpcClient::new(nodes(MAX_NODES + 1)).is_err());
         assert!(RpcClient::new(nodes(MAX_NODES)).is_ok());
+    }
+
+    #[test]
+    fn load_quotas_seeds_each_node_from_its_own_entry() {
+        let client = RpcClient::new(nodes(2)).unwrap();
+
+        client.load_quotas(&BTreeMap::from([
+            ("node0".to_owned(), 42),
+            ("node1".to_owned(), 7),
+        ]));
+
+        assert_eq!(client.nodes_usage.usage(0).get(), 42);
+        assert_eq!(client.nodes_usage.usage(1).get(), 7);
+    }
+
+    #[test]
+    fn load_quotas_matches_by_name_not_by_position() {
+        // Why the file is keyed by name at all: reordering the config must not
+        // hand a node the spend of whoever used to sit at that index.
+        let mut reordered = nodes(2);
+        reordered.reverse(); // node1 now takes id 0
+
+        let client = RpcClient::new(reordered).unwrap();
+
+        client.load_quotas(&BTreeMap::from([("node1".to_owned(), 42)]));
+
+        assert_eq!(
+            client.nodes_usage.usage(0).get(),
+            42,
+            "node1 kept its usage"
+        );
+        assert_eq!(client.nodes_usage.usage(1).get(), 0);
+    }
+
+    #[test]
+    fn load_quotas_ignores_entries_and_nodes_that_do_not_pair_up() {
+        // A node dropped from the config keeps its entry in the file until the
+        // next flush; a node added to the config has no entry yet. Neither may
+        // disturb the other's counter.
+        let client = RpcClient::new(nodes(2)).unwrap();
+
+        client.load_quotas(&BTreeMap::from([
+            ("node1".to_owned(), 42),
+            ("retired-node".to_owned(), 9),
+        ]));
+
+        assert_eq!(
+            client.nodes_usage.usage(0).get(),
+            0,
+            "node0 is new to the config"
+        );
+        assert_eq!(client.nodes_usage.usage(1).get(), 42);
     }
 
     #[test]

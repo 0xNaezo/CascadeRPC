@@ -6,7 +6,7 @@ use rpc_load_balancer::{
         rpc::RpcClient,
     },
     provider::{load_config::Settings, pricing_parser},
-    quotas::persistence,
+    quotas::persistence::{self, restore},
     server,
 };
 
@@ -23,6 +23,8 @@ async fn main() -> Result<()> {
     let config = Settings::load()?;
 
     let server_config = config.server;
+
+    let quotas = restore()?;
 
     let nodes: Vec<RpcNode> = config
         .nodes
@@ -47,16 +49,20 @@ async fn main() -> Result<()> {
 
     let rpc_client = RpcClient::new(nodes)?;
 
+    rpc_client.load_quotas(&quotas);
+
     tokio::spawn(HealthCheckLoop::run_healthcheck_loop(rpc_client.clone()));
     tokio::spawn(persistence::start_disk_flusher(rpc_client.clone()));
 
     server::init_server(
-        rpc_client,
+        rpc_client.clone(),
         server_config.port,
         server_config.host,
         server_config.enable_metrics,
     )
     .await?;
+
+    persistence::flush(&rpc_client).await;
 
     Ok(())
 }
