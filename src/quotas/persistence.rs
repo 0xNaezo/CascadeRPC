@@ -43,7 +43,10 @@ pub async fn start_disk_flusher(rpc_client: RpcClient) {
 /// Failures are logged rather than returned: the periodic caller retries on the
 /// next tick, and the shutdown caller has no one left to report to.
 pub async fn flush(rpc_client: &RpcClient) {
-    let usage = snapshot(&rpc_client.all_nodes, &rpc_client.nodes_usage);
+    // `load_full` rather than `load`: the guard would otherwise be held across
+    // the write below.
+    let topology = rpc_client.topology.load_full();
+    let usage = snapshot(&topology.all, &rpc_client.nodes_usage);
 
     match to_vec_pretty(&usage) {
         Ok(bytes) => {

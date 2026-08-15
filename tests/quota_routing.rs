@@ -18,7 +18,9 @@ use common::{
 /// Quota slot of a node, resolved by name so the tests below stay readable.
 fn node_id(client: &RpcClient, name: &str) -> usize {
     client
-        .all_nodes
+        .topology
+        .load()
+        .all
         .iter()
         .find(|node| node.name == name)
         .expect("node was never given to build_client")

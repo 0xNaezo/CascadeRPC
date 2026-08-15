@@ -135,11 +135,13 @@ impl RpcClient {
         method_id: usize,
     ) -> Result<(StatusCode, Bytes), RouteError> {
         loop {
-            let active_nodes = self.routing_table.load();
+            // Reloaded once per attempt round, so a config swap reaches the
+            // retry loop without disturbing the round already in flight.
+            let topology = self.topology.load();
 
             let mut best_time: Option<Duration> = None;
 
-            for node in &active_nodes.active_nodes {
+            for node in &topology.active {
                 let _permit = match self.admit(node, method_id).await {
                     Admission::Ready(permit) => permit,
                     Admission::Skip => continue,

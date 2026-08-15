@@ -53,7 +53,9 @@ const fn default_enable_metrics() -> bool {
     false
 }
 
-#[derive(Debug, Deserialize, Clone)]
+// `PartialEq` so a reload can tell the operator that the `[server]` section
+// they edited is not one of the things a reload can apply.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 pub struct ServerSettings {
     pub port: u16,
     pub host: String,
