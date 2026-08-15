@@ -72,7 +72,9 @@ struct HealthResponse {
 
 pub async fn health(State(rpc_client): State<RpcClient>) -> impl IntoResponse {
     let nodes: Vec<NodeHealth> = rpc_client
-        .all_nodes
+        .topology
+        .load()
+        .all
         .iter()
         .map(|node| {
             let is_up = node.healthy.load(Ordering::Relaxed);

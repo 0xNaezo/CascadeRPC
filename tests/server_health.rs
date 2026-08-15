@@ -26,8 +26,9 @@ fn client() -> RpcClient {
 }
 
 fn set_state(client: &RpcClient, name: &str, up: bool, latency_ms: u32) {
-    let target = client
-        .all_nodes
+    let topology = client.topology.load();
+    let target = topology
+        .all
         .iter()
         .find(|node| node.name == name)
         .unwrap_or_else(|| panic!("no node named {name}"));

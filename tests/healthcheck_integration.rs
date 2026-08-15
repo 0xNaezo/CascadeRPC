@@ -9,7 +9,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rpc_load_balancer::core::{healthcheck::HealthCheckLoop, node::RoutingTable, rpc::RpcClient};
+use rpc_load_balancer::core::{
+    healthcheck::HealthCheckLoop,
+    rpc::{RpcClient, Topology},
+};
 
 mod common;
 
@@ -19,13 +22,13 @@ use common::{build_client, dead_url, node, spawn_health_mock, spawn_unhealthy_mo
 ///
 /// A node that never answers costs ~2s (3 probes on a 1s interval), so the
 /// deadline has to clear that comfortably.
-async fn run_one_tick(client: &RpcClient) -> Arc<RoutingTable> {
-    let before = client.routing_table.load_full();
+async fn run_one_tick(client: &RpcClient) -> Arc<Topology> {
+    let before = client.topology.load_full();
     let handle = tokio::spawn(HealthCheckLoop::run_healthcheck_loop(client.clone()));
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let published = loop {
-        let current = client.routing_table.load_full();
+        let current = client.topology.load_full();
         if !Arc::ptr_eq(&before, &current) {
             break current;
         }
@@ -42,12 +45,8 @@ async fn run_one_tick(client: &RpcClient) -> Arc<RoutingTable> {
     published
 }
 
-fn names(table: &RoutingTable) -> Vec<&str> {
-    table
-        .active_nodes
-        .iter()
-        .map(|node| node.name.as_str())
-        .collect()
+fn names(table: &Topology) -> Vec<&str> {
+    table.active.iter().map(|node| node.name.as_str()).collect()
 }
 
 #[tokio::test]
@@ -83,7 +82,7 @@ async fn unhealthy_node_is_removed_from_the_table() {
     let table = run_one_tick(&client).await;
 
     assert_eq!(names(&table), ["good"]);
-    assert_eq!(client.all_nodes.len(), 2, "all_nodes is left untouched");
+    assert_eq!(table.all.len(), 2, "the full node set is left untouched");
 }
 
 #[tokio::test]
@@ -102,11 +101,11 @@ async fn fails_open_when_every_node_is_unhealthy() {
     let table = run_one_tick(&client).await;
 
     assert_eq!(
-        table.active_nodes.len(),
+        table.active.len(),
         2,
         "failing open must restore every node"
     );
-    for rpc_node in &table.active_nodes {
+    for rpc_node in &table.active {
         assert!(
             !rpc_node.healthy.load(std::sync::atomic::Ordering::Relaxed),
             "{} is in the table despite being unhealthy — that is the point",
@@ -132,7 +131,7 @@ async fn unreachable_node_sorts_last_when_failing_open() {
 
     assert_eq!(names(&table), ["responding", "unreachable"]);
     assert_eq!(
-        table.active_nodes[1]
+        table.active[1]
             .latency
             .load(std::sync::atomic::Ordering::Relaxed),
         u32::MAX

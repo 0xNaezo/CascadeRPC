@@ -1,11 +1,7 @@
 use anyhow::Result;
 use rpc_load_balancer::{
-    core::{
-        healthcheck::HealthCheckLoop,
-        node::{NewNode, RpcNode},
-        rpc::RpcClient,
-    },
-    provider::{load_config::Settings, pricing_parser},
+    core::{healthcheck::HealthCheckLoop, node::RpcNode, reload, rpc::RpcClient},
+    provider::load_config::Settings,
     quotas::persistence::{self, restore},
     server,
 };
@@ -26,26 +22,7 @@ async fn main() -> Result<()> {
 
     let quotas = restore()?;
 
-    let nodes: Vec<RpcNode> = config
-        .nodes
-        .into_iter()
-        .map(|n| {
-            let (costs, spillover_percent) =
-                pricing_parser::load_from_path(&n.provider_pricing_path)?;
-
-            RpcNode::new(NewNode {
-                name: n.name,
-                url: n.url,
-                rps_limit: n.rps_limit,
-                max_concurrent: n.max_concurrent,
-                tier: n.tier,
-                method_costs: costs,
-                monthly_limit: n.monthly_limit,
-                billing_type: n.billing_type,
-                spillover_percent,
-            })
-        })
-        .collect::<Result<Vec<RpcNode>, _>>()?;
+    let nodes: Vec<RpcNode> = RpcNode::build_nodes(config.nodes)?;
 
     let rpc_client = RpcClient::new(nodes)?;
 
@@ -53,6 +30,11 @@ async fn main() -> Result<()> {
 
     tokio::spawn(HealthCheckLoop::run_healthcheck_loop(rpc_client.clone()));
     tokio::spawn(persistence::start_disk_flusher(rpc_client.clone()));
+    #[cfg(unix)]
+    tokio::spawn(reload::watch_sighup(
+        rpc_client.clone(),
+        server_config.clone(),
+    ));
 
     server::init_server(
         rpc_client.clone(),

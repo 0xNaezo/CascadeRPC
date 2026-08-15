@@ -16,11 +16,7 @@ use std::{
 use tokio::sync::{Semaphore, SemaphorePermit};
 use url::Url;
 
-use crate::provider::cost_table::ProviderCostTable;
-
-pub struct RoutingTable {
-    pub active_nodes: Vec<Arc<RpcNode>>,
-}
+use crate::provider::{cost_table::ProviderCostTable, load_config::ConfigNode, pricing_parser};
 
 pub type DefaultDirectRateLimiter<MW = NoOpMiddleware<<DefaultClock as Clock>::Instant>> =
     RateLimiter<NotKeyed, InMemoryState, DefaultClock, MW>;
@@ -83,13 +79,46 @@ impl RpcNode {
             rate_limiting: Arc::new(RateLimiter::direct(quota)),
             concurrency_limiting: Arc::new(Semaphore::new(config.max_concurrent)),
             tier: config.tier,
-            latency: Arc::new(AtomicU32::new(0)),
+            latency: Arc::new(AtomicU32::new(u32::MAX)),
             healthy: Arc::new(AtomicBool::new(true)),
             method_costs: Arc::new(config.method_costs),
             monthly_limit: config.monthly_limit,
             billing_type: config.billing_type,
             spillover_threshold,
         })
+    }
+
+    /// Builds every node the config describes, pricing tables included.
+    ///
+    /// Shared by startup and by hot reload, which is why the provider TOMLs are
+    /// re-read here rather than once at boot: editing a price list and sending
+    /// SIGHUP has to be enough to apply it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a pricing file cannot be read or a node is invalid.
+    /// Nothing is published until the whole set builds, so a bad edit leaves the
+    /// running configuration alone.
+    pub fn build_nodes(configs: Vec<ConfigNode>) -> Result<Vec<Self>> {
+        configs
+            .into_iter()
+            .map(|n| {
+                let (costs, spillover_percent) =
+                    pricing_parser::load_from_path(&n.provider_pricing_path)?;
+
+                Self::new(NewNode {
+                    name: n.name,
+                    url: n.url,
+                    rps_limit: n.rps_limit,
+                    max_concurrent: n.max_concurrent,
+                    tier: n.tier,
+                    method_costs: costs,
+                    monthly_limit: n.monthly_limit,
+                    billing_type: n.billing_type,
+                    spillover_percent,
+                })
+            })
+            .collect::<Result<Vec<Self>, _>>()
     }
 
     /// Checks rate limit, then acquires concurrency permit.
