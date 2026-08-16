@@ -227,12 +227,13 @@ async fn unpriced_method_does_not_bill() {
 }
 
 #[tokio::test]
-async fn retry_loop_rebills_the_failing_node() {
-    // One client request can bill a node more than once: every pass of the
-    // route loop re-admits (and re-charges) each node it walks past.
+async fn retry_loop_bills_the_failing_node_once() {
+    // One client request bills a node at most once, however many passes the
+    // route loop makes: a node that already had its turn is skipped before
+    // `admit`, so only the rate-limited one comes back around.
     //
     // Pass 1: A is charged and fails, B is rate-limited -> sleep ~100ms.
-    // Pass 2: A is charged again and fails, B has a token and answers.
+    // Pass 2: A is skipped, B has a token and answers.
     let a = spawn_mock(200, SERVER_ERROR_BODY).await;
     let b = spawn_mock(200, OK_BODY).await;
 
@@ -254,11 +255,11 @@ async fn retry_loop_rebills_the_failing_node() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, Bytes::from(OK_BODY));
-    assert_eq!(a.hits(), 2, "A is retried on the second pass");
+    assert_eq!(a.hits(), 1, "A is not retried on the second pass");
     assert_eq!(
         usage(&client, "A"),
-        20,
-        "one client request billed A twice: quota is charged per attempt, not per request"
+        10,
+        "one client request bills a node once, not once per pass"
     );
     assert_eq!(usage(&client, "B"), 10);
 }

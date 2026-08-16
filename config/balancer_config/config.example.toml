@@ -1,3 +1,12 @@
+# Edits here are applied on SIGHUP, without a restart: `kill -HUP <pid>`.
+# The [server] section is the exception — the listener is only bound at startup.
+#
+# `name` is a node's identity, not a label. Monthly usage is tracked and stored
+# under it, so renaming a node reads as "one node left, another arrived": the
+# new name starts the month from zero and may overspend the provider's quota.
+# It also breaks the "node" label on every metric. Rename between billing
+# periods, or not at all.
+
 [server]
 host = "0.0.0.0"
 port = 3000
