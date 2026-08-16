@@ -129,11 +129,20 @@ impl RpcClient {
     /// Walks the routing table, retrying across nodes until one answers or all
     /// of them are exhausted. Sleeps and retries while some node is only
     /// rate-limited.
+    ///
+    /// A node serves the request at most once, however many rounds the sleeping
+    /// takes: one attempt, one quota booking. Only a rate-limited node comes
+    /// back around, which is what the sleep is for.
     async fn route(
         &self,
         body_bytes: &Bytes,
         method_id: usize,
     ) -> Result<(StatusCode, Bytes), RouteError> {
+        // One bit per quota slot: `node.id` is below `MAX_NODES` == 64 by
+        // construction, `assign_ids` rejects larger configs. Without it every
+        // round would book the cost of a steadily failing node all over again.
+        let mut tried: u64 = 0;
+
         loop {
             // Reloaded once per attempt round, so a config swap reaches the
             // retry loop without disturbing the round already in flight.
@@ -142,9 +151,23 @@ impl RpcClient {
             let mut best_time: Option<Duration> = None;
 
             for node in &topology.active {
+                let bit = 1u64 << node.id;
+
+                if tried & bit != 0 {
+                    continue;
+                }
+
                 let _permit = match self.admit(node, method_id).await {
-                    Admission::Ready(permit) => permit,
-                    Admission::Skip => continue,
+                    Admission::Ready(permit) => {
+                        tried |= bit;
+
+                        permit
+                    }
+                    Admission::Skip => {
+                        tried |= bit;
+
+                        continue;
+                    }
                     Admission::RateLimited(time) => {
                         best_time =
                             Some(best_time.map_or(time, |current_best| current_best.min(time)));
