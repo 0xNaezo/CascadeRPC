@@ -1,3 +1,23 @@
+# Three ways to price a method, in the order the balancer looks:
+#
+#   [routing]  standard JSON-RPC methods. A name the balancer does not know is
+#              ignored, so a typo here cannot quietly price something else. The
+#              `Unknown` key below is one of those ignored names — it predates
+#              `unknown_method_cost` and does nothing.
+#   [custom]   methods outside the standard set, under whatever name the
+#              provider gave them. Any name is accepted here:
+#
+#                  [custom]
+#                  helius_getFoo = 50
+#
+#   unknown_method_cost = N   under [limits]: what this node charges for a
+#              method neither table names. Leave it out and the node is skipped
+#              for those methods instead of guessing at their price. Set it
+#              high — over-charging makes the balancer think the monthly quota
+#              ran out early, under-charging overspends it.
+#
+# Edits here are applied on SIGHUP, same as the balancer config.
+
 [limits]
 
 spillover_percent = 95

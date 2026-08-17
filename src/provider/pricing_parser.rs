@@ -6,7 +6,8 @@ use anyhow::{Context, Result, anyhow};
 use config::{Config, File};
 use serde::Deserialize;
 
-use crate::provider::cost_table::ProviderCostTable;
+use crate::protocol::registry::CUSTOM_METHODS;
+use crate::provider::cost_table::{CostSpec, ProviderCostTable};
 
 const DEFAULT_SPILLOVER_PERCENT: u8 = 95;
 
@@ -14,6 +15,10 @@ const DEFAULT_SPILLOVER_PERCENT: u8 = 95;
 struct ProviderLimits {
     #[serde(default = "default_spillover_percent")]
     spillover_percent: u8,
+    /// Price for a method neither `[routing]` nor `[custom]` names. Left out,
+    /// the node is skipped for those methods instead of guessing what they cost.
+    #[serde(default)]
+    unknown_method_cost: Option<u32>,
 }
 
 const fn default_spillover_percent() -> u8 {
@@ -23,27 +28,39 @@ const fn default_spillover_percent() -> u8 {
 #[derive(Debug, Deserialize)]
 struct ProviderRouting {
     routing: HashMap<String, u32>,
+    /// Methods outside the standard set, under whatever names the provider gave
+    /// them. Separate from `[routing]` so that section keeps its property: a
+    /// name it does not recognize is a typo, not a new method.
+    #[serde(default)]
+    custom: HashMap<String, u32>,
     #[serde(default)]
     limits: Option<ProviderLimits>,
 }
 
-/// Parses a single provider config file into a `method -> cost` map and a
-/// `spillover_percent` (1..=100). Missing `[limits]` → `DEFAULT_SPILLOVER_PERCENT`.
+/// Parses a single provider config file into what its methods cost and a
+/// `spillover_percent` (1..=100). Missing `[limits]` → `DEFAULT_SPILLOVER_PERCENT`
+/// and no fallback price.
 ///
 /// # Errors
 ///
 /// Returns an error if the file cannot be read, parsed, or `spillover_percent`
 /// is outside `1..=100`.
-fn parse_file(path: &str) -> Result<(HashMap<String, u32>, u8)> {
+fn parse_file(path: &str) -> Result<(CostSpec, u8)> {
     let config = Config::builder()
         .add_source(File::with_name(path).required(true))
         .build()?;
 
     let parsed: ProviderRouting = config.try_deserialize()?;
 
-    let spillover_percent = parsed
-        .limits
-        .map_or(DEFAULT_SPILLOVER_PERCENT, |l| l.spillover_percent);
+    let (spillover_percent, unknown_cost) =
+        parsed
+            .limits
+            .map_or((DEFAULT_SPILLOVER_PERCENT, u32::MAX), |l| {
+                (
+                    l.spillover_percent,
+                    l.unknown_method_cost.unwrap_or(u32::MAX),
+                )
+            });
 
     if !(1..=100).contains(&spillover_percent) {
         return Err(anyhow!(
@@ -51,7 +68,14 @@ fn parse_file(path: &str) -> Result<(HashMap<String, u32>, u8)> {
         ));
     }
 
-    Ok((parsed.routing, spillover_percent))
+    Ok((
+        CostSpec {
+            routing: parsed.routing,
+            custom: parsed.custom,
+            unknown_cost,
+        },
+        spillover_percent,
+    ))
 }
 
 /// Loads routing cost tables for all providers from `PROVIDER_CONFIG_DIR`
@@ -72,12 +96,20 @@ pub fn load_all() -> Result<HashMap<String, HashMap<String, u32>>> {
 /// Loads the routing cost table and `spillover_percent` from a single provider
 /// config file.
 ///
+/// Custom method names in the file are interned into the process-wide
+/// [`CUSTOM_METHODS`] on the way through, which is what makes the ids in the
+/// returned table the same ids the router resolves requests to.
+///
 /// # Errors
 ///
 /// Returns an error if the file cannot be read or parsed.
 pub fn load_from_path(path: &str) -> Result<(ProviderCostTable, u8)> {
-    let (routing, spillover_percent) = parse_file(path)?;
-    Ok((ProviderCostTable::new(routing), spillover_percent))
+    let (spec, spillover_percent) = parse_file(path)?;
+
+    Ok((
+        ProviderCostTable::new(&spec, &CUSTOM_METHODS),
+        spillover_percent,
+    ))
 }
 
 /// Loads routing cost tables from all `*.toml` files in `dir`.
@@ -101,9 +133,10 @@ pub fn load_from_dir(dir: &Path) -> Result<HashMap<String, HashMap<String, u32>>
             .context("config file without a name")?
             .to_string_lossy();
 
-        // spillover_percent discarded here.
-        let (routing, _) = parse_file(&path.to_string_lossy())?;
-        out.insert(provider.into_owned(), routing);
+        // spillover_percent and the custom table are discarded here: callers of
+        // this one want the names that have to resolve to an `RpcMethod`.
+        let (spec, _) = parse_file(&path.to_string_lossy())?;
+        out.insert(provider.into_owned(), spec.routing);
     }
 
     Ok(out)
@@ -114,6 +147,7 @@ pub fn load_from_dir(dir: &Path) -> Result<HashMap<String, HashMap<String, u32>>
 mod tests {
     use super::{load_from_dir, load_from_path};
     use crate::protocol::methods::RpcMethod;
+    use crate::protocol::registry::CUSTOM_METHODS;
     use std::path::{Path, PathBuf};
 
     /// Absolute, so the tests do not depend on the working directory cargo
@@ -220,6 +254,54 @@ mod tests {
 
             assert_eq!(parsed, percent);
         }
+    }
+
+    #[test]
+    fn parses_custom_methods_and_the_fallback_price() {
+        let dir = TempDir::new("custom");
+        let path = dir.write(
+            "provider.toml",
+            "[limits]\nspillover_percent = 50\nunknown_method_cost = 400\n\
+             [routing]\ngetBalance = 1\n\
+             [custom]\nparser_test_doSomething = 77\n",
+        );
+
+        let (table, spillover) = load_from_path(path.to_string_lossy().as_ref()).unwrap();
+
+        assert_eq!(spillover, 50);
+        assert_eq!(table.cost(RpcMethod::GetBalance as usize), 1);
+        assert_eq!(
+            table.cost(CUSTOM_METHODS.resolve("parser_test_doSomething")),
+            77,
+            "the name has to be interned where the router will resolve it"
+        );
+        assert_eq!(table.cost(RpcMethod::Unknown as usize), 400);
+    }
+
+    #[test]
+    fn a_file_without_limits_prices_nothing_it_does_not_name() {
+        // solana.toml has no [limits], so no fallback: the node is skipped for
+        // anything its [routing] table leaves out.
+        let (table, _) = load_from_path(&config("solana.toml")).unwrap();
+
+        assert_eq!(table.cost(RpcMethod::Unknown as usize), u32::MAX);
+    }
+
+    #[test]
+    fn a_custom_table_does_not_disturb_the_routing_table() {
+        // load_from_dir feeds the "every priced name must resolve" check in
+        // protocol::methods, which would start failing if custom names leaked
+        // into what it returns.
+        let dir = TempDir::new("custom_isolated");
+        dir.write(
+            "provider.toml",
+            "[routing]\ngetBalance = 1\n[custom]\nnot_a_real_rpc_method = 2\n",
+        );
+
+        let loaded = load_from_dir(&dir.0).unwrap();
+
+        assert_eq!(loaded["provider"].len(), 1);
+        assert!(loaded["provider"].contains_key("getBalance"));
     }
 
     #[test]

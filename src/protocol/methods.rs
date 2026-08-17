@@ -321,7 +321,8 @@ mod tests {
 
     #[test]
     fn every_resolved_id_fits_the_cost_table() {
-        // `ProviderCostTable` indexes a fixed [u32; Count] array with these ids.
+        // `ProviderCostTable` reserves the slots below `Count` for these ids;
+        // everything from `Count` up belongs to `protocol::registry`.
         for names in provider_method_names().into_values() {
             for name in names {
                 assert!(
