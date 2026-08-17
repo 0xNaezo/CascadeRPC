@@ -28,7 +28,8 @@ use rpc_load_balancer::{
         node::{NewNode, RpcNode},
         rpc::RpcClient,
     },
-    provider::cost_table::ProviderCostTable,
+    protocol::registry::CUSTOM_METHODS,
+    provider::cost_table::{CostSpec, ProviderCostTable},
 };
 
 // ---------------------------------------------------------------------------
@@ -171,13 +172,23 @@ pub fn priced_table() -> ProviderCostTable {
 
 /// Cost table with exactly the given methods priced; everything else stays
 /// `u32::MAX`.
+///
+/// Built over the same process-wide registry the router resolves against, so a
+/// custom name priced here gets the id a request for it will carry.
 pub fn table_with(methods: &[(&str, u32)]) -> ProviderCostTable {
-    ProviderCostTable::new(
-        methods
+    table_from(&CostSpec {
+        routing: methods
             .iter()
             .map(|(name, cost)| ((*name).to_string(), *cost))
             .collect::<HashMap<String, u32>>(),
-    )
+        ..CostSpec::default()
+    })
+}
+
+/// Cost table over a spec the test wrote itself — custom methods, a fallback
+/// price, or both.
+pub fn table_from(spec: &CostSpec) -> ProviderCostTable {
+    ProviderCostTable::new(spec, &CUSTOM_METHODS)
 }
 
 // ---------------------------------------------------------------------------

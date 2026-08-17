@@ -8,7 +8,7 @@ use tracing::{debug, trace};
 
 use crate::core::node::RpcNode;
 use crate::core::rpc::{GaugeGuard, RpcClient};
-use crate::protocol::methods::get_standard_method_id;
+use crate::protocol::registry::CUSTOM_METHODS;
 use crate::protocol::rpc_payload::{MethodExtractor, RpcErrorOnly};
 
 const GLOBAL_TIMEOUT: Duration = Duration::from_secs(1);
@@ -109,9 +109,13 @@ impl RpcClient {
     }
 
     /// Resolves the method, then walks the nodes under the global time budget.
+    ///
+    /// The id is resolved once, here, and stays valid for every retry round
+    /// below: custom-method ids are append-only, so a SIGHUP landing mid-request
+    /// can add names but never renumber the one already in hand.
     async fn dispatch(&self, body_bytes: &Bytes) -> Result<(StatusCode, Bytes), RouteError> {
         let method = Self::extract_method(body_bytes)?;
-        let method_id = get_standard_method_id(method.as_bytes());
+        let method_id = CUSTOM_METHODS.resolve(method);
 
         // `?` peels off the timeout layer; what is left is the routing outcome.
         timeout(GLOBAL_TIMEOUT, self.route(body_bytes, method_id))
