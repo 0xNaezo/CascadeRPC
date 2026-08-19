@@ -5,6 +5,7 @@ use rpc_load_balancer::{
     core::{healthcheck::HealthCheckLoop, node::RpcNode, reload, rpc::RpcClient},
     protocol::registry::CUSTOM_METHODS,
     provider::load_config::{Settings, build_nodes},
+    metrics,
     quotas::{
         period::{self, lock_periods},
         persistence::{self, restore},
@@ -28,6 +29,13 @@ async fn main() -> Result<()> {
 
     let server_config = config.server;
 
+    // Before anything emits: the recorder is global, and what is measured
+    // before it exists is dropped, not held for it.
+    let metrics_handle = server_config
+        .enable_metrics
+        .then(server::install_metrics_recorder)
+        .transpose()?;
+
     let quotas = restore()?;
 
     let nodes: Vec<RpcNode> = build_nodes(config.nodes, &CUSTOM_METHODS)?;
@@ -40,6 +48,7 @@ async fn main() -> Result<()> {
     // route its first request against a reset counter, not wait for the flusher's
     // first tick a minute in.
     roll_over_periods(&rpc_client);
+    publish_quota_gauges(&rpc_client);
 
     tokio::spawn(HealthCheckLoop::run_healthcheck_loop(rpc_client.clone()));
     tokio::spawn(start_disk_flusher(rpc_client.clone()));
@@ -53,7 +62,7 @@ async fn main() -> Result<()> {
         rpc_client.clone(),
         server_config.port,
         server_config.host,
-        server_config.enable_metrics,
+        metrics_handle,
     )
     .await?;
 
@@ -82,6 +91,7 @@ async fn start_disk_flusher(rpc_client: RpcClient) {
         // Before the flush, so a counter this tick zeroes is written out zeroed
         // rather than a minute later.
         roll_over_periods(&rpc_client);
+        publish_quota_gauges(&rpc_client);
 
         flush_usage(&rpc_client).await;
     }
@@ -100,6 +110,24 @@ fn roll_over_periods(rpc_client: &RpcClient) {
         &rpc_client.periods,
         SystemTime::now(),
     );
+}
+
+/// Republishes every node's usage counter as a gauge.
+///
+/// Shares the flusher's tick rather than the request path: a quota is a monthly
+/// budget, so a value refreshed once a minute says everything about it that an
+/// atomic read per request would. It also runs once at startup, so a restart
+/// does not leave the gauges missing until the first tick a minute later.
+fn publish_quota_gauges(rpc_client: &RpcClient) {
+    let topology = rpc_client.topology.load();
+
+    for node in &topology.all {
+        metrics::set_node_quota(
+            &node.name,
+            rpc_client.nodes_usage.usage(node.id).get(),
+            node.spillover_threshold,
+        );
+    }
 }
 
 /// Takes a snapshot of what every node has spent and writes it out.

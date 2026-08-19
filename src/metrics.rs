@@ -122,3 +122,53 @@ pub fn set_healthy_nodes(count: usize) {
     )
     .set(u32::try_from(count).unwrap_or(u32::MAX));
 }
+
+/// Counts one node passed over without a request being sent, and why.
+///
+/// A counter with no histogram beside it: nothing was sent, so there is no
+/// duration to record, and the `0.0` a shared `record_upstream` would have to
+/// pass lands in the latency histogram as a real observation of zero.
+///
+/// `quota_exhausted` and `method_unsupported` fire at most once per request per
+/// node — the router marks such a node tried and never returns to it.
+/// `rate_limit` fires once per retry round, because a rate-limited node is
+/// exactly the one it comes back for.
+pub fn record_skip(node: &str, reason: &'static str) {
+    counter!(
+        description: "Nodes passed over without sending a request",
+        "rpc_upstream_skips",
+        "node" => node.to_owned(),
+        "reason" => reason,
+    )
+    .increment(1);
+}
+
+/// Publishes what one node has spent in the current billing period, against the
+/// usage the router stops admitting it at.
+///
+/// Two gauges rather than one ratio: the ratio is what an alert fires on, but
+/// the absolute spend is what a provider's bill is reconciled against, and
+/// dividing here throws it away. `PromQL` can take the ratio back out.
+///
+/// A node with no real quota reports a threshold near `u64::MAX`, which leaves
+/// its ratio pinned at zero — the right shape for a node that never spills.
+pub fn set_node_quota(node: &str, used: u64, threshold: u64) {
+    // Past 2^53 an f64 stops resolving single units. The only quota that large
+    // is the unlimited node's, where the absolute value is not the reading
+    // anyone takes.
+    #[allow(clippy::cast_precision_loss)]
+    let (used, threshold) = (used as f64, threshold as f64);
+
+    gauge!(
+        description: "Usage a node has booked in the current billing period",
+        "rpc_node_quota_used",
+        "node" => node.to_owned(),
+    )
+    .set(used);
+    gauge!(
+        description: "Usage past which the router stops routing to a node",
+        "rpc_node_quota_threshold",
+        "node" => node.to_owned(),
+    )
+    .set(threshold);
+}

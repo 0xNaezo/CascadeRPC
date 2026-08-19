@@ -227,7 +227,7 @@ impl RpcClient {
         let permit = match node.acquire_and_check().await {
             Ok(permit) => permit,
             Err(time) => {
-                metrics::record_upstream(&node.name, "rate_limit", 0.0);
+                metrics::record_skip(&node.name, "rate_limit");
 
                 return Admission::RateLimited(time);
             }
@@ -236,12 +236,16 @@ impl RpcClient {
         let used = self.nodes_usage.usage(node.id);
 
         if used.get() > node.spillover_threshold {
+            metrics::record_skip(&node.name, "quota_exhausted");
+
             return Admission::Skip;
         }
 
         let method_cost = node.method_costs.cost(method_id);
 
         if method_cost == u32::MAX {
+            metrics::record_skip(&node.name, "method_unsupported");
+
             return Admission::Skip;
         }
 
