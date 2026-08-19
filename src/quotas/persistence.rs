@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::fs::read_to_string;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -22,8 +23,13 @@ use crate::core::node::RpcNode;
 use crate::quotas::period::PeriodMap;
 use crate::quotas::state::GlobalQuotaState;
 
-const TEMP_PATH: &str = "quotas_temp.json";
 const FINAL_PATH: &str = "quotas.json";
+
+/// Distinguishes one write's temp file from every other's. A single shared
+/// name is enough for two writers in the same directory — a second balancer,
+/// or this one's shutdown flush landing on the periodic tick — to rename each
+/// other's half-written file over the target.
+static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// One node's line in [`FINAL_PATH`]: what it has spent, and the billing period
 /// that spend belongs to.
@@ -96,13 +102,41 @@ pub fn snapshot<'a>(
 
 /// Writes to a temp file in the same directory, then renames it over the
 /// target, so a reader never observes a half-written file.
+///
+/// The temp file is named for this write alone and removed if any step fails:
+/// nobody else will ever reuse it, so a failure that left it behind would leak
+/// one file per tick.
 async fn write_atomic_async(data: &[u8]) -> Result<()> {
-    let mut file = fs::File::create(TEMP_PATH).await?;
+    let temp = format!(
+        "{FINAL_PATH}.{}.{}.tmp",
+        std::process::id(),
+        WRITE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+
+    let result = write_then_rename(&temp, data).await;
+
+    if result.is_err() {
+        fs::remove_file(&temp).await.ok();
+    }
+
+    result
+}
+
+/// The write itself, split out so one cleanup in the caller covers every point
+/// it can fail at.
+async fn write_then_rename(temp: &str, data: &[u8]) -> Result<()> {
+    let mut file = fs::File::create(temp).await?;
 
     file.write_all(data).await?;
     file.sync_all().await?;
 
-    fs::rename(TEMP_PATH, FINAL_PATH).await?;
+    fs::rename(temp, FINAL_PATH).await?;
+
+    // The rename is only durable once the directory entry it moved is. Syncing
+    // the file alone leaves a crash able to lose the rename and land on neither
+    // the old usage file nor the new one. `FINAL_PATH` has no directory part,
+    // so the entry lives in the working directory.
+    fs::File::open(".").await?.sync_all().await?;
 
     Ok(())
 }
@@ -333,8 +367,16 @@ mod tests {
             std::fs::write(self.dir.join(FINAL_PATH), contents).unwrap();
         }
 
-        fn has(&self, name: &str) -> bool {
-            self.dir.join(name).exists()
+        /// Every file name in the scratch directory, sorted. The temp file has
+        /// no fixed name any more, so a leak is caught by what is left over
+        /// rather than by checking one path.
+        fn entries(&self) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(&self.dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
         }
     }
 
@@ -436,10 +478,37 @@ mod tests {
         ))
         .await;
 
-        assert!(scratch.has(FINAL_PATH), "the flush wrote nothing");
-        assert!(
-            !scratch.has(TEMP_PATH),
-            "the rename left the temp file behind"
+        assert_eq!(
+            scratch.entries(),
+            vec![FINAL_PATH.to_owned()],
+            "a flush must leave the usage file and nothing else"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_failed_flush_cleans_up_its_temp_file() {
+        let scratch = Scratch::new("quota_failed");
+        // A directory where the usage file goes: the temp write succeeds, the
+        // rename onto it cannot.
+        std::fs::create_dir(scratch.dir.join(FINAL_PATH)).unwrap();
+
+        let usage = GlobalQuotaState::default();
+        let nodes = [node(0, "helius")];
+
+        flush(&snapshot(
+            &nodes,
+            &usage,
+            &periods(&["helius"], date!(2026 - 08 - 01)),
+        ))
+        .await;
+
+        // Each temp name is used once, so one left behind is never cleaned up:
+        // a provider that keeps failing would fill the directory.
+        assert_eq!(
+            scratch.entries(),
+            vec![FINAL_PATH.to_owned()],
+            "the failed rename left its temp file behind"
         );
     }
 

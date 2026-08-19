@@ -3,9 +3,9 @@ use std::time::{Duration, SystemTime};
 use anyhow::Result;
 use rpc_load_balancer::{
     core::{healthcheck::HealthCheckLoop, node::RpcNode, reload, rpc::RpcClient},
+    metrics,
     protocol::registry::CUSTOM_METHODS,
     provider::load_config::{Settings, build_nodes},
-    metrics,
     quotas::{
         period::{self, lock_periods},
         persistence::{self, restore},

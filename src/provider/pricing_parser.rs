@@ -220,8 +220,12 @@ mod tests {
 
     #[test]
     fn missing_limits_defaults_to_95() {
-        // solana.toml has no [limits] section → default 95.
-        let (_, spillover) = load_from_path(&config("solana.toml"), &CUSTOM_METHODS).unwrap();
+        let dir = TempDir::new("no_limits_spillover");
+        let path = dir.write("provider.toml", "[routing]\ngetBalance = 1\n");
+
+        let (_, spillover) =
+            load_from_path(path.to_string_lossy().as_ref(), &CUSTOM_METHODS).unwrap();
+
         assert_eq!(spillover, 95);
     }
 
@@ -288,9 +292,12 @@ mod tests {
 
     #[test]
     fn a_file_without_limits_prices_nothing_it_does_not_name() {
-        // solana.toml has no [limits], so no fallback: the node is skipped for
-        // anything its [routing] table leaves out.
-        let (table, _) = load_from_path(&config("solana.toml"), &CUSTOM_METHODS).unwrap();
+        // No [limits], so no fallback: the node is skipped for anything its
+        // [routing] table leaves out, rather than guessing at a price.
+        let dir = TempDir::new("no_limits_fallback");
+        let path = dir.write("provider.toml", "[routing]\ngetBalance = 1\n");
+
+        let (table, _) = load_from_path(path.to_string_lossy().as_ref(), &CUSTOM_METHODS).unwrap();
 
         assert_eq!(table.cost(RpcMethod::Unknown as usize), u32::MAX);
     }
