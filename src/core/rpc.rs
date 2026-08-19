@@ -1,97 +1,31 @@
-//! The shared client every request is served from: the node set, the order the
+//! The shared state every request is served from: the node set, the order the
 //! router walks it in, and the quota counters it bills against.
 //!
 //! Cheap to clone and cloned into every task that needs it — the state lives
 //! behind `Arc`s, so a handler, the health check loop and the flusher all see
 //! the same topology and the same counters.
 //!
-//! Routing itself lives in `core::router` and probing in `core::health`; this
-//! module owns what both of them share.
+//! What lives here is the state and the three operations that replace it whole:
+//! building it, reloading it, and seeding it from disk. Routing is in
+//! [`crate::core::router`], probing in [`crate::core::health`], and the node set
+//! itself in [`crate::core::topology`]; this module owns what all of them share.
 
 use anyhow::Result;
 use arc_swap::ArcSwap;
-use bytes::Bytes;
-use metrics::{Unit, counter, histogram};
-use reqwest::{Client, Response, StatusCode};
-use std::sync::atomic::Ordering;
-use std::time::Duration;
-use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    sync::Arc,
-};
+use reqwest::Client;
+use std::{collections::BTreeMap, sync::Arc};
 use tokio::sync::Mutex;
-use tracing::{info, warn};
-use url::Url;
 
-use crate::{
-    core::node::RpcNode,
-    quotas::{
-        period::{PeriodMap, lock_periods},
-        persistence::NodeUsage,
-        state::{GlobalQuotaState, MAX_NODES},
-    },
+use crate::core::{
+    node::RpcNode,
+    topology::{NodeHealth, Topology, assign_ids},
+    upstream,
 };
-
-/// Holds a gauge up for as long as the guard lives.
-///
-/// For counting things that are *currently* happening: the increment and the
-/// matching decrement cannot drift apart, because the decrement is `Drop` and
-/// runs on every path out — including a cancelled future.
-pub struct GaugeGuard(metrics::Gauge);
-
-impl GaugeGuard {
-    /// Increments the gauge; it goes back down when the guard is dropped.
-    #[must_use]
-    pub fn new(gauge: metrics::Gauge) -> Self {
-        gauge.increment(1);
-        Self(gauge)
-    }
-}
-
-impl Drop for GaugeGuard {
-    fn drop(&mut self) {
-        self.0.decrement(1);
-    }
-}
-
-/// Every node the config describes, plus the order the router walks them in.
-///
-/// The two live in one struct so a single swap replaces both: published apart,
-/// they would disagree for a moment and `active` could name a node `all` no
-/// longer has.
-#[derive(Clone)]
-pub struct Topology {
-    pub all: Vec<Arc<RpcNode>>,
-    pub active: Vec<Arc<RpcNode>>,
-}
-
-impl Topology {
-    /// Picks and orders the nodes the router may use: healthy ones first by
-    /// tier, then by measured latency.
-    ///
-    /// The sort is stable so nodes the balancer cannot yet tell apart keep the
-    /// order the operator wrote them in — every unprobed node reports the same
-    /// `u32::MAX` latency.
-    ///
-    /// With nothing healthy it fails open on the whole set: answering 502 to
-    /// everything is worse than trying a node the last probe disliked.
-    #[must_use]
-    pub fn rank(all: &[Arc<RpcNode>]) -> Vec<Arc<RpcNode>> {
-        let mut active: Vec<Arc<RpcNode>> = all
-            .iter()
-            .filter(|node| node.healthy.load(Ordering::Relaxed))
-            .cloned()
-            .collect();
-
-        if active.is_empty() {
-            active.extend_from_slice(all);
-        }
-
-        active.sort_by_key(|node| (node.tier, node.latency.load(Ordering::Relaxed)));
-
-        active
-    }
-}
+use crate::quotas::{
+    period::{PeriodMap, lock_periods},
+    persistence::NodeUsage,
+    state::GlobalQuotaState,
+};
 
 /// Everything a request needs, shared by every task that serves one.
 ///
@@ -99,9 +33,8 @@ impl Topology {
 /// `Arc`, so clones share one topology and one set of counters.
 #[derive(Clone)]
 pub struct RpcClient {
-    /// One pooled HTTP client for every upstream, with a 2-second timeout. The
-    /// router's own budget is shorter, so this only bounds the health probes'
-    /// worst case.
+    /// One pooled HTTP client for every upstream. Its timeout is only a
+    /// backstop — see [`crate::core::upstream`], where it is built.
     pub client: Client,
     /// The live node set and routing order, republished whole by a health check
     /// round or a reload. Read with `load()` on the request path, never locked.
@@ -122,97 +55,9 @@ pub struct RpcClient {
     pub(crate) topology_lock: Arc<Mutex<()>>,
 }
 
-/// Hands every node the quota-counter slot it has to keep using.
-///
-/// `id` indexes [`GlobalQuotaState`], so it cannot stay the node's position in
-/// the config: inserting one node at the top of the TOML would shift every
-/// counter by one. A node keeps the slot it was given for as long as its name
-/// stays in the config, and slots freed by removed nodes are recycled — zeroed
-/// on the way out, or whoever takes one would inherit a stranger's spend.
-///
-/// The name is the identity, the same key the usage file on disk is written
-/// with. A rename is indistinguishable from "one node left, another arrived",
-/// so a renamed node starts from zero; both halves of that are logged rather
-/// than hidden.
-///
-/// # Errors
-///
-/// Returns an error if the set is larger than [`MAX_NODES`] or two nodes share
-/// a name. Both are checked before anything is written, so a rejected set
-/// leaves the counters untouched.
-fn assign_ids(prev: &[Arc<RpcNode>], new: &mut [RpcNode], usage: &GlobalQuotaState) -> Result<()> {
-    if new.len() > MAX_NODES {
-        anyhow::bail!(
-            "Fatal error: at most {MAX_NODES} nodes are supported, config has {}",
-            new.len()
-        );
-    }
-
-    {
-        // Two nodes under one name would share a counter here and collapse into
-        // a single entry in the usage file.
-        let mut seen = HashSet::with_capacity(new.len());
-        for node in new.iter() {
-            if !seen.insert(node.name.as_str()) {
-                anyhow::bail!("Fatal error: two nodes share the name '{}'", node.name);
-            }
-        }
-    }
-
-    let prev_ids: HashMap<&str, usize> = prev
-        .iter()
-        .map(|node| (node.name.as_str(), node.id))
-        .collect();
-
-    let mut taken = [false; MAX_NODES];
-    let mut arrived: Vec<usize> = Vec::new();
-
-    for (position, node) in new.iter_mut().enumerate() {
-        match prev_ids.get(node.name.as_str()).copied() {
-            Some(id) => {
-                node.id = id;
-                taken[id] = true;
-            }
-            None => arrived.push(position),
-        }
-    }
-
-    // Before the slots below are recycled: a departing node's counter is about
-    // to be handed to a new node and zeroed, so this is the last chance to
-    // report what it had spent.
-    for old in prev {
-        if !new.iter().any(|node| node.name == old.name) {
-            warn!(
-                node = %old.name,
-                usage = usage.usage(old.id).get(),
-                "node left the config; its usage is no longer tracked"
-            );
-        }
-    }
-
-    let mut free = (0..MAX_NODES).filter(|id| !taken[*id]);
-
-    for position in arrived {
-        // Cannot run dry: `taken` holds one slot per surviving node and the
-        // whole set is no larger than the number of slots.
-        let id = free
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("Fatal error: out of quota slots"))?;
-
-        new[position].id = id;
-        usage.usage(id).set(0);
-
-        if !prev.is_empty() {
-            info!(node = %new[position].name, "node is new to the config, starting from zero usage");
-        }
-    }
-
-    Ok(())
-}
-
 impl RpcClient {
-    /// Builds the client the balancer runs on: one pooled HTTP client with a
-    /// 2-second timeout, the ranked node set, and counters at zero.
+    /// Builds the client the balancer runs on: one pooled HTTP client, the
+    /// ranked node set, and counters at zero.
     ///
     /// Usage is seeded separately, by [`Self::load_quotas`], because it comes
     /// from disk and only makes sense together with the billing periods it was
@@ -221,10 +66,11 @@ impl RpcClient {
     /// # Errors
     ///
     /// Returns an error if the HTTP client cannot be initialized (e.g. a TLS
-    /// backend failure), if the set is larger than [`MAX_NODES`], or if two
-    /// nodes share a name.
+    /// backend failure), if the set is larger than
+    /// [`MAX_NODES`](crate::quotas::state::MAX_NODES), or if two nodes share a
+    /// name.
     pub fn new(mut nodes: Vec<RpcNode>) -> Result<Self> {
-        let client = Client::builder().timeout(Duration::new(2, 0)).build()?;
+        let client = upstream::client()?;
 
         let nodes_usage = Arc::new(GlobalQuotaState::default());
 
@@ -234,10 +80,7 @@ impl RpcClient {
 
         Ok(Self {
             client,
-            topology: Arc::new(ArcSwap::from_pointee(Topology {
-                active: Topology::rank(&all),
-                all,
-            })),
+            topology: Arc::new(ArcSwap::from_pointee(Topology::new(all))),
             nodes_usage,
             periods: Arc::new(std::sync::Mutex::new(PeriodMap::new())),
             topology_lock: Arc::new(Mutex::new(())),
@@ -255,8 +98,9 @@ impl RpcClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if the new set is larger than [`MAX_NODES`] or two of
-    /// its nodes share a name.
+    /// Returns an error if the new set is larger than
+    /// [`MAX_NODES`](crate::quotas::state::MAX_NODES) or two of its nodes share
+    /// a name.
     pub async fn reload(&self, mut nodes: Vec<RpcNode>) -> Result<()> {
         let _guard = self.topology_lock.lock().await;
 
@@ -264,10 +108,7 @@ impl RpcClient {
 
         let all: Vec<Arc<RpcNode>> = nodes.into_iter().map(Arc::new).collect();
 
-        self.topology.store(Arc::new(Topology {
-            active: Topology::rank(&all),
-            all,
-        }));
+        self.topology.store(Arc::new(Topology::new(all)));
 
         Ok(())
     }
@@ -299,87 +140,13 @@ impl RpcClient {
         }
     }
 
-    /// Records one attempt against one upstream node: how it ended, and how
-    /// long it took. Every path out of an attempt goes through here, so the
-    /// `outcome` label partitions the attempts rather than sampling them.
-    pub fn record_upstream(node: &RpcNode, outcome: &'static str, duration_seconds: f64) {
-        counter!(
-            description: "Attempts sent to upstream RPC nodes",
-            "rpc_upstream_attempts",
-            "node" => node.name.clone(),
-            "outcome" => outcome,
-        )
-        .increment(1);
-        histogram!(
-            description: "Upstream RPC attempt duration",
-            unit: Unit::Seconds,
-            "rpc_upstream_duration",
-            "node" => node.name.clone(),
-            "outcome" => outcome,
-        )
-        .record(duration_seconds);
-    }
-
-    /// Posts a body to one upstream URL, verbatim. Shared by the router and the
-    /// health probe, which is why it takes the URL rather than a node.
+    /// What the last health check round measured, per node.
     ///
-    /// # Errors
-    ///
-    /// Returns an error if the request cannot be completed at all: DNS,
-    /// connection, TLS, or the client's own timeout. An HTTP error status is a
-    /// completed request and comes back as `Ok`.
-    pub async fn send_request(client: Client, body: Bytes, url: Url) -> Result<Response> {
-        let result = client
-            .post(url)
-            .header("content-type", "application/json")
-            .body(body)
-            .send()
-            .await?;
-
-        Ok(result)
-    }
-
-    /// Whether an HTTP status leaves room to try another node.
-    ///
-    /// A deny-list, so the default is to retry: the listed statuses are the ones
-    /// that say something about the *request*, and repeating it against another
-    /// node would only produce the same answer more slowly. Everything else —
-    /// 5xx, 429, an unassigned code — is the node's problem, not the request's.
-    ///
-    /// Success is "retryable" too, which reads oddly on its own: the caller uses
-    /// this to decide whether the response is final *on its status alone*, and a
-    /// 200 still has to be checked for a JSON-RPC error inside the body.
+    /// Costs nothing and never dials an upstream, so the HTTP layer can answer
+    /// `/health` from it directly.
     #[must_use]
-    pub fn is_retryable_error(error_code: StatusCode) -> bool {
-        let http_status = error_code.as_u16();
-        let not_retryable = [
-            400, 402, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413, 414, 415, 416, 417, 418,
-            421, 422, 423, 424, 425, 426, 428, 431, 451,
-        ];
-
-        if not_retryable.contains(&http_status) {
-            return false;
-        }
-
-        true
-    }
-
-    /// Whether a JSON-RPC error code leaves room to try another node.
-    ///
-    /// The same deny-list shape as [`Self::is_retryable_error`], over the four
-    /// codes the spec defines for a malformed or unanswerable request: parse
-    /// error, invalid request, method not found, invalid params. Another node
-    /// would reject the identical body identically, so those are forwarded to
-    /// the client as they are.
-    #[must_use]
-    pub fn is_retryable_json_rpc_error(error_code: i32) -> bool {
-        let not_retryable = [-32700, -32601, -32602, -32600];
-
-        if not_retryable.contains(&error_code) {
-            return false;
-        }
-
-        true
+    pub fn health_snapshot(&self) -> Vec<NodeHealth> {
+        self.topology.load().health()
     }
 }
 
@@ -387,8 +154,10 @@ impl RpcClient {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
     use crate::core::node::NewNode;
     use crate::protocol::cost_table::ProviderCostTable;
+    use crate::quotas::state::MAX_NODES;
 
     fn nodes(count: usize) -> Vec<RpcNode> {
         (0..count)
@@ -420,14 +189,6 @@ mod tests {
                 node
             })
             .collect()
-    }
-
-    fn arced(nodes: Vec<RpcNode>) -> Vec<Arc<RpcNode>> {
-        nodes.into_iter().map(Arc::new).collect()
-    }
-
-    fn names_of(nodes: &[Arc<RpcNode>]) -> Vec<&str> {
-        nodes.iter().map(|node| node.name.as_str()).collect()
     }
 
     fn slot_of(client: &RpcClient, name: &str) -> usize {
@@ -596,98 +357,5 @@ mod tests {
         assert!(client.reload(nodes(MAX_NODES + 1)).await.is_err());
 
         assert!(Arc::ptr_eq(&before, &client.topology.load_full()));
-    }
-
-    #[test]
-    fn rank_keeps_config_order_between_nodes_it_cannot_tell_apart() {
-        // Every unprobed node reports the same u32::MAX latency, so the sort
-        // has nothing to go on and must not shuffle what the operator wrote.
-        let all = arced(named(&["a", "b", "c"]));
-
-        assert_eq!(names_of(&Topology::rank(&all)), ["a", "b", "c"]);
-    }
-
-    #[test]
-    fn rank_orders_by_tier_then_latency() {
-        let mut built = named(&["slow_t0", "fast_t0", "fast_t1"]);
-        built[2].tier = 1;
-        let all = arced(built);
-        all[0].latency.store(200, Ordering::Relaxed);
-        all[1].latency.store(1, Ordering::Relaxed);
-        all[2].latency.store(1, Ordering::Relaxed);
-
-        assert_eq!(
-            names_of(&Topology::rank(&all)),
-            ["fast_t0", "slow_t0", "fast_t1"]
-        );
-    }
-
-    #[test]
-    fn rank_drops_unhealthy_nodes() {
-        let all = arced(named(&["up", "down"]));
-        all[1].healthy.store(false, Ordering::Relaxed);
-
-        assert_eq!(names_of(&Topology::rank(&all)), ["up"]);
-    }
-
-    #[test]
-    fn rank_fails_open_when_nothing_is_healthy() {
-        // Trying a node the last probe disliked beats answering 502 to
-        // everything.
-        let all = arced(named(&["a", "b"]));
-        for node in &all {
-            node.healthy.store(false, Ordering::Relaxed);
-        }
-
-        assert_eq!(names_of(&Topology::rank(&all)), ["a", "b"]);
-    }
-
-    #[test]
-    fn retryable_error_true_for_5xx_and_429() {
-        assert!(RpcClient::is_retryable_error(StatusCode::TOO_MANY_REQUESTS));
-        assert!(RpcClient::is_retryable_error(
-            StatusCode::INTERNAL_SERVER_ERROR
-        ));
-        assert!(RpcClient::is_retryable_error(StatusCode::BAD_GATEWAY));
-        assert!(RpcClient::is_retryable_error(
-            StatusCode::SERVICE_UNAVAILABLE
-        ));
-        assert!(RpcClient::is_retryable_error(StatusCode::GATEWAY_TIMEOUT));
-    }
-
-    #[test]
-    fn retryable_error_true_for_success() {
-        assert!(RpcClient::is_retryable_error(StatusCode::OK));
-    }
-
-    #[test]
-    fn retryable_error_false_for_not_retryable_list() {
-        let not_retryable = [
-            400, 402, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413, 414, 415, 416, 417, 418,
-            421, 422, 423, 424, 425, 426, 428, 431, 451,
-        ];
-        for code in not_retryable {
-            assert!(
-                !RpcClient::is_retryable_error(StatusCode::from_u16(code).unwrap()),
-                "expected {code} to be not-retryable"
-            );
-        }
-    }
-
-    #[test]
-    fn retryable_jsonrpc_false_for_not_retryable_codes() {
-        for code in [-32700, -32601, -32602, -32600] {
-            assert!(
-                !RpcClient::is_retryable_json_rpc_error(code),
-                "expected {code} to be not-retryable"
-            );
-        }
-    }
-
-    #[test]
-    fn retryable_jsonrpc_true_for_server_internal_and_zero() {
-        assert!(RpcClient::is_retryable_json_rpc_error(-32000)); // server error
-        assert!(RpcClient::is_retryable_json_rpc_error(-32603)); // internal error
-        assert!(RpcClient::is_retryable_json_rpc_error(0)); // no error
     }
 }

@@ -5,12 +5,15 @@
 //! takes the first node in the table that will accept the request, so the sort
 //! published here *is* the balancing policy.
 
-use crate::core::rpc::{RpcClient, Topology};
-use metrics::{Unit, gauge, histogram};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
+
+use crate::core::health;
+use crate::core::rpc::RpcClient;
+use crate::core::topology::Topology;
+use crate::metrics;
 
 /// Namespace for the probe loop; carries no state of its own.
 pub struct HealthCheckLoop;
@@ -46,7 +49,7 @@ impl HealthCheckLoop {
     /// of its nodes are actually up would route requests on a guess.
     ///
     /// Reading the node set, probing it — up to ~2.5s for a node that never
-    /// answers, see [`RpcClient::get_health`] — and storing the result is one
+    /// answers, see [`crate::core::health::probe`] — and storing the result is one
     /// critical section. Without the lock a reload landing mid-round would be
     /// undone by an `active` list built from the node set it had just replaced.
     pub async fn run_once(rpc_client: &RpcClient) -> usize {
@@ -63,27 +66,17 @@ impl HealthCheckLoop {
 
             set.spawn(async move {
                 let started = tokio::time::Instant::now();
-                let (health, latency) = RpcClient::get_health(client, &node).await;
-                let outcome = if health { "healthy" } else { "unhealthy" };
+                let (health, latency) = health::probe(&client, &node).await;
 
-                histogram!(
-                    description: "Time spent completing an RPC node healthcheck",
-                    unit: Unit::Seconds,
-                    "rpc_healthcheck_duration",
-                    "node" => node.name.clone(),
-                    "outcome" => outcome,
-                )
-                .record(started.elapsed().as_secs_f64());
+                metrics::record_probe(
+                    &node.name,
+                    node.tier,
+                    health,
+                    started.elapsed().as_secs_f64(),
+                );
 
                 node.latency.store(latency, Ordering::Relaxed);
                 let was_healthy = node.healthy.swap(health, Ordering::Relaxed);
-                gauge!(
-                    description: "Whether an RPC node passed its latest healthcheck",
-                    "rpc_node_healthy",
-                    "node" => node.name.clone(),
-                    "tier" => node.tier.to_string(),
-                )
-                .set(if health { 1.0 } else { 0.0 });
 
                 if health {
                     debug!(node = %node.name, latency_ms = latency, "node healthy");
@@ -108,11 +101,7 @@ impl HealthCheckLoop {
             .filter(|node| node.healthy.load(Ordering::Relaxed))
             .count();
 
-        gauge!(
-            description: "Number of RPC nodes that passed the latest healthcheck",
-            "rpc_healthy_nodes",
-        )
-        .set(u32::try_from(healthy_nodes).unwrap_or(u32::MAX));
+        metrics::set_healthy_nodes(healthy_nodes);
 
         debug!(
             healthy_nodes,
@@ -120,10 +109,7 @@ impl HealthCheckLoop {
             "healthcheck completed"
         );
 
-        rpc_client.topology.store(Arc::new(Topology {
-            active: Topology::rank(&all),
-            all,
-        }));
+        rpc_client.topology.store(Arc::new(Topology::new(all)));
 
         healthy_nodes
     }

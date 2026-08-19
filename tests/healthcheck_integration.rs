@@ -9,10 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rpc_load_balancer::core::{
-    healthcheck::HealthCheckLoop,
-    rpc::{RpcClient, Topology},
-};
+use rpc_load_balancer::core::{healthcheck::HealthCheckLoop, rpc::RpcClient, topology::Topology};
 
 mod common;
 

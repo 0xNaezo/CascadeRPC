@@ -4,9 +4,8 @@
 //! Handlers hold no state of their own — everything comes from the shared
 //! [`RpcClient`], which is why they can be cloned across connections freely.
 
-use std::sync::atomic::Ordering;
-
 use crate::core::rpc::RpcClient;
+use crate::core::topology::NodeHealth;
 use axum::{
     Router,
     extract::{Json, State},
@@ -72,14 +71,6 @@ async fn send_request(State(rpc_client): State<RpcClient>, body: Bytes) -> (Stat
 }
 
 #[derive(Serialize)]
-struct NodeHealth {
-    name: String,
-    tier: u8,
-    status: &'static str,
-    latency_ms: Option<u32>,
-}
-
-#[derive(Serialize)]
 struct HealthResponse {
     status: &'static str,
     active_nodes: usize,
@@ -89,28 +80,15 @@ struct HealthResponse {
 
 /// Reports what the last health check round measured, per node.
 ///
-/// Reads only the per-node atomics, so it costs nothing and never dials an
-/// upstream: `up`/`down` and the latency are as fresh as the last probe.
-/// `degraded` means the balancer is still serving but with fewer nodes than
-/// configured; `critical` means it is failing open over the whole set.
+/// Costs nothing and never dials an upstream: `up`/`down` and the latency are as
+/// fresh as the last probe. `degraded` means the balancer is still serving but
+/// with fewer nodes than configured; `critical` means it is failing open over
+/// the whole set.
+///
+/// The per-node reading is [`RpcClient::health_snapshot`]; what is left here is
+/// the summary the endpoint puts around it.
 pub async fn health(State(rpc_client): State<RpcClient>) -> impl IntoResponse {
-    let nodes: Vec<NodeHealth> = rpc_client
-        .topology
-        .load()
-        .all
-        .iter()
-        .map(|node| {
-            let is_up = node.healthy.load(Ordering::Relaxed);
-            let latency = node.latency.load(Ordering::Relaxed);
-
-            NodeHealth {
-                name: node.name.clone(),
-                tier: node.tier,
-                status: if is_up { "up" } else { "down" },
-                latency_ms: is_up.then_some(latency),
-            }
-        })
-        .collect();
+    let nodes = rpc_client.health_snapshot();
 
     let active_nodes = nodes.iter().filter(|n| n.status == "up").count();
     let total_nodes = nodes.len();
