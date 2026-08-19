@@ -15,7 +15,11 @@ use url::Url;
 
 use crate::{
     core::node::RpcNode,
-    quotas::state::{GlobalQuotaState, MAX_NODES},
+    quotas::{
+        period::{PeriodMap, lock_periods},
+        persistence::NodeUsage,
+        state::{GlobalQuotaState, MAX_NODES},
+    },
 };
 
 pub struct GaugeGuard(metrics::Gauge);
@@ -78,6 +82,13 @@ pub struct RpcClient {
     pub client: Client,
     pub topology: Arc<ArcSwap<Topology>>,
     pub nodes_usage: Arc<GlobalQuotaState>,
+    /// Which billing period each node's counter in [`Self::nodes_usage`] is
+    /// credited to — the other half of what the usage file on disk holds. See
+    /// [`crate::quotas::period`].
+    ///
+    /// A plain `Mutex` and not an atomic per slot: it is touched once a minute
+    /// by the flusher, never by the request path.
+    pub periods: Arc<std::sync::Mutex<PeriodMap>>,
     /// Held by whoever rebuilds [`Self::topology`], so that reading the node
     /// set, working on it and publishing the result is one critical section.
     /// The request path never takes it — it only ever calls `topology.load()`.
@@ -195,6 +206,7 @@ impl RpcClient {
                 all,
             })),
             nodes_usage,
+            periods: Arc::new(std::sync::Mutex::new(PeriodMap::new())),
             topology_lock: Arc::new(Mutex::new(())),
         })
     }
@@ -227,19 +239,29 @@ impl RpcClient {
         Ok(())
     }
 
-    /// Seeds the usage counters from a previous run's flush.
+    /// Seeds the usage counters, and the periods they were counted in, from a
+    /// previous run's flush.
     ///
     /// Entries are matched by node name, the same key the flusher writes, so a
     /// reordered config still restores each node its own usage. A name with no
     /// node is dropped (it left the config) and a node with no entry keeps its
     /// zero (it is new to the config).
     ///
+    /// Seeding usage without its period would be worse than not seeding at all:
+    /// the counter would carry last month's spend with nothing to say the month
+    /// has turned. The two go in together, and
+    /// [`crate::quotas::period::rollover_if_new_period`] resolves them right
+    /// after.
+    ///
     /// Overwrites the counters, so it must run before the healthcheck loop, the
     /// flusher and the server are started.
-    pub fn load_quotas(&self, quotas: &BTreeMap<String, u64>) {
+    pub fn load_quotas(&self, quotas: &BTreeMap<String, NodeUsage>) {
+        let mut periods = lock_periods(&self.periods);
+
         for node in &self.topology.load().all {
-            if let Some(&quota) = quotas.get(&node.name) {
-                self.nodes_usage.usage(node.id).set(quota);
+            if let Some(entry) = quotas.get(&node.name) {
+                self.nodes_usage.usage(node.id).set(entry.used);
+                periods.insert(node.name.clone(), entry.period_start);
             }
         }
     }
@@ -325,6 +347,7 @@ mod tests {
                     monthly_limit: u64::MAX,
                     billing_type: "credits".into(),
                     spillover_percent: 100,
+                    reset_day: 1,
                 })
                 .unwrap()
             })
@@ -392,17 +415,39 @@ mod tests {
         assert!(RpcClient::new(nodes(MAX_NODES)).is_ok());
     }
 
+    /// A restored file entry: usage, plus the period it was counted in.
+    fn stored(used: u64) -> NodeUsage {
+        NodeUsage {
+            used,
+            period_start: time::macros::date!(2026 - 08 - 01),
+        }
+    }
+
     #[test]
     fn load_quotas_seeds_each_node_from_its_own_entry() {
         let client = RpcClient::new(nodes(2)).unwrap();
 
         client.load_quotas(&BTreeMap::from([
-            ("node0".to_owned(), 42),
-            ("node1".to_owned(), 7),
+            ("node0".to_owned(), stored(42)),
+            ("node1".to_owned(), stored(7)),
         ]));
 
         assert_eq!(client.nodes_usage.usage(0).get(), 42);
         assert_eq!(client.nodes_usage.usage(1).get(), 7);
+    }
+
+    #[test]
+    fn load_quotas_seeds_the_period_alongside_the_counter() {
+        // Usage without its period would look like a month that never turns, so
+        // the rollover would never fire for a restored node.
+        let client = RpcClient::new(nodes(1)).unwrap();
+
+        client.load_quotas(&BTreeMap::from([("node0".to_owned(), stored(42))]));
+
+        assert_eq!(
+            lock_periods(&client.periods).get("node0").copied(),
+            Some(time::macros::date!(2026 - 08 - 01))
+        );
     }
 
     #[test]
@@ -414,7 +459,7 @@ mod tests {
 
         let client = RpcClient::new(reordered).unwrap();
 
-        client.load_quotas(&BTreeMap::from([("node1".to_owned(), 42)]));
+        client.load_quotas(&BTreeMap::from([("node1".to_owned(), stored(42))]));
 
         assert_eq!(
             client.nodes_usage.usage(0).get(),
@@ -432,8 +477,8 @@ mod tests {
         let client = RpcClient::new(nodes(2)).unwrap();
 
         client.load_quotas(&BTreeMap::from([
-            ("node1".to_owned(), 42),
-            ("retired-node".to_owned(), 9),
+            ("node1".to_owned(), stored(42)),
+            ("retired-node".to_owned(), stored(9)),
         ]));
 
         assert_eq!(
@@ -442,6 +487,10 @@ mod tests {
             "node0 is new to the config"
         );
         assert_eq!(client.nodes_usage.usage(1).get(), 42);
+        assert!(
+            lock_periods(&client.periods).get("retired-node").is_none(),
+            "an entry with no node must not seed a period either"
+        );
     }
 
     #[tokio::test]

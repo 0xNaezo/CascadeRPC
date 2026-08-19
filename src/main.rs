@@ -1,8 +1,13 @@
+use std::time::SystemTime;
+
 use anyhow::Result;
 use rpc_load_balancer::{
     core::{healthcheck::HealthCheckLoop, node::RpcNode, reload, rpc::RpcClient},
     provider::load_config::Settings,
-    quotas::persistence::{self, restore},
+    quotas::{
+        period,
+        persistence::{self, restore},
+    },
     server,
 };
 
@@ -27,6 +32,11 @@ async fn main() -> Result<()> {
     let rpc_client = RpcClient::new(nodes)?;
 
     rpc_client.load_quotas(&quotas);
+
+    // Before anything is served: a restart that spanned a billing boundary must
+    // route its first request against a reset counter, not wait for the flusher's
+    // first tick a minute in.
+    period::rollover_if_new_period(&rpc_client, SystemTime::now());
 
     tokio::spawn(HealthCheckLoop::run_healthcheck_loop(rpc_client.clone()));
     tokio::spawn(persistence::start_disk_flusher(rpc_client.clone()));

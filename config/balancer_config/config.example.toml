@@ -6,6 +6,16 @@
 # new name starts the month from zero and may overspend the provider's quota.
 # It also breaks the "node" label on every metric. Rename between billing
 # periods, or not at all.
+#
+# `reset_day` is the day of the month a node's usage counter goes back to zero,
+# per node because the anchor belongs to the account: one provider bills on the
+# 1st, the next on the day the subscription started. Left out, it defaults to 1.
+# A day past the end of a short month lands on its last day, so 31 resets on
+# Feb 28 (29 in a leap year). Set it too early and the balancer re-opens a quota
+# the provider still bills as spent; too late only costs a detour to a lower
+# tier until the real reset. The reset itself is checked in UTC once a minute,
+# and survives restarts — the period it last reset for is stored in quotas.json
+# next to the usage.
 
 [server]
 host = "0.0.0.0"
@@ -20,6 +30,7 @@ rps_limit = 10
 max_concurrent = 4
 monthly_limit = 50_000_000
 billing_type = "compute_units"
+reset_day = 15 # billed on the 15th, not the 1st
 provider_pricing_path = "config/provider_config/helius.toml"
 
 [[nodes]]

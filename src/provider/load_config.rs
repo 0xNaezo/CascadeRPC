@@ -36,6 +36,17 @@ impl Settings {
             if node.monthly_limit == 0 {
                 node.monthly_limit = u64::MAX;
             }
+
+            // Checked here rather than at use: a day outside this range would
+            // leave the node's counter unreset for the rest of its life, and a
+            // reload runs through here too.
+            if !(1..=31).contains(&node.reset_day) {
+                anyhow::bail!(
+                    "Fatal error: reset_day for node '{}' must be 1..=31, got {}",
+                    node.name,
+                    node.reset_day
+                );
+            }
         }
 
         info!(
@@ -51,6 +62,13 @@ impl Settings {
 
 const fn default_enable_metrics() -> bool {
     false
+}
+
+/// What most providers bill on, and the only sane guess for one that does not
+/// say: resetting late costs a detour to a lower tier, resetting early
+/// overspends a quota the provider still considers spent.
+const fn default_reset_day() -> u8 {
+    1
 }
 
 // `PartialEq` so a reload can tell the operator that the `[server]` section
@@ -73,6 +91,13 @@ pub struct ConfigNode {
     pub monthly_limit: u64,
     pub billing_type: String,
     pub provider_pricing_path: String,
+    /// Day of the month this provider's quota goes back to zero.
+    ///
+    /// Per node, because the anchor is the account's, not the protocol's: one
+    /// provider bills on the 1st, the next on the day the subscription started.
+    /// A day past the end of a short month lands on its last day.
+    #[serde(default = "default_reset_day")]
+    pub reset_day: u8,
 }
 
 fn resolve_env(s: &str) -> Result<String, ConfigError> {
