@@ -11,6 +11,10 @@ use config::{Config, ConfigError, File};
 use serde::Deserialize;
 use tracing::info;
 
+use crate::core::node::{NewNode, RpcNode};
+use crate::protocol::registry::CustomMethods;
+use crate::provider::pricing_parser;
+
 /// The whole config file, as parsed.
 #[derive(Debug, Deserialize, Clone)]
 pub struct Settings {
@@ -74,6 +78,49 @@ impl Settings {
 
         Ok(settings)
     }
+}
+
+/// Builds every node the config describes, pricing tables included.
+///
+/// Shared by startup and by hot reload, which is why the provider TOMLs are
+/// re-read here rather than once at boot: editing a price list and sending
+/// SIGHUP has to be enough to apply it.
+///
+/// Lives on this side of the config boundary, not on [`RpcNode`], so that the
+/// node type stays a domain type that reads no files and knows no TOML schema:
+/// everything that touches the disk is in `provider`, and `core` only ever sees
+/// a finished [`NewNode`].
+///
+/// `methods` is the registry the custom method names in those files are
+/// interned into; every caller outside a test passes
+/// [`crate::protocol::registry::CUSTOM_METHODS`], the one the router resolves
+/// requests against.
+///
+/// # Errors
+///
+/// Returns an error if a pricing file cannot be read or a node is invalid.
+/// Nothing is published until the whole set builds, so a bad edit leaves the
+/// running configuration alone.
+pub fn build_nodes(configs: Vec<ConfigNode>, methods: &CustomMethods) -> Result<Vec<RpcNode>> {
+    configs
+        .into_iter()
+        .map(|n| {
+            let (costs, spillover_percent) =
+                pricing_parser::load_from_path(&n.provider_pricing_path, methods)?;
+
+            RpcNode::new(NewNode {
+                name: n.name,
+                url: n.url,
+                rps_limit: n.rps_limit,
+                max_concurrent: n.max_concurrent,
+                tier: n.tier,
+                method_costs: costs,
+                monthly_limit: n.monthly_limit,
+                spillover_percent,
+                reset_day: n.reset_day,
+            })
+        })
+        .collect()
 }
 
 const fn default_enable_metrics() -> bool {

@@ -143,7 +143,7 @@ mod tests {
     use time::macros::{date, datetime};
 
     use crate::core::node::{NewNode, RpcNode};
-    use crate::provider::cost_table::ProviderCostTable;
+    use crate::protocol::cost_table::ProviderCostTable;
 
     fn client(names: &[&str], reset_day: u8) -> RpcClient {
         let nodes = names
@@ -349,7 +349,7 @@ mod tests {
         let client = client(&["a", "b"], 1);
         rollover_if_new_period(&client, at(datetime!(2026-08-17 12:00 UTC)));
 
-        let mut kept = RpcNode::build_nodes(vec![]).unwrap();
+        let mut kept: Vec<RpcNode> = Vec::new();
         kept.push(
             RpcNode::new(NewNode {
                 name: "a".into(),

@@ -12,8 +12,8 @@ use anyhow::{Context, Result, anyhow};
 use config::{Config, File};
 use serde::Deserialize;
 
-use crate::protocol::registry::CUSTOM_METHODS;
-use crate::provider::cost_table::{CostSpec, ProviderCostTable};
+use crate::protocol::cost_table::{CostSpec, ProviderCostTable};
+use crate::protocol::registry::CustomMethods;
 
 const DEFAULT_SPILLOVER_PERCENT: u8 = 95;
 
@@ -95,20 +95,22 @@ fn parse_file(path: &str) -> Result<(CostSpec, u8)> {
 /// Loads the routing cost table and `spillover_percent` from a single provider
 /// config file.
 ///
-/// Custom method names in the file are interned into the process-wide
-/// [`CUSTOM_METHODS`] on the way through, which is what makes the ids in the
-/// returned table the same ids the router resolves requests to.
+/// Custom method names in the file are interned into `methods` on the way
+/// through, which is what makes the ids in the returned table the same ids the
+/// router resolves requests to — so the registry passed here has to be the one
+/// the router reads, `CUSTOM_METHODS`, for every call that is not a test.
+///
+/// The registry is an argument and not the global because interning is a side
+/// effect on the process: parsing a file to look at it would otherwise grow the
+/// process-wide table, and every reload would grow it again.
 ///
 /// # Errors
 ///
 /// Returns an error if the file cannot be read or parsed.
-pub fn load_from_path(path: &str) -> Result<(ProviderCostTable, u8)> {
+pub fn load_from_path(path: &str, methods: &CustomMethods) -> Result<(ProviderCostTable, u8)> {
     let (spec, spillover_percent) = parse_file(path)?;
 
-    Ok((
-        ProviderCostTable::new(&spec, &CUSTOM_METHODS),
-        spillover_percent,
-    ))
+    Ok((ProviderCostTable::new(&spec, methods), spillover_percent))
 }
 
 /// Reads every `*.toml` in `dir` and returns each provider's `[routing]` table,
@@ -210,7 +212,7 @@ mod tests {
 
     #[test]
     fn parses_single_provider_config() {
-        let (table, spillover) = load_from_path(&config("helius.toml")).unwrap();
+        let (table, spillover) = load_from_path(&config("helius.toml"), &CUSTOM_METHODS).unwrap();
 
         assert_eq!(table.cost(RpcMethod::GetBalance as usize), 1);
         assert_eq!(spillover, 95);
@@ -219,7 +221,7 @@ mod tests {
     #[test]
     fn missing_limits_defaults_to_95() {
         // solana.toml has no [limits] section → default 95.
-        let (_, spillover) = load_from_path(&config("solana.toml")).unwrap();
+        let (_, spillover) = load_from_path(&config("solana.toml"), &CUSTOM_METHODS).unwrap();
         assert_eq!(spillover, 95);
     }
 
@@ -231,7 +233,7 @@ mod tests {
             "[limits]\nspillover_percent = 0\n[routing]\ngetBalance = 1\n",
         );
 
-        assert!(load_from_path(path.to_string_lossy().as_ref()).is_err());
+        assert!(load_from_path(path.to_string_lossy().as_ref(), &CUSTOM_METHODS).is_err());
     }
 
     #[test]
@@ -242,7 +244,7 @@ mod tests {
             "[limits]\nspillover_percent = 101\n[routing]\ngetBalance = 1\n",
         );
 
-        assert!(load_from_path(path.to_string_lossy().as_ref()).is_err());
+        assert!(load_from_path(path.to_string_lossy().as_ref(), &CUSTOM_METHODS).is_err());
     }
 
     #[test]
@@ -254,7 +256,7 @@ mod tests {
                 &format!("ok_{percent}.toml"),
                 &format!("[limits]\nspillover_percent = {percent}\n[routing]\ngetBalance = 1\n"),
             );
-            let (_, parsed) = load_from_path(path.to_string_lossy().as_ref())
+            let (_, parsed) = load_from_path(path.to_string_lossy().as_ref(), &CUSTOM_METHODS)
                 .unwrap_or_else(|e| panic!("{percent} should be accepted: {e}"));
 
             assert_eq!(parsed, percent);
@@ -271,7 +273,7 @@ mod tests {
              [custom]\nparser_test_doSomething = 77\n",
         );
 
-        let (table, spillover) = load_from_path(path.to_string_lossy().as_ref()).unwrap();
+        let (table, spillover) = load_from_path(path.to_string_lossy().as_ref(), &CUSTOM_METHODS).unwrap();
 
         assert_eq!(spillover, 50);
         assert_eq!(table.cost(RpcMethod::GetBalance as usize), 1);
@@ -287,7 +289,7 @@ mod tests {
     fn a_file_without_limits_prices_nothing_it_does_not_name() {
         // solana.toml has no [limits], so no fallback: the node is skipped for
         // anything its [routing] table leaves out.
-        let (table, _) = load_from_path(&config("solana.toml")).unwrap();
+        let (table, _) = load_from_path(&config("solana.toml"), &CUSTOM_METHODS).unwrap();
 
         assert_eq!(table.cost(RpcMethod::Unknown as usize), u32::MAX);
     }
@@ -313,6 +315,6 @@ mod tests {
     fn missing_file_errors() {
         let missing = config("does_not_exist.toml");
 
-        assert!(load_from_path(&missing).is_err());
+        assert!(load_from_path(&missing, &CUSTOM_METHODS).is_err());
     }
 }

@@ -7,8 +7,9 @@
 use anyhow::Result;
 use tracing::{error, info, warn};
 
-use crate::core::{healthcheck::HealthCheckLoop, node::RpcNode, rpc::RpcClient};
-use crate::provider::load_config::{ServerSettings, Settings};
+use crate::core::{healthcheck::HealthCheckLoop, rpc::RpcClient};
+use crate::protocol::registry::CUSTOM_METHODS;
+use crate::provider::load_config::{ServerSettings, Settings, build_nodes};
 
 /// Rebuilds the node set from disk on every SIGHUP, forever.
 ///
@@ -58,7 +59,7 @@ async fn reload_once(rpc_client: &RpcClient, startup_server: &ServerSettings) ->
         warn!("[server] section changed; the listener is only bound at startup, so it is ignored");
     }
 
-    let nodes = RpcNode::build_nodes(settings.nodes)?;
+    let nodes = build_nodes(settings.nodes, &CUSTOM_METHODS)?;
     let node_count = nodes.len();
 
     rpc_client.reload(nodes).await?;

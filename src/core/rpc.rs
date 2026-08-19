@@ -388,7 +388,7 @@ impl RpcClient {
 mod tests {
     use super::*;
     use crate::core::node::NewNode;
-    use crate::provider::cost_table::ProviderCostTable;
+    use crate::protocol::cost_table::ProviderCostTable;
 
     fn nodes(count: usize) -> Vec<RpcNode> {
         (0..count)

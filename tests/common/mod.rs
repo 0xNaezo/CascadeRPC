@@ -29,7 +29,7 @@ use rpc_load_balancer::{
         rpc::RpcClient,
     },
     protocol::registry::CUSTOM_METHODS,
-    provider::cost_table::{CostSpec, ProviderCostTable},
+    protocol::cost_table::{CostSpec, ProviderCostTable},
 };
 
 // ---------------------------------------------------------------------------

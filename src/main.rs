@@ -3,7 +3,8 @@ use std::time::SystemTime;
 use anyhow::Result;
 use rpc_load_balancer::{
     core::{healthcheck::HealthCheckLoop, node::RpcNode, reload, rpc::RpcClient},
-    provider::load_config::Settings,
+    protocol::registry::CUSTOM_METHODS,
+    provider::load_config::{Settings, build_nodes},
     quotas::{
         period,
         persistence::{self, restore},
@@ -27,7 +28,7 @@ async fn main() -> Result<()> {
 
     let quotas = restore()?;
 
-    let nodes: Vec<RpcNode> = RpcNode::build_nodes(config.nodes)?;
+    let nodes: Vec<RpcNode> = build_nodes(config.nodes, &CUSTOM_METHODS)?;
 
     let rpc_client = RpcClient::new(nodes)?;
 
