@@ -4,40 +4,40 @@
 //! The order is not decided here — the health check loop publishes it and this
 //! walks it front to back, taking the first node that will accept the request.
 //! What this module owns is everything after that choice: the global time
-//! budget, quota booking, and which upstream failures are worth another node.
+//! budget, quota booking, and when to give up.
+//!
+//! What an individual answer *means* is [`crate::core::upstream`]'s job; this
+//! only acts on the verdict.
 
 use bytes::Bytes;
-use memchr::memmem;
-use metrics::{Unit, counter, gauge, histogram};
-use reqwest::{Response, StatusCode};
+use reqwest::StatusCode;
 use std::time::Duration;
 use tokio::sync::SemaphorePermit;
 use tokio::time::{Instant, timeout};
-use tracing::{debug, trace};
+use tracing::trace;
 
 use crate::core::node::RpcNode;
-use crate::core::rpc::{GaugeGuard, RpcClient};
+use crate::core::rpc::RpcClient;
+use crate::core::upstream::{self, Attempt};
+use crate::metrics;
 use crate::protocol::registry::CUSTOM_METHODS;
-use crate::protocol::rpc_payload::{MethodExtractor, RpcErrorOnly};
+use crate::protocol::rpc_payload::MethodExtractor;
 use crate::quotas::state::MAX_NODES;
+
+/// Wall-clock budget for one client request, retries and rate-limit sleeps
+/// included.
+const GLOBAL_TIMEOUT: Duration = Duration::from_secs(1);
+
+// Shorter than the backstop on a single HTTP request, on purpose: one upstream
+// may not spend the whole budget on its own. The other way round the backstop
+// would fire first and this budget would never be the thing that bounds a
+// request.
+const _: () = assert!(GLOBAL_TIMEOUT.as_millis() <= upstream::HTTP_BACKSTOP.as_millis());
 
 // `route` tracks the nodes a request has already tried in a `u64` bitmask, one
 // bit per quota slot. The two numbers are set in different modules, so the
 // agreement between them is checked here rather than trusted to a comment.
 const _: () = assert!(MAX_NODES <= u64::BITS as usize);
-
-/// Wall-clock budget for one client request, retries and rate-limit sleeps
-/// included. Shorter than the per-attempt HTTP timeout on purpose: a single
-/// upstream may not spend the whole budget on its own.
-///
-/// Keep [`RouteError::body`]'s timeout message in step with this value.
-const GLOBAL_TIMEOUT: Duration = Duration::from_secs(1);
-
-/// Upstream bodies up to this size are always parsed, larger ones only when
-/// they contain an `"error"` key. Any plausible non-JSON upstream answer (a
-/// gateway error page, a rate-limit notice) fits well below the limit, while
-/// the payloads worth not parsing start an order of magnitude above it.
-const VALIDATE_BELOW: usize = 64 * 1024;
 
 /// Failure produced by the balancer itself, as opposed to a response forwarded
 /// from an upstream node.
@@ -110,14 +110,6 @@ enum Admission<'a> {
     RateLimited(Duration),
 }
 
-/// Outcome of a single attempt against one node.
-enum Attempt {
-    /// Response is final and goes back to the client.
-    Done(StatusCode, Bytes),
-    /// Attempt failed in a retryable way; move on to the next node.
-    Retry,
-}
-
 impl RpcClient {
     /// Sends a JSON-RPC request with fallback across nodes.
     ///
@@ -142,7 +134,7 @@ impl RpcClient {
             Ok(_) => "forwarded",
             Err(error) => error.outcome(),
         };
-        Self::record_request(outcome, request_started);
+        metrics::record_request(outcome, request_started.elapsed().as_secs_f64());
 
         result.map_err(RouteError::response)
     }
@@ -153,20 +145,13 @@ impl RpcClient {
     /// below: custom-method ids are append-only, so a SIGHUP landing mid-request
     /// can add names but never renumber the one already in hand.
     async fn dispatch(&self, body_bytes: &Bytes) -> Result<(StatusCode, Bytes), RouteError> {
-        let method = Self::extract_method(body_bytes)?;
+        let method = extract_method(body_bytes)?;
         let method_id = CUSTOM_METHODS.resolve(method);
 
         // `?` peels off the timeout layer; what is left is the routing outcome.
         timeout(GLOBAL_TIMEOUT, self.route(body_bytes, method_id))
             .await
             .map_err(|_| RouteError::Timeout)?
-    }
-
-    /// Extracts the JSON-RPC method name from the raw request body.
-    fn extract_method(body_bytes: &[u8]) -> Result<&str, RouteError> {
-        serde_json::from_slice::<MethodExtractor<'_>>(body_bytes)
-            .map(|extractor| extractor.method)
-            .map_err(|_| RouteError::BadRequest)
     }
 
     /// Walks the routing table, retrying across nodes until one answers or all
@@ -222,7 +207,7 @@ impl RpcClient {
                 trace!(node = %node.name, "sending request");
 
                 if let Attempt::Done(status_code, body) =
-                    self.attempt_node(node, body_bytes.clone()).await
+                    upstream::attempt(&self.client, node, body_bytes.clone()).await
                 {
                     return Ok((status_code, body));
                 }
@@ -232,7 +217,7 @@ impl RpcClient {
                 return Err(RouteError::AllNodesFailed);
             };
 
-            Self::wait_rate_limited(best_time).await;
+            wait_rate_limited(best_time).await;
         }
     }
 
@@ -242,7 +227,7 @@ impl RpcClient {
         let permit = match node.acquire_and_check().await {
             Ok(permit) => permit,
             Err(time) => {
-                Self::record_upstream(node, "rate_limit", 0.0);
+                metrics::record_upstream(&node.name, "rate_limit", 0.0);
 
                 return Admission::RateLimited(time);
             }
@@ -264,122 +249,19 @@ impl RpcClient {
 
         Admission::Ready(permit)
     }
+}
 
-    /// Performs one HTTP attempt against a node and classifies the result.
-    async fn attempt_node(&self, node: &RpcNode, body_bytes: Bytes) -> Attempt {
-        let started = Instant::now();
+/// Extracts the JSON-RPC method name from the raw request body.
+fn extract_method(body_bytes: &[u8]) -> Result<&str, RouteError> {
+    serde_json::from_slice::<MethodExtractor<'_>>(body_bytes)
+        .map(|extractor| extractor.method)
+        .map_err(|_| RouteError::BadRequest)
+}
 
-        match Self::send_request(self.client.clone(), body_bytes, node.url.clone()).await {
-            Ok(response) => Self::classify_response(node, response, started).await,
-            Err(e) => {
-                Self::record_upstream(node, "transport_error", started.elapsed().as_secs_f64());
-                debug!(node = %node.name, error = %e, "upstream HTTP request failed");
+/// Waits for the first node to leave its rate limit, tracking how many
+/// requests are parked in the meantime.
+async fn wait_rate_limited(best_time: Duration) {
+    let _guard = metrics::sleeping_on_rate_limit();
 
-                Attempt::Retry
-            }
-        }
-    }
-
-    /// Decides whether an upstream response is final or the next node should be
-    /// tried, recording the per-attempt metrics for either case.
-    async fn classify_response(node: &RpcNode, response: Response, started: Instant) -> Attempt {
-        let status_code = response.status();
-
-        let body = match response.bytes().await {
-            Ok(body) => body,
-            Err(e) => {
-                Self::record_upstream(node, "body_error", started.elapsed().as_secs_f64());
-                debug!(
-                    node = %node.name,
-                    error = %e,
-                    "failed to read upstream response body"
-                );
-
-                return Attempt::Retry;
-            }
-        };
-
-        if !Self::is_retryable_error(status_code) {
-            Self::record_upstream(
-                node,
-                "forwarded_http_error",
-                started.elapsed().as_secs_f64(),
-            );
-
-            return Attempt::Done(status_code, body);
-        }
-
-        if body.len() <= VALIDATE_BELOW || memmem::find(body.as_ref(), br#""error""#).is_some() {
-            let parse_error: RpcErrorOnly = match serde_json::from_slice(body.as_ref()) {
-                Ok(res) => res,
-                Err(e) => {
-                    Self::record_upstream(node, "invalid_json", started.elapsed().as_secs_f64());
-                    debug!(
-                        node = %node.name,
-                        error = %e,
-                        "upstream returned invalid JSON"
-                    );
-
-                    return Attempt::Retry;
-                }
-            };
-
-            if let Some(err) = parse_error.error {
-                if !Self::is_retryable_json_rpc_error(err.code) {
-                    Self::record_upstream(
-                        node,
-                        "forwarded_rpc_error",
-                        started.elapsed().as_secs_f64(),
-                    );
-
-                    return Attempt::Done(status_code, body);
-                }
-
-                Self::record_upstream(node, "retryable_rpc_error", started.elapsed().as_secs_f64());
-                debug!(
-                    node = %node.name,
-                    code = err.code,
-                    "upstream returned retryable RPC error"
-                );
-
-                return Attempt::Retry;
-            }
-        }
-
-        let outcome = if status_code.is_success() {
-            "success"
-        } else {
-            "forwarded_http_error"
-        };
-        Self::record_upstream(node, outcome, started.elapsed().as_secs_f64());
-
-        Attempt::Done(status_code, body)
-    }
-
-    /// Waits for the first node to leave its rate limit, tracking how many
-    /// requests are parked in the meantime.
-    async fn wait_rate_limited(best_time: Duration) {
-        let _guard = GaugeGuard::new(gauge!(
-            description: "Number of requests currently sleeping while all RPC nodes are rate-limited",
-            "rpc_sleep_queue_size"
-        ));
-        tokio::time::sleep(best_time).await;
-    }
-
-    /// Records the end-to-end metrics for one client request.
-    fn record_request(outcome: &'static str, request_started: Instant) {
-        counter!(
-            description: "Client requests handled by the RPC load balancer",
-            "rpc_requests",
-            "outcome" => outcome,
-        )
-        .increment(1);
-        histogram!(
-            description: "End-to-end RPC load balancer request duration",
-            unit: Unit::Seconds,
-            "rpc_request_duration",
-            "outcome" => outcome,
-        )
-        .record(request_started.elapsed().as_secs_f64());
-    }
+    tokio::time::sleep(best_time).await;
 }

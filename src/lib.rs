@@ -1,4 +1,5 @@
 pub mod core;
+pub mod metrics;
 pub mod protocol;
 pub mod provider;
 pub mod quotas;
