@@ -381,3 +381,96 @@ async fn max_concurrent_caps_in_flight_requests() {
         mock.peak_concurrency()
     );
 }
+
+// ---------------------------------------------------------------------------
+// A reload landing mid-request
+//
+// The retry loop re-reads the topology once per round, so a SIGHUP that lands
+// while a request is parked on a rate limit reaches that request. Nothing else
+// in the suite exercises the two together.
+// ---------------------------------------------------------------------------
+
+/// Sends `count` requests, only to burn the first node's rate-limit tokens.
+async fn drain_tokens(client: &rpc_load_balancer::core::rpc::RpcClient, count: usize) {
+    for _ in 0..count {
+        let _ = client.send(Bytes::from(OK_BODY)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_topology_swap_mid_retry_uses_the_new_node_set() {
+    let old_upstream = spawn_mock(200, OK_BODY).await;
+    let fresh_upstream = spawn_mock(200, OK_BODY).await;
+
+    // Two tokens, both spent below, so the third request parks on the limit.
+    let client = build_client_one(node("old", &old_upstream.url).rps(2).build());
+    drain_tokens(&client, 2).await;
+
+    let reloading = client.clone();
+    let fresh_url = fresh_upstream.url.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        reloading
+            .reload(vec![node("fresh", &fresh_url).build()])
+            .await
+            .unwrap();
+    });
+
+    let (status, _) = client.send(Bytes::from(OK_BODY)).await.unwrap();
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        fresh_upstream.hits(),
+        1,
+        "the retry round did not see the reloaded node set"
+    );
+}
+
+#[tokio::test]
+async fn a_node_already_tried_is_not_retried_after_a_reload() {
+    // Tier 0 always fails retryably; tier 1 serves, and has two tokens.
+    let failing = spawn_mock(200, SERVER_ERROR_BODY).await;
+    let serving = spawn_mock(200, OK_BODY).await;
+
+    let failing_url = failing.url.clone();
+    let serving_url = serving.url.clone();
+
+    let client = build_client(vec![
+        node("failing", &failing_url).tier(0).build(),
+        node("serving", &serving_url).tier(1).rps(2).build(),
+    ]);
+
+    // Spend both of the serving node's tokens.
+    drain_tokens(&client, 2).await;
+
+    let failing_before = failing.hits();
+    let serving_before = serving.hits();
+
+    let reloading = client.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The same two nodes under the same two names, which is what keeps
+        // each of them its quota slot — and so its bit in the tried mask.
+        reloading
+            .reload(vec![
+                node("failing", &failing_url).tier(0).build(),
+                node("serving", &serving_url).tier(1).rps(2).build(),
+            ])
+            .await
+            .unwrap();
+    });
+
+    let (status, _) = client.send(Bytes::from(OK_BODY)).await.unwrap();
+
+    assert_eq!(status, StatusCode::OK);
+
+    // One attempt, one quota booking: the bitmask is keyed on the node's slot,
+    // and a reload that keeps a name keeps its slot, so the second round must
+    // walk straight past it.
+    assert_eq!(
+        failing.hits() - failing_before,
+        1,
+        "the failing node was retried after the reload"
+    );
+    assert_eq!(serving.hits() - serving_before, 1);
+}

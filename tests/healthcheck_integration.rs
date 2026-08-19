@@ -13,7 +13,11 @@ use rpc_load_balancer::core::{healthcheck::HealthCheckLoop, rpc::RpcClient, topo
 
 mod common;
 
-use common::{build_client, dead_url, node, spawn_health_mock, spawn_unhealthy_mock};
+use common::{
+    HEALTH_ERROR_BODY, HEALTH_OK_BODY, NOT_JSON_BODY, build_client, build_client_one, dead_url,
+    node, spawn_flaky_mock, spawn_health_mock, spawn_mock, spawn_mock_latency,
+    spawn_unhealthy_mock,
+};
 
 /// Runs the health check until it publishes a routing table, then stops it.
 ///
@@ -132,5 +136,154 @@ async fn unreachable_node_sorts_last_when_failing_open() {
             .latency
             .load(std::sync::atomic::Ordering::Relaxed),
         u32::MAX
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The probe itself: how many attempts it spends, and what it accepts as
+// healthy. `core::health` is a private module, so these go through
+// `run_once`, which is what calls it in production anyway.
+// ---------------------------------------------------------------------------
+
+/// Runs one probe round and reports how many nodes answered.
+async fn probe_round(client: &RpcClient) -> usize {
+    HealthCheckLoop::run_once(client).await
+}
+
+fn is_up(client: &RpcClient, name: &str) -> bool {
+    client
+        .health_snapshot()
+        .into_iter()
+        .find(|node| node.name == name)
+        .expect("node is in the topology")
+        .status
+        == "up"
+}
+
+#[tokio::test]
+async fn a_node_that_answers_on_the_third_probe_is_healthy() {
+    // Two dropped packets are what the retries exist for; without them a node
+    // leaves the routing table for a whole interval over a transient blip.
+    let flaky = spawn_flaky_mock(HEALTH_OK_BODY, 2).await;
+    let client = build_client_one(node("flaky", &flaky.url).build());
+
+    assert_eq!(probe_round(&client).await, 1);
+    assert_eq!(
+        flaky.hits(),
+        3,
+        "the probe gave up before its third attempt"
+    );
+    assert!(is_up(&client, "flaky"));
+}
+
+#[tokio::test]
+async fn a_node_that_never_answers_costs_three_attempts() {
+    let broken = spawn_flaky_mock(HEALTH_OK_BODY, usize::MAX).await;
+    let client = build_client_one(node("broken", &broken.url).build());
+
+    assert_eq!(probe_round(&client).await, 0);
+
+    // Three and no more: a node that never answers must not stall the round
+    // it shares with every other node.
+    assert_eq!(broken.hits(), 3);
+    assert!(!is_up(&client, "broken"));
+}
+
+#[tokio::test]
+async fn a_probe_slower_than_the_timeout_reads_as_unhealthy() {
+    // 600ms against the probe's 500ms budget: the node answers, just not in
+    // time, which is the case a plain TCP connect check would miss.
+    let sluggish = spawn_mock_latency(200, HEALTH_OK_BODY, Duration::from_millis(600)).await;
+    let client = build_client_one(node("sluggish", &sluggish.url).build());
+
+    assert_eq!(probe_round(&client).await, 0);
+    assert_eq!(sluggish.hits(), 3);
+}
+
+#[tokio::test]
+async fn a_body_that_does_not_parse_reads_as_unhealthy() {
+    let gateway_page = spawn_mock(200, NOT_JSON_BODY).await;
+    let client = build_client_one(node("gateway", &gateway_page.url).build());
+
+    assert_eq!(probe_round(&client).await, 0);
+    assert_eq!(gateway_page.hits(), 3, "an unparseable body is retried");
+}
+
+#[tokio::test]
+async fn an_error_member_reads_as_unhealthy() {
+    // Says `result: "ok"` and carries an error beside it. Reading only the
+    // result would call this node healthy.
+    let contradictory = spawn_mock(200, HEALTH_ERROR_BODY).await;
+    let client = build_client_one(node("contradictory", &contradictory.url).build());
+
+    assert_eq!(probe_round(&client).await, 0);
+    assert!(!is_up(&client, "contradictory"));
+}
+
+#[tokio::test]
+async fn a_healthy_node_reports_a_measured_latency() {
+    let good = spawn_health_mock(Duration::ZERO).await;
+    let client = build_client_one(node("good", &good.url).build());
+
+    probe_round(&client).await;
+
+    let measured = client.health_snapshot()[0].latency_ms;
+
+    // Not the u32::MAX sentinel: an unmeasured node sorts to the back of the
+    // routing table, which a healthy node must never do.
+    assert!(
+        measured.is_some_and(|ms| ms < u32::MAX),
+        "no latency measured: {measured:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_recovered_node_returns_to_the_table() {
+    let good = spawn_health_mock(Duration::ZERO).await;
+    // Fails the first round's three attempts, answers on the next round's.
+    let recovering = spawn_flaky_mock(HEALTH_OK_BODY, 3).await;
+
+    let client = build_client(vec![
+        node("good", &good.url).build(),
+        node("recovering", &recovering.url).build(),
+    ]);
+
+    assert_eq!(probe_round(&client).await, 1);
+    assert_eq!(names(&client.topology.load()), ["good"]);
+
+    assert_eq!(probe_round(&client).await, 2);
+    assert!(is_up(&client, "recovering"));
+    assert_eq!(names(&client.topology.load()).len(), 2);
+}
+
+#[tokio::test]
+async fn an_unreachable_node_never_reports_a_latency() {
+    let client = build_client_one(node("gone", &dead_url().await).build());
+
+    assert_eq!(probe_round(&client).await, 0);
+    assert_eq!(
+        client.health_snapshot()[0].latency_ms,
+        None,
+        "a down node reports no latency at all"
+    );
+}
+
+#[tokio::test]
+async fn a_node_that_goes_bad_leaves_the_table() {
+    let good = spawn_health_mock(Duration::ZERO).await;
+    let bad = spawn_unhealthy_mock().await;
+
+    let client = build_client(vec![
+        node("good", &good.url).build(),
+        node("bad", &bad.url).build(),
+    ]);
+
+    probe_round(&client).await;
+
+    assert_eq!(names(&client.topology.load()), ["good"]);
+    assert_eq!(
+        client.topology.load().all.len(),
+        2,
+        "the full node set survives; only the routing table shrinks"
     );
 }

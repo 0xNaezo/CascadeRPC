@@ -148,7 +148,7 @@ impl RpcNode {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -180,5 +180,108 @@ mod tests {
         // `monthly_limit * 95` code. u128 path must not overflow.
         let node = dummy_node(u64::MAX, 95);
         assert!(node.spillover_threshold < u64::MAX);
+    }
+
+    /// A node with every limit given, for the tests that exercise the limits
+    /// rather than the quota arithmetic.
+    fn node_with(rps_limit: u32, max_concurrent: usize, url: &str) -> Result<RpcNode> {
+        RpcNode::new(NewNode {
+            name: "test".into(),
+            url: url.into(),
+            rps_limit,
+            max_concurrent,
+            tier: 0,
+            method_costs: ProviderCostTable::default(),
+            monthly_limit: 1000,
+            spillover_percent: 95,
+            reset_day: 1,
+        })
+    }
+
+    #[test]
+    fn zero_rps_is_rejected() {
+        // `Quota::per_second` takes a `NonZeroU32`; without the guard this is a
+        // panic at startup instead of a config error.
+        assert!(node_with(0, 1, "http://localhost:9").is_err());
+    }
+
+    #[test]
+    fn an_invalid_url_is_rejected() {
+        assert!(node_with(1, 1, "not a url").is_err());
+    }
+
+    #[test]
+    fn a_url_without_a_scheme_is_rejected() {
+        // The most likely typo in a config file, and one that would otherwise
+        // only surface as a failed request.
+        assert!(node_with(1, 1, "127.0.0.1:8899").is_err());
+    }
+
+    #[test]
+    fn a_new_node_starts_healthy_with_no_measured_latency() {
+        let node = node_with(1, 1, "http://localhost:9").unwrap();
+
+        // Assumed up until the first probe says otherwise, and sorted last by
+        // `Topology::rank` until one measures it.
+        assert!(node.healthy.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(
+            node.latency.load(std::sync::atomic::Ordering::Relaxed),
+            u32::MAX
+        );
+        assert_eq!(node.id, 0, "the real slot is handed out by assign_ids");
+    }
+
+    #[tokio::test]
+    async fn acquire_and_check_reports_the_wait_when_the_bucket_is_empty() {
+        let node = node_with(1, 10, "http://localhost:9").unwrap();
+
+        let _first = node
+            .acquire_and_check()
+            .await
+            .expect("first call has a token");
+
+        let wait = node
+            .acquire_and_check()
+            .await
+            .expect_err("one token per second, so the second call is limited");
+
+        // The router sleeps on this value, so a zero would spin.
+        assert!(
+            wait > Duration::ZERO,
+            "wait time must be positive: {wait:?}"
+        );
+        assert!(
+            wait <= Duration::from_secs(1),
+            "wait longer than the quota window: {wait:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_permit_is_released_when_the_attempt_is_dropped() {
+        let node = node_with(100, 1, "http://localhost:9").unwrap();
+
+        let permit = node
+            .acquire_and_check()
+            .await
+            .expect("first attempt admitted");
+        assert_eq!(node.concurrency_limiting.available_permits(), 0);
+
+        drop(permit);
+
+        // Without this the node would be permanently at capacity after one
+        // request.
+        assert_eq!(node.concurrency_limiting.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrency_is_capped_at_max_concurrent() {
+        let node = node_with(100, 2, "http://localhost:9").unwrap();
+
+        let _a = node.acquire_and_check().await.unwrap();
+        let _b = node.acquire_and_check().await.unwrap();
+
+        // The third would block rather than fail, so this asserts on the
+        // semaphore instead of awaiting it.
+        assert_eq!(node.concurrency_limiting.available_permits(), 0);
     }
 }

@@ -36,3 +36,6 @@ nursery = { level = "warn", priority = 0 }
 unwrap_used = { level = "deny", priority = 1 }
 expect_used = { level = "deny", priority = 1 }
 panic = { level = "deny", priority = 1 }
+
+[dev-dependencies]
+serial_test = "4.0.1"

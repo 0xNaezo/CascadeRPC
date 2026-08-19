@@ -134,7 +134,7 @@ pub fn restore() -> Result<BTreeMap<String, NodeUsage>> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -295,5 +295,196 @@ mod tests {
             snapshot(&nodes, &usage, &periods(&["helius"], date!(2026 - 08 - 01))),
             BTreeMap::from([("helius", entry(42, date!(2026 - 08 - 01)))])
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // `flush` and `restore`
+    //
+    // Both resolve `quotas.json` against the working directory, which is
+    // process-global — hence `#[serial]` and a guard that puts the old
+    // directory back even when a test panics.
+    // -----------------------------------------------------------------------
+
+    use serial_test::serial;
+    use std::path::PathBuf;
+
+    /// Moves the process into a scratch directory for the duration of one test.
+    struct Scratch {
+        previous: PathBuf,
+        dir: PathBuf,
+    }
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let dir =
+                std::env::temp_dir().join(format!("rpc_lb_{tag}_{}_{unique}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+
+            let previous = std::env::current_dir().unwrap();
+            std::env::set_current_dir(&dir).unwrap();
+
+            Self { previous, dir }
+        }
+
+        fn write_usage_file(&self, contents: &str) {
+            std::fs::write(self.dir.join(FINAL_PATH), contents).unwrap();
+        }
+
+        fn has(&self, name: &str) -> bool {
+            self.dir.join(name).exists()
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.previous).ok();
+            std::fs::remove_dir_all(&self.dir).ok();
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn a_missing_usage_file_restores_an_empty_map() {
+        let _scratch = Scratch::new("quota_absent");
+
+        // The ordinary first start: no file, no usage, no error.
+        assert!(restore().unwrap().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn a_corrupt_usage_file_is_fatal() {
+        let scratch = Scratch::new("quota_corrupt");
+        scratch.write_usage_file("{ this is not json");
+
+        // Starting from zero here would re-open a monthly quota the provider
+        // still bills as spent, so the operator has to delete the file on
+        // purpose.
+        let error = restore().expect_err("a corrupt usage file must not start from zero");
+        assert!(
+            format!("{error}").contains(FINAL_PATH),
+            "the error must name the file to delete: {error}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_usage_file_with_the_wrong_shape_is_fatal() {
+        let scratch = Scratch::new("quota_shape");
+        // Valid JSON, wrong type: `used` must be a number.
+        scratch.write_usage_file(r#"{"helius":{"used":"lots","period_start":"2026-08-01"}}"#);
+
+        assert!(restore().is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn an_unreadable_usage_file_is_fatal() {
+        let scratch = Scratch::new("quota_unreadable");
+        // A directory where the file should be: not `NotFound`, so it must take
+        // the fatal branch rather than the empty-map one.
+        std::fs::create_dir(scratch.dir.join(FINAL_PATH)).unwrap();
+
+        assert!(restore().is_err());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn flush_then_restore_returns_the_same_counters() {
+        let _scratch = Scratch::new("quota_roundtrip");
+
+        let usage = GlobalQuotaState::default();
+        usage.usage(0).add(42);
+        usage.usage(1).add(7);
+
+        let nodes = [node(0, "helius"), node(1, "quicknode")];
+        let august = date!(2026 - 08 - 01);
+
+        flush(&snapshot(
+            &nodes,
+            &usage,
+            &periods(&["helius", "quicknode"], august),
+        ))
+        .await;
+
+        // The whole point of the file: a restart resumes the month where it
+        // left off.
+        assert_eq!(
+            restore().unwrap(),
+            BTreeMap::from([
+                ("helius".to_owned(), entry(42, august)),
+                ("quicknode".to_owned(), entry(7, august)),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_flush_leaves_no_temp_file_behind() {
+        let scratch = Scratch::new("quota_temp");
+
+        let usage = GlobalQuotaState::default();
+        let nodes = [node(0, "helius")];
+
+        flush(&snapshot(
+            &nodes,
+            &usage,
+            &periods(&["helius"], date!(2026 - 08 - 01)),
+        ))
+        .await;
+
+        assert!(scratch.has(FINAL_PATH), "the flush wrote nothing");
+        assert!(
+            !scratch.has(TEMP_PATH),
+            "the rename left the temp file behind"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_second_flush_replaces_the_first() {
+        let _scratch = Scratch::new("quota_overwrite");
+
+        let usage = GlobalQuotaState::default();
+        let nodes = [node(0, "helius")];
+        let august = date!(2026 - 08 - 01);
+        let periods = periods(&["helius"], august);
+
+        usage.usage(0).add(5);
+        flush(&snapshot(&nodes, &usage, &periods)).await;
+
+        usage.usage(0).add(5);
+        flush(&snapshot(&nodes, &usage, &periods)).await;
+
+        // Truncated, not appended to: the rename replaces the file whole.
+        assert_eq!(restore().unwrap()["helius"], entry(10, august));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_node_with_no_period_is_left_out_of_the_file() {
+        let _scratch = Scratch::new("quota_no_period");
+
+        let usage = GlobalQuotaState::default();
+        usage.usage(0).add(9);
+        usage.usage(1).add(9);
+
+        let nodes = [node(0, "helius"), node(1, "quicknode")];
+
+        flush(&snapshot(
+            &nodes,
+            &usage,
+            &periods(&["helius"], date!(2026 - 08 - 01)),
+        ))
+        .await;
+
+        // Writing a guessed period is the one way this file can cause a wrong
+        // reset, so the node is skipped until the rollover gives it one.
+        let restored = restore().unwrap();
+        assert!(restored.contains_key("helius"));
+        assert!(!restored.contains_key("quicknode"));
     }
 }

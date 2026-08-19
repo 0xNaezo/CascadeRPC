@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::{Router, extract::State, response::IntoResponse, routing::post};
+use metrics_exporter_prometheus::PrometheusHandle;
 use reqwest::StatusCode;
 use rpc_load_balancer::{
     core::{
@@ -30,6 +31,7 @@ use rpc_load_balancer::{
     },
     protocol::cost_table::{CostSpec, ProviderCostTable},
     protocol::registry::CUSTOM_METHODS,
+    server,
 };
 
 // ---------------------------------------------------------------------------
@@ -54,6 +56,12 @@ pub const HEALTH_OK_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"result":"ok"}"#;
 pub const HEALTH_BAD_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"result":"behind"}"#;
 /// A JSON-RPC batch. The balancer does not support batching.
 pub const BATCH_BODY: &str = r#"[{"jsonrpc":"2.0","method":"getBalance","id":1}]"#;
+/// Says `ok` *and* carries an error member. The health check must read the
+/// error, not the result.
+pub const HEALTH_ERROR_BODY: &str =
+    r#"{"jsonrpc":"2.0","id":1,"result":"ok","error":{"code":-32000}}"#;
+/// A gateway error page: 200, but nothing a JSON-RPC client can read.
+pub const NOT_JSON_BODY: &str = "<html>502 Bad Gateway</html>";
 
 // ---------------------------------------------------------------------------
 // Mock upstream node
@@ -63,6 +71,9 @@ struct MockState {
     status: u16,
     body: &'static str,
     latency: Duration,
+    /// Answers 500 to this many requests before serving `body`, for testing
+    /// the retry paths that only a transient failure reaches.
+    fail_first: usize,
     requests: Arc<AtomicUsize>,
     in_flight: Arc<AtomicUsize>,
     max_in_flight: Arc<AtomicUsize>,
@@ -88,7 +99,7 @@ impl Mock {
 }
 
 async fn handle_rpc(State(state): State<Arc<MockState>>) -> impl IntoResponse {
-    state.requests.fetch_add(1, Ordering::Relaxed);
+    let seen = state.requests.fetch_add(1, Ordering::Relaxed);
 
     let in_flight = state.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
     state.max_in_flight.fetch_max(in_flight, Ordering::SeqCst);
@@ -96,6 +107,10 @@ async fn handle_rpc(State(state): State<Arc<MockState>>) -> impl IntoResponse {
     tokio::time::sleep(state.latency).await;
 
     state.in_flight.fetch_sub(1, Ordering::SeqCst);
+
+    if seen < state.fail_first {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "upstream is unwell");
+    }
 
     (StatusCode::from_u16(state.status).unwrap(), state.body)
 }
@@ -107,12 +122,28 @@ pub async fn spawn_mock(status: u16, body: &'static str) -> Mock {
 
 /// Spawns a mock RPC node that sleeps `latency` before answering.
 pub async fn spawn_mock_latency(status: u16, body: &'static str, latency: Duration) -> Mock {
+    spawn_mock_flaky(status, body, latency, 0).await
+}
+
+/// Spawns a mock that answers 500 to its first `fail_first` requests, then
+/// serves `body` normally.
+pub async fn spawn_flaky_mock(body: &'static str, fail_first: usize) -> Mock {
+    spawn_mock_flaky(200, body, Duration::ZERO, fail_first).await
+}
+
+async fn spawn_mock_flaky(
+    status: u16,
+    body: &'static str,
+    latency: Duration,
+    fail_first: usize,
+) -> Mock {
     let requests = Arc::new(AtomicUsize::new(0));
     let max_in_flight = Arc::new(AtomicUsize::new(0));
     let state = Arc::new(MockState {
         status,
         body,
         latency,
+        fail_first,
         requests: requests.clone(),
         in_flight: Arc::new(AtomicUsize::new(0)),
         max_in_flight: max_in_flight.clone(),
@@ -151,13 +182,23 @@ pub async fn spawn_unhealthy_mock() -> Mock {
     spawn_mock(200, HEALTH_BAD_BODY).await
 }
 
-/// A URL nothing is listening on: binds a port to reserve it, then drops it.
+/// A URL nothing is listening on.
 pub async fn dead_url() -> String {
+    format!("http://127.0.0.1:{}", free_port().await)
+}
+
+/// An ephemeral port, released before it is handed back.
+///
+/// Racy in principle — something else could take it — but nothing else on the
+/// machine is binding into the ephemeral range in the microseconds between,
+/// and it is the only way to tell a server that binds its own listener which
+/// port to use.
+pub async fn free_port() -> u16 {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+    let port = listener.local_addr().unwrap().port();
     drop(listener);
 
-    format!("http://{addr}")
+    port
 }
 
 // ---------------------------------------------------------------------------
@@ -285,4 +326,36 @@ pub fn build_client_one(node: RpcNode) -> RpcClient {
 pub fn assert_err_contains(body: &bytes::Bytes, needle: &str) {
     let text = String::from_utf8_lossy(body);
     assert!(text.contains(needle), "unexpected error body: {text}");
+}
+
+// ---------------------------------------------------------------------------
+// The real HTTP server
+// ---------------------------------------------------------------------------
+
+/// Starts [`server::init_server`] on an ephemeral port and returns its base
+/// URL, once the listener is actually accepting connections.
+///
+/// Pass a handle to get the `/metrics` route; the server is left running for
+/// the rest of the test binary, which is what the process exit tidies up.
+pub async fn spawn_server(client: RpcClient, metrics: Option<PrometheusHandle>) -> String {
+    let port = free_port().await;
+
+    tokio::spawn(server::init_server(
+        client,
+        port,
+        "127.0.0.1".to_owned(),
+        metrics,
+    ));
+
+    let addr = format!("127.0.0.1:{port}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::net::TcpStream::connect(&addr).await.is_err() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "server never bound {addr}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    format!("http://{addr}")
 }
