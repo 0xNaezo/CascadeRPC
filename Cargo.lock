@@ -1549,6 +1549,7 @@ dependencies = [
  "config",
  "dotenvy",
  "governor",
+ "memchr",
  "metrics",
  "metrics-exporter-prometheus",
  "reqwest",

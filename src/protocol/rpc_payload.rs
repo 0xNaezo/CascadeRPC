@@ -18,7 +18,6 @@ pub struct RpcHealthResponse {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RpcError {
     pub code: i32,
-    pub message: String,
 }
 
 #[derive(Deserialize)]

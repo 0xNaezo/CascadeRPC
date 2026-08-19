@@ -247,6 +247,59 @@ async fn retryable_status_with_non_json_body_falls_over() {
 }
 
 // ---------------------------------------------------------------------------
+// Large-body fast path
+//
+// Above `VALIDATE_BELOW` (64 KiB) `classify_response` scans for a literal
+// `"error"` key instead of parsing the body. These two pin both sides of that
+// shortcut: what it skips, and what it must still catch.
+// ---------------------------------------------------------------------------
+
+/// Turns a generated body into the `&'static str` the mock harness wants.
+fn leak(body: String) -> &'static str {
+    Box::leak(body.into_boxed_str())
+}
+
+#[tokio::test]
+async fn large_non_json_body_without_error_key_is_forwarded() {
+    // Over the size limit and without an `"error"` key anywhere, so the body is
+    // never handed to serde. It is not valid JSON, which below the limit would
+    // have sent the request to node B — the deliberate trade for not parsing
+    // multi-megabyte payloads on the success path.
+    let a = spawn_mock(200, leak("x".repeat(70 * 1024))).await;
+    let b = spawn_mock(200, OK_BODY).await;
+
+    let client = build_client(vec![node("A", &a.url).build(), node("B", &b.url).build()]);
+
+    let (status, body) = client.send(Bytes::from(OK_BODY)).await.unwrap();
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.len(), 70 * 1024);
+    assert_eq!(a.hits(), 1);
+    assert_eq!(b.hits(), 0);
+}
+
+#[tokio::test]
+async fn large_body_with_retryable_error_still_falls_over() {
+    // Same size class, but the key is in there: the scan finds it, the body is
+    // parsed, and -32000 sends the request on to node B as it would at any size.
+    let padded = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"padding":"{}","error":{{"code":-32000,"message":"server error"}}}}"#,
+        "x".repeat(70 * 1024)
+    );
+    let a = spawn_mock(200, leak(padded)).await;
+    let b = spawn_mock(200, OK_BODY).await;
+
+    let client = build_client(vec![node("A", &a.url).build(), node("B", &b.url).build()]);
+
+    let (status, body) = client.send(Bytes::from(OK_BODY)).await.unwrap();
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, Bytes::from(OK_BODY));
+    assert_eq!(a.hits(), 1);
+    assert_eq!(b.hits(), 1);
+}
+
+// ---------------------------------------------------------------------------
 // Router edge cases
 // ---------------------------------------------------------------------------
 

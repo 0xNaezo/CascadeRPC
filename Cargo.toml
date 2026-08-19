@@ -21,6 +21,7 @@ dotenvy = "0.15.7"
 axum = "0.8"
 url = "2.5"
 bytes = "1.12"
+memchr = "2"
 governor = "0.10"
 arc-swap = "1.9"
 config = { version = "0.15", features = ["toml"] }

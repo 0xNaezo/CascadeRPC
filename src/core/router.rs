@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use memchr::memmem;
 use metrics::{Unit, counter, gauge, histogram};
 use reqwest::{Response, StatusCode};
 use std::time::Duration;
@@ -12,6 +13,12 @@ use crate::protocol::registry::CUSTOM_METHODS;
 use crate::protocol::rpc_payload::{MethodExtractor, RpcErrorOnly};
 
 const GLOBAL_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Upstream bodies up to this size are always parsed, larger ones only when
+/// they contain an `"error"` key. Any plausible non-JSON upstream answer (a
+/// gateway error page, a rate-limit notice) fits well below the limit, while
+/// the payloads worth not parsing start an order of magnitude above it.
+const VALIDATE_BELOW: usize = 64 * 1024;
 
 /// Failure produced by the balancer itself, as opposed to a response forwarded
 /// from an upstream node.
@@ -270,35 +277,41 @@ impl RpcClient {
             return Attempt::Done(status_code, body);
         }
 
-        let parse_error: RpcErrorOnly = match serde_json::from_slice(body.as_ref()) {
-            Ok(res) => res,
-            Err(e) => {
-                Self::record_upstream(node, "invalid_json", started.elapsed().as_secs_f64());
+        if body.len() <= VALIDATE_BELOW || memmem::find(body.as_ref(), br#""error""#).is_some() {
+            let parse_error: RpcErrorOnly = match serde_json::from_slice(body.as_ref()) {
+                Ok(res) => res,
+                Err(e) => {
+                    Self::record_upstream(node, "invalid_json", started.elapsed().as_secs_f64());
+                    debug!(
+                        node = %node.name,
+                        error = %e,
+                        "upstream returned invalid JSON"
+                    );
+
+                    return Attempt::Retry;
+                }
+            };
+
+            if let Some(err) = parse_error.error {
+                if !Self::is_retryable_json_rpc_error(err.code) {
+                    Self::record_upstream(
+                        node,
+                        "forwarded_rpc_error",
+                        started.elapsed().as_secs_f64(),
+                    );
+
+                    return Attempt::Done(status_code, body);
+                }
+
+                Self::record_upstream(node, "retryable_rpc_error", started.elapsed().as_secs_f64());
                 debug!(
                     node = %node.name,
-                    error = %e,
-                    "upstream returned invalid JSON"
+                    code = err.code,
+                    "upstream returned retryable RPC error"
                 );
 
                 return Attempt::Retry;
             }
-        };
-
-        if let Some(err) = parse_error.error {
-            if !Self::is_retryable_json_rpc_error(err.code) {
-                Self::record_upstream(node, "forwarded_rpc_error", started.elapsed().as_secs_f64());
-
-                return Attempt::Done(status_code, body);
-            }
-
-            Self::record_upstream(node, "retryable_rpc_error", started.elapsed().as_secs_f64());
-            debug!(
-                node = %node.name,
-                code = err.code,
-                "upstream returned retryable RPC error"
-            );
-
-            return Attempt::Retry;
         }
 
         let outcome = if status_code.is_success() {
