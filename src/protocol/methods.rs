@@ -1,3 +1,28 @@
+//! The method names the balancer knows how to price, and the ids it prices them
+//! by.
+//!
+//! Names arrive as bytes in a request body and have to become an index into a
+//! per-node cost table, on every request. A compiled-in `match` over byte string
+//! literals does that without allocating or lowercasing anything; the enum is
+//! only there to name the slots.
+//!
+//! Anything this table does not carry is a *custom* method, interned at config
+//! load by [`crate::protocol::registry`] and given an id past
+//! [`RpcMethod::Count`].
+
+/// A method slot in every provider's cost table.
+///
+/// Two variants are load-bearing and not methods at all:
+///
+/// - `Unknown = 0` is where every unrecognized name resolves, and the slot a
+///   provider's `unknown_method_cost` fallback is written to.
+/// - `Count` is not a method but the size of the built-in table, and the id the
+///   first interned custom method is handed. Keeping it last is what lets both
+///   kinds of id share one space.
+///
+/// Discriminants are written out rather than left implicit because they are the
+/// table layout, not an implementation detail: reordering the variants reprices
+/// every method.
 #[repr(usize)]
 pub enum RpcMethod {
     Unknown = 0,
@@ -120,6 +145,13 @@ pub enum RpcMethod {
     Count,
 }
 
+/// Id of a built-in method name, or `RpcMethod::Unknown` for anything else —
+/// including a custom method, which [`crate::protocol::registry::CustomMethods`]
+/// resolves instead.
+///
+/// The comparison is exact: case, whitespace and any trailing byte all matter,
+/// so `getbalance` and `getBalance ` are not `getBalance`. A typo therefore
+/// prices as unknown rather than as a near-miss.
 #[must_use]
 pub fn get_standard_method_id(method_bytes: &[u8]) -> usize {
     (match method_bytes {

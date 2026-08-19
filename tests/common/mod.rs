@@ -213,7 +213,6 @@ pub fn node(name: &str, url: &str) -> NodeBuilder {
             tier: 0,
             method_costs: priced_table(),
             monthly_limit: u64::MAX,
-            billing_type: "requests".to_string(),
             spillover_percent: 100,
             reset_day: 1,
         },

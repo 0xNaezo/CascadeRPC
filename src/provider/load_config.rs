@@ -1,3 +1,9 @@
+//! The balancer's own config file: the listener, and the node list every
+//! reload rebuilds the topology from.
+//!
+//! Provider pricing lives in separate files, one per provider, read through
+//! [`crate::provider::pricing_parser`] — a node only names the path to its own.
+
 use std::env;
 
 use anyhow::{Result, anyhow};
@@ -5,6 +11,7 @@ use config::{Config, ConfigError, File};
 use serde::Deserialize;
 use tracing::info;
 
+/// The whole config file, as parsed.
 #[derive(Debug, Deserialize, Clone)]
 pub struct Settings {
     pub server: ServerSettings,
@@ -12,17 +19,25 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// Load settings from `CONFIG_PATH` (required).
+    /// Reads the config file named by the `CONFIG_PATH` environment variable
+    /// and normalizes every node in it: `$VAR` references in the URL are
+    /// resolved from the environment, a `monthly_limit` of 0 becomes "no
+    /// limit", and `reset_day` is bounds-checked.
+    ///
+    /// Also the reload path, so anything checked here is checked again on every
+    /// SIGHUP.
     ///
     /// # Errors
     ///
-    /// Returns an error if the file cannot be read or parsed.
+    /// Returns an error if `CONFIG_PATH` is unset, the file cannot be read or
+    /// parsed, an interpolated environment variable is unset, or a node's
+    /// `reset_day` is outside `1..=31`.
     pub fn load() -> Result<Self> {
         dotenvy::dotenv().ok();
 
-        info!("Loading config from config/balancer_config/config.toml");
-
         let config_path = env::var("CONFIG_PATH")?;
+
+        info!("Loading config from {config_path}");
 
         let config = Config::builder()
             .add_source(File::with_name(&config_path).required(true))
@@ -33,6 +48,9 @@ impl Settings {
         for node in &mut settings.nodes {
             node.url = resolve_env(&node.url)?;
 
+            // 0 reads as "unmetered" in the config; the quota accounting has no
+            // separate "no limit" state, so it is spelled as a limit nothing can
+            // reach.
             if node.monthly_limit == 0 {
                 node.monthly_limit = u64::MAX;
             }
@@ -88,8 +106,10 @@ pub struct ConfigNode {
     pub tier: u8,
     pub rps_limit: u32,
     pub max_concurrent: usize,
+    /// Quota for one billing period, in the unit the provider bills in. 0 means
+    /// unmetered and is rewritten to [`u64::MAX`] on load.
     pub monthly_limit: u64,
-    pub billing_type: String,
+    /// Path to this node's provider pricing file, re-read on every reload.
     pub provider_pricing_path: String,
     /// Day of the month this provider's quota goes back to zero.
     ///
@@ -100,6 +120,18 @@ pub struct ConfigNode {
     pub reset_day: u8,
 }
 
+/// Substitutes `$VAR` references in a config string from the environment,
+/// which is how an API key reaches a node URL without being written to the
+/// config file.
+///
+/// Only the bare `$VAR` form is recognized — a name runs to the first character
+/// that is neither alphanumeric nor `_`. `${VAR}` is not a form of it and is
+/// passed through unchanged, as is a `$` with no name after it.
+///
+/// # Errors
+///
+/// Returns an error if a referenced variable is not set. Substituting an empty
+/// string would produce a URL that fails much further from the cause.
 fn resolve_env(s: &str) -> Result<String, ConfigError> {
     let mut out = String::new();
     let mut rest = s;

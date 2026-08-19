@@ -1,3 +1,10 @@
+//! The loop that keeps the routing table honest: probe every node, then
+//! republish the order the router walks them in.
+//!
+//! This is where node selection happens. The router itself does not choose — it
+//! takes the first node in the table that will accept the request, so the sort
+//! published here *is* the balancing policy.
+
 use crate::core::rpc::{RpcClient, Topology};
 use metrics::{Unit, gauge, histogram};
 use std::sync::Arc;
@@ -5,9 +12,15 @@ use std::sync::atomic::Ordering;
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
+/// Namespace for the probe loop; carries no state of its own.
 pub struct HealthCheckLoop;
 
 impl HealthCheckLoop {
+    /// Probes every node every 10 seconds, for as long as the task lives.
+    ///
+    /// The "everything is down" error is logged on the edge, not on every tick:
+    /// the balancer keeps serving in that state (see [`Topology::rank`]), and a
+    /// line every 10 seconds would bury whatever is actually wrong.
     pub async fn run_healthcheck_loop(rpc_client: RpcClient) {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -33,9 +46,9 @@ impl HealthCheckLoop {
     /// of its nodes are actually up would route requests on a guess.
     ///
     /// Reading the node set, probing it — up to ~2.5s for a node that never
-    /// answers — and storing the result is one critical section. Without the
-    /// lock a reload landing mid-round would be undone by an `active` list
-    /// built from the node set it had just replaced.
+    /// answers, see [`RpcClient::get_health`] — and storing the result is one
+    /// critical section. Without the lock a reload landing mid-round would be
+    /// undone by an `active` list built from the node set it had just replaced.
     pub async fn run_once(rpc_client: &RpcClient) -> usize {
         let _guard = rpc_client.topology_lock.lock().await;
 

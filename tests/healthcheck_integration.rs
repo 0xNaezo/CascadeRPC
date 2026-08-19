@@ -20,8 +20,8 @@ use common::{build_client, dead_url, node, spawn_health_mock, spawn_unhealthy_mo
 
 /// Runs the health check until it publishes a routing table, then stops it.
 ///
-/// A node that never answers costs ~2s (3 probes on a 1s interval), so the
-/// deadline has to clear that comfortably.
+/// A node that never answers costs ~2.5s (3 probes on a 1s interval, 500ms
+/// each), so the deadline has to clear that comfortably.
 async fn run_one_tick(client: &RpcClient) -> Arc<Topology> {
     let before = client.topology.load_full();
     let handle = tokio::spawn(HealthCheckLoop::run_healthcheck_loop(client.clone()));

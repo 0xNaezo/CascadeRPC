@@ -1,3 +1,10 @@
+//! One upstream RPC node: its address, the limits it is served under, and the
+//! health the probe loop measures for it.
+//!
+//! A node is built once per config load and never mutated afterwards. The
+//! request path only touches its atomics and its permits, so a reload can
+//! republish the whole set while requests are in flight.
+
 use anyhow::{Context, Result};
 use governor::{
     Quota, RateLimiter,
@@ -18,9 +25,15 @@ use url::Url;
 
 use crate::provider::{cost_table::ProviderCostTable, load_config::ConfigNode, pricing_parser};
 
+/// A `governor` limiter with every knob at its default: one unkeyed bucket,
+/// state in memory, no middleware. Named because the full path appears in
+/// [`RpcNode`]'s type.
 pub type DefaultDirectRateLimiter<MW = NoOpMiddleware<<DefaultClock as Clock>::Instant>> =
     RateLimiter<NotKeyed, InMemoryState, DefaultClock, MW>;
 
+/// What [`RpcNode::new`] needs to build a node, gathered into one struct
+/// because the list is long enough that positional arguments stop being
+/// readable.
 pub struct NewNode {
     pub name: String,
     pub url: String,
@@ -28,14 +41,20 @@ pub struct NewNode {
     pub max_concurrent: usize,
     pub tier: u8,
     pub method_costs: ProviderCostTable,
+    /// Quota for one billing period, in whatever unit the provider bills in.
+    /// Only used to derive [`RpcNode::spillover_threshold`].
     pub monthly_limit: u64,
-    pub billing_type: String,
+    /// Share of `monthly_limit` the node may spend before the router starts
+    /// skipping it, in percent.
     pub spillover_percent: u8,
     pub reset_day: u8,
 }
 
 #[derive(Clone)]
 pub struct RpcNode {
+    /// Index of this node's counter in [`crate::quotas::state::GlobalQuotaState`],
+    /// assigned by `assign_ids` and tied to [`Self::name`], not to the node's
+    /// position in the config.
     pub id: usize,
     pub name: String,
     pub url: Url,
@@ -45,8 +64,9 @@ pub struct RpcNode {
     pub latency: Arc<AtomicU32>,
     pub healthy: Arc<AtomicBool>,
     pub method_costs: Arc<ProviderCostTable>,
-    pub monthly_limit: u64,
-    pub billing_type: String,
+    /// Usage past which the router stops routing to this node: `monthly_limit`
+    /// scaled by `spillover_percent`. Traffic spills to the next tier a little
+    /// before the provider's quota is actually gone.
     pub spillover_threshold: u64,
     /// Day of the month this node's usage counter is zeroed on. See
     /// [`crate::quotas::period`].
@@ -54,7 +74,8 @@ pub struct RpcNode {
 }
 
 impl RpcNode {
-    /// Creates a new `RpcNode`.
+    /// Creates a node with no quota slot yet and no measured latency, assumed
+    /// healthy until the first probe says otherwise.
     ///
     /// # Errors
     ///
@@ -77,6 +98,9 @@ impl RpcNode {
             ((config.monthly_limit as u128) * u128::from(config.spillover_percent) / 100) as u64;
 
         Ok(Self {
+            // Placeholder: the real slot is handed out by `assign_ids`, which
+            // sees the whole node set and can keep a name on the counter it
+            // was already spending.
             id: 0,
             name: config.name,
             url,
@@ -86,8 +110,6 @@ impl RpcNode {
             latency: Arc::new(AtomicU32::new(u32::MAX)),
             healthy: Arc::new(AtomicBool::new(true)),
             method_costs: Arc::new(config.method_costs),
-            monthly_limit: config.monthly_limit,
-            billing_type: config.billing_type,
             spillover_threshold,
             reset_day: config.reset_day,
         })
@@ -119,7 +141,6 @@ impl RpcNode {
                     tier: n.tier,
                     method_costs: costs,
                     monthly_limit: n.monthly_limit,
-                    billing_type: n.billing_type,
                     spillover_percent,
                     reset_day: n.reset_day,
                 })
@@ -127,11 +148,15 @@ impl RpcNode {
             .collect::<Result<Vec<Self>, _>>()
     }
 
-    /// Checks rate limit, then acquires concurrency permit.
+    /// Takes a concurrency permit for one attempt, once the rate limiter has a
+    /// token to spare. The permit is held for as long as the attempt runs.
     ///
     /// # Errors
     ///
-    /// Returns the minimum wait time if the rate limit is exceeded.
+    /// Returns how long until the rate limiter frees up, which the router
+    /// sleeps on. A closed semaphore — which cannot happen while the node is
+    /// alive, nothing ever closes it — reports `Duration::MAX` so that the
+    /// router treats the node as the worst option rather than the best.
     pub async fn acquire_and_check(&self) -> Result<SemaphorePermit<'_>, Duration> {
         if let Err(err) = self.rate_limiting.check() {
             let clock = DefaultClock::default();
@@ -165,7 +190,6 @@ mod tests {
             tier: 0,
             method_costs: ProviderCostTable::default(),
             monthly_limit,
-            billing_type: "credits".into(),
             spillover_percent,
             reset_day: 1,
         })

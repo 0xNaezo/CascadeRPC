@@ -1,14 +1,35 @@
+//! The usage counters the router bills against, one per node.
+//!
+//! A fixed array rather than a map: the request path reads a counter on every
+//! admission decision, so the lookup is an index and the storage is laid out to
+//! keep two nodes off one cache line.
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Hard cap on how many nodes one config may describe.
+///
+/// 64 and not an arbitrary number: the router tracks which nodes a request has
+/// already tried in a `u64` bitmask, one bit per slot. `assign_ids` rejects
+/// larger configs, which is what keeps that mask and this array in agreement.
 pub const MAX_NODES: usize = 64;
 
-#[repr(align(64))] // align to one cache line to avoid False Sharing
+/// One node's usage counter, alone on its cache line.
+///
+/// The padding is the point: without it several nodes' counters share a line,
+/// and every quota increment invalidates it for whichever cores are billing the
+/// others.
+#[repr(align(64))]
 pub struct PaddedCounter(pub AtomicU64);
 
 impl PaddedCounter {
+    /// Books `val` against this node. The only way the request path may touch a
+    /// counter.
     pub fn add(&self, val: u64) {
         self.0.fetch_add(val, Ordering::Relaxed);
     }
+    /// Reads the counter. `Relaxed`, so a concurrent `add` may or may not be
+    /// included — the quota is a budget, not a ledger, and a request either side
+    /// of the threshold is not worth ordering for.
     pub fn get(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
     }
@@ -23,6 +44,7 @@ impl PaddedCounter {
     }
 }
 
+/// Every node's counter, indexed by the slot `assign_ids` gave it.
 pub struct GlobalQuotaState {
     nodes: [PaddedCounter; MAX_NODES],
 }
@@ -36,14 +58,12 @@ impl Default for GlobalQuotaState {
 }
 
 impl GlobalQuotaState {
-    /// Usage counter of the node with this id.
+    /// Usage counter of the node holding this id.
     ///
-    /// `id` is handed out by `RpcClient::new`, which rejects configs with more
-    /// than [`MAX_NODES`] nodes, so the index is in range by construction.
-    ///
-    /// ponytail: id is the node's position in the config; a hot reload must
-    /// match nodes by name, or reordering the TOML hands a node someone
-    /// else's counter.
+    /// Ids come from `assign_ids`, which rejects configs larger than
+    /// [`MAX_NODES`], so the index is in range by construction. It also keeps a
+    /// slot with the node's *name* across reloads, so a counter follows the node
+    /// that spent it rather than the position it happens to sit at.
     #[inline]
     #[must_use]
     pub const fn usage(&self, id: usize) -> &PaddedCounter {
