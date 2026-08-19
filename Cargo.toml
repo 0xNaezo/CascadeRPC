@@ -26,6 +26,7 @@ arc-swap = "1.9"
 config = { version = "0.15", features = ["toml"] }
 metrics = "0.24.6"
 metrics-exporter-prometheus = "0.18.3"
+time = { version = "0.3", features = ["macros", "serde", "serde-human-readable"] }
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }

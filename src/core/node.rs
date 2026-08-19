@@ -31,6 +31,7 @@ pub struct NewNode {
     pub monthly_limit: u64,
     pub billing_type: String,
     pub spillover_percent: u8,
+    pub reset_day: u8,
 }
 
 #[derive(Clone)]
@@ -47,6 +48,9 @@ pub struct RpcNode {
     pub monthly_limit: u64,
     pub billing_type: String,
     pub spillover_threshold: u64,
+    /// Day of the month this node's usage counter is zeroed on. See
+    /// [`crate::quotas::period`].
+    pub reset_day: u8,
 }
 
 impl RpcNode {
@@ -85,6 +89,7 @@ impl RpcNode {
             monthly_limit: config.monthly_limit,
             billing_type: config.billing_type,
             spillover_threshold,
+            reset_day: config.reset_day,
         })
     }
 
@@ -116,6 +121,7 @@ impl RpcNode {
                     monthly_limit: n.monthly_limit,
                     billing_type: n.billing_type,
                     spillover_percent,
+                    reset_day: n.reset_day,
                 })
             })
             .collect::<Result<Vec<Self>, _>>()
@@ -161,6 +167,7 @@ mod tests {
             monthly_limit,
             billing_type: "credits".into(),
             spillover_percent,
+            reset_day: 1,
         })
         .unwrap()
     }

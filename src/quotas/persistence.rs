@@ -1,24 +1,44 @@
 use std::collections::BTreeMap;
 use std::fs::read_to_string;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::to_vec_pretty;
 use std::io::ErrorKind;
+use time::Date;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tracing::warn;
 
 use crate::core::node::RpcNode;
 use crate::core::rpc::RpcClient;
+use crate::quotas::period::{self, PeriodMap, lock_periods};
 use crate::quotas::state::GlobalQuotaState;
 
 const FLUSH_PERIOD: Duration = Duration::from_mins(1);
 const TEMP_PATH: &str = "quotas_temp.json";
 const FINAL_PATH: &str = "quotas.json";
 
-/// Periodically writes every node's usage counter to [`FINAL_PATH`].
+/// One node's line in [`FINAL_PATH`]: what it has spent, and the billing period
+/// that spend belongs to.
+///
+/// The period is stored beside the counter, not derived on read, because it is
+/// what makes a monthly reset happen exactly once across a restart: see
+/// [`period::rollover_if_new_period`].
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeUsage {
+    pub used: u64,
+    pub period_start: Date,
+}
+
+/// Rolls the billing period over and writes every node's usage counter to
+/// [`FINAL_PATH`], once a minute.
+///
+/// The rollover shares this tick instead of running a loop of its own: it needs
+/// no other timer, and pairing the two means a reset and the marker that records
+/// it reach the disk together.
 ///
 /// Entries are keyed by node name, not by the counter's array index: the index
 /// is the node's position in the config, so reordering the TOML would hand a
@@ -34,6 +54,10 @@ pub async fn start_disk_flusher(rpc_client: RpcClient) {
     loop {
         interval.tick().await;
 
+        // Before the flush, so a counter this tick zeroes is written out zeroed
+        // rather than a minute later.
+        period::rollover_if_new_period(&rpc_client, SystemTime::now());
+
         flush(&rpc_client).await;
     }
 }
@@ -46,7 +70,12 @@ pub async fn flush(rpc_client: &RpcClient) {
     // `load_full` rather than `load`: the guard would otherwise be held across
     // the write below.
     let topology = rpc_client.topology.load_full();
-    let usage = snapshot(&topology.all, &rpc_client.nodes_usage);
+    let usage = {
+        // Dropped before the write: the flusher is the only writer, but holding
+        // it across an await would block a reload's rollover for a disk write.
+        let periods = lock_periods(&rpc_client.periods);
+        snapshot(&topology.all, &rpc_client.nodes_usage, &periods)
+    };
 
     match to_vec_pretty(&usage) {
         Ok(bytes) => {
@@ -58,14 +87,36 @@ pub async fn flush(rpc_client: &RpcClient) {
     }
 }
 
-/// Pairs each node's name with its current usage.
+/// Pairs each node's name with its current usage and billing period.
 ///
 /// `BTreeMap` keeps the output ordered by name, so the file stays diffable and
 /// hand-editable across flushes.
-fn snapshot<'a>(nodes: &'a [Arc<RpcNode>], usage: &GlobalQuotaState) -> BTreeMap<&'a str, u64> {
+///
+/// A node with no period yet is skipped rather than guessed at: writing a period
+/// the rollover has not agreed to would be the one way this file can cause a
+/// wrong reset. Every caller rolls over first, so the gap closes on the next
+/// tick.
+fn snapshot<'a>(
+    nodes: &'a [Arc<RpcNode>],
+    usage: &GlobalQuotaState,
+    periods: &PeriodMap,
+) -> BTreeMap<&'a str, NodeUsage> {
     nodes
         .iter()
-        .map(|node| (node.name.as_str(), usage.usage(node.id).get()))
+        .filter_map(|node| {
+            let Some(&period_start) = periods.get(&node.name) else {
+                warn!(node = %node.name, "no billing period yet; usage not written this tick");
+                return None;
+            };
+
+            Some((
+                node.name.as_str(),
+                NodeUsage {
+                    used: usage.usage(node.id).get(),
+                    period_start,
+                },
+            ))
+        })
         .collect()
 }
 
@@ -82,7 +133,7 @@ async fn write_atomic_async(data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Reads back the usage counters written by the last flush.
+/// Reads back the usage counters and billing periods written by the last flush.
 ///
 /// [`FINAL_PATH`] is relative to the working directory, same as on the write
 /// side: starting the balancer from a different directory starts it from zero.
@@ -95,7 +146,7 @@ async fn write_atomic_async(data: &[u8]) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if [`FINAL_PATH`] exists but cannot be read or parsed.
-pub fn restore() -> Result<BTreeMap<String, u64>> {
+pub fn restore() -> Result<BTreeMap<String, NodeUsage>> {
     let content = match read_to_string(FINAL_PATH) {
         Ok(data) => data,
         Err(err) if err.kind() == ErrorKind::NotFound => {
@@ -113,6 +164,8 @@ pub fn restore() -> Result<BTreeMap<String, u64>> {
 mod tests {
     use super::*;
 
+    use time::macros::date;
+
     use crate::core::node::NewNode;
     use crate::provider::cost_table::ProviderCostTable;
 
@@ -127,10 +180,23 @@ mod tests {
             monthly_limit: 1000,
             billing_type: "credits".into(),
             spillover_percent: 95,
+            reset_day: 1,
         })
         .unwrap();
         node.id = id;
         Arc::new(node)
+    }
+
+    /// Both nodes in the same period, which is the ordinary case.
+    fn periods(names: &[&str], start: Date) -> PeriodMap {
+        names
+            .iter()
+            .map(|name| ((*name).to_owned(), start))
+            .collect()
+    }
+
+    fn entry(used: u64, period_start: Date) -> NodeUsage {
+        NodeUsage { used, period_start }
     }
 
     #[test]
@@ -143,13 +209,43 @@ mod tests {
         usage.usage(1).add(7);
 
         let nodes = [node(0, "helius"), node(1, "quicknode")];
-        let flushed = to_vec_pretty(&snapshot(&nodes, &usage)).unwrap();
+        let august = date!(2026 - 08 - 01);
+        let flushed = to_vec_pretty(&snapshot(
+            &nodes,
+            &usage,
+            &periods(&["helius", "quicknode"], august),
+        ))
+        .unwrap();
 
-        let parsed: BTreeMap<String, u64> = serde_json::from_slice(&flushed).unwrap();
+        let parsed: BTreeMap<String, NodeUsage> = serde_json::from_slice(&flushed).unwrap();
 
         assert_eq!(
             parsed,
-            BTreeMap::from([("helius".to_owned(), 42), ("quicknode".to_owned(), 7)])
+            BTreeMap::from([
+                ("helius".to_owned(), entry(42, august)),
+                ("quicknode".to_owned(), entry(7, august)),
+            ])
+        );
+    }
+
+    #[test]
+    fn the_period_is_written_as_a_plain_iso_date() {
+        // The file is meant to be readable and hand-editable, and an operator
+        // recovering from a bad reset edits this field. Pinned because the date
+        // format comes from a dependency's serde impl, not from this crate.
+        let usage = GlobalQuotaState::default();
+        let nodes = [node(0, "helius")];
+
+        let flushed = to_vec_pretty(&snapshot(
+            &nodes,
+            &usage,
+            &periods(&["helius"], date!(2026 - 08 - 15)),
+        ))
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(flushed).unwrap(),
+            "{\n  \"helius\": {\n    \"used\": 0,\n    \"period_start\": \"2026-08-15\"\n  }\n}"
         );
     }
 
@@ -160,10 +256,14 @@ mod tests {
         usage.usage(1).add(7);
 
         let nodes = [node(0, "helius"), node(1, "quicknode")];
+        let august = date!(2026 - 08 - 01);
 
         assert_eq!(
-            snapshot(&nodes, &usage),
-            BTreeMap::from([("helius", 42), ("quicknode", 7)])
+            snapshot(&nodes, &usage, &periods(&["helius", "quicknode"], august)),
+            BTreeMap::from([
+                ("helius", entry(42, august)),
+                ("quicknode", entry(7, august))
+            ])
         );
     }
 
@@ -176,10 +276,51 @@ mod tests {
         usage.usage(1).add(7);
 
         let reordered = [node(1, "quicknode"), node(0, "helius")];
+        let august = date!(2026 - 08 - 01);
 
         assert_eq!(
-            snapshot(&reordered, &usage),
-            BTreeMap::from([("helius", 42), ("quicknode", 7)])
+            snapshot(
+                &reordered,
+                &usage,
+                &periods(&["helius", "quicknode"], august)
+            ),
+            BTreeMap::from([
+                ("helius", entry(42, august)),
+                ("quicknode", entry(7, august))
+            ])
+        );
+    }
+
+    #[test]
+    fn snapshot_keeps_each_node_its_own_period() {
+        // Two providers with different billing anchors are the reason the period
+        // is per entry and not one field for the whole file.
+        let usage = GlobalQuotaState::default();
+        let nodes = [node(0, "helius"), node(1, "quicknode")];
+
+        let mut mixed = PeriodMap::new();
+        mixed.insert("helius".to_owned(), date!(2026 - 08 - 01));
+        mixed.insert("quicknode".to_owned(), date!(2026 - 07 - 15));
+
+        assert_eq!(
+            snapshot(&nodes, &usage, &mixed),
+            BTreeMap::from([
+                ("helius", entry(0, date!(2026 - 08 - 01))),
+                ("quicknode", entry(0, date!(2026 - 07 - 15))),
+            ])
+        );
+    }
+
+    #[test]
+    fn snapshot_skips_a_node_with_no_period_rather_than_inventing_one() {
+        let usage = GlobalQuotaState::default();
+        usage.usage(0).add(42);
+
+        let nodes = [node(0, "helius"), node(1, "just-arrived")];
+
+        assert_eq!(
+            snapshot(&nodes, &usage, &periods(&["helius"], date!(2026 - 08 - 01))),
+            BTreeMap::from([("helius", entry(42, date!(2026 - 08 - 01)))])
         );
     }
 }
