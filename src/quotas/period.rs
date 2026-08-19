@@ -12,14 +12,15 @@
 //! quota open again.
 
 use std::collections::BTreeMap;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use time::{Date, Month, OffsetDateTime, util::days_in_month};
 use tracing::{info, warn};
 
-use crate::core::rpc::RpcClient;
+use crate::core::node::RpcNode;
+use crate::quotas::state::GlobalQuotaState;
 
 /// A period longer than this is a restart after a long outage, or a machine
 /// whose clock is simply wrong. Either way the operator wants to hear about it.
@@ -86,12 +87,21 @@ fn clamp_to_month(year: i32, month: Month, reset_day: u8) -> u8 {
 /// Idempotent, because the marker moves together with the counter: a reset lost
 /// to a crash before the next flush leaves the old period on disk and simply
 /// happens again on the next start.
-pub fn rollover_if_new_period(rpc_client: &RpcClient, now: SystemTime) {
+///
+/// Takes the three things it works on and not the client that holds them: the
+/// caller has already decided which node set this round is about — the whole
+/// point of the topology being republished rather than mutated — and passing it
+/// in is what keeps billing arithmetic testable without an HTTP client.
+pub fn rollover_if_new_period(
+    nodes: &[Arc<RpcNode>],
+    usage: &GlobalQuotaState,
+    periods: &Mutex<PeriodMap>,
+    now: SystemTime,
+) {
     let today = OffsetDateTime::from(now).date();
-    let topology = rpc_client.topology.load();
-    let mut periods = lock_periods(&rpc_client.periods);
+    let mut periods = lock_periods(periods);
 
-    for node in &topology.all {
+    for node in nodes {
         let start = match period_start(today, node.reset_day) {
             Ok(start) => start,
             Err(e) => {
@@ -113,9 +123,9 @@ pub fn rollover_if_new_period(rpc_client: &RpcClient, now: SystemTime) {
                     );
                 }
 
-                let usage = rpc_client.nodes_usage.usage(node.id);
-                let spent = usage.get();
-                usage.set(0);
+                let counter = usage.usage(node.id);
+                let spent = counter.get();
+                counter.set(0);
                 periods.insert(node.name.clone(), start);
 
                 info!(node = %node.name, spent, from = %stored, to = %start, "billing period rolled over");
@@ -132,7 +142,7 @@ pub fn rollover_if_new_period(rpc_client: &RpcClient, now: SystemTime) {
     // A node dropped from the config leaves its marker behind. The usage file is
     // written from the live node set, so this only keeps the map from growing
     // across reloads.
-    periods.retain(|name, _| topology.all.iter().any(|node| node.name == *name));
+    periods.retain(|name, _| nodes.iter().any(|node| node.name == *name));
 }
 
 #[cfg(test)]
@@ -142,38 +152,73 @@ mod tests {
 
     use time::macros::{date, datetime};
 
-    use crate::core::node::{NewNode, RpcNode};
+    use crate::core::node::NewNode;
     use crate::protocol::cost_table::ProviderCostTable;
 
-    fn client(names: &[&str], reset_day: u8) -> RpcClient {
-        let nodes = names
-            .iter()
-            .map(|name| {
-                RpcNode::new(NewNode {
-                    name: (*name).to_owned(),
-                    url: "http://localhost:9".into(),
-                    rps_limit: 1,
-                    max_concurrent: 1,
-                    tier: 0,
-                    method_costs: ProviderCostTable::default(),
-                    monthly_limit: u64::MAX,
-                    spillover_percent: 100,
-                    reset_day,
-                })
-                .unwrap()
-            })
-            .collect();
-
-        RpcClient::new(nodes).unwrap()
+    /// The three things a rollover works on, kept together so a test reads the
+    /// way the caller does.
+    struct Fixture {
+        nodes: Vec<Arc<RpcNode>>,
+        usage: GlobalQuotaState,
+        periods: Mutex<PeriodMap>,
     }
 
-    /// Wall-clock instant, the way the callers get it: `SystemTime`.
-    fn at(when: OffsetDateTime) -> SystemTime {
-        when.into()
+    impl Fixture {
+        fn new(names: &[&str], reset_day: u8) -> Self {
+            let with_days: Vec<(&str, u8)> = names.iter().map(|name| (*name, reset_day)).collect();
+
+            Self::with_reset_days(&with_days)
+        }
+
+        fn with_reset_days(nodes: &[(&str, u8)]) -> Self {
+            Self {
+                nodes: nodes
+                    .iter()
+                    .enumerate()
+                    .map(|(id, (name, reset_day))| Arc::new(node(id, name, *reset_day)))
+                    .collect(),
+                usage: GlobalQuotaState::default(),
+                periods: Mutex::new(PeriodMap::new()),
+            }
+        }
+
+        /// One rollover round over the whole node set.
+        fn roll(&self, when: OffsetDateTime) {
+            rollover_if_new_period(&self.nodes, &self.usage, &self.periods, when.into());
+        }
+
+        /// The same round over a node set a reload has narrowed.
+        fn roll_over(&self, nodes: &[Arc<RpcNode>], when: OffsetDateTime) {
+            rollover_if_new_period(nodes, &self.usage, &self.periods, when.into());
+        }
+
+        fn used(&self, id: usize) -> u64 {
+            self.usage.usage(id).get()
+        }
+
+        fn marker(&self, name: &str) -> Option<Date> {
+            lock_periods(&self.periods).get(name).copied()
+        }
     }
 
-    fn marker(client: &RpcClient, name: &str) -> Option<Date> {
-        lock_periods(&client.periods).get(name).copied()
+    /// Ids are handed out here the way `assign_ids` hands them out in
+    /// production: dense, in the order the nodes were given.
+    fn node(id: usize, name: &str, reset_day: u8) -> RpcNode {
+        let mut node = RpcNode::new(NewNode {
+            name: name.to_owned(),
+            url: "http://localhost:9".into(),
+            rps_limit: 1,
+            max_concurrent: 1,
+            tier: 0,
+            method_costs: ProviderCostTable::default(),
+            monthly_limit: u64::MAX,
+            spillover_percent: 100,
+            reset_day,
+        })
+        .unwrap();
+        node.id = id;
+
+        node
     }
 
     #[test]
@@ -231,25 +276,25 @@ mod tests {
     fn first_sight_of_a_node_adopts_the_period_without_resetting() {
         // A node added by a reload mid-month has no earlier period to compare
         // against; zeroing it here would throw away usage it really has.
-        let client = client(&["helius"], 1);
-        client.nodes_usage.usage(0).add(42);
+        let f = Fixture::new(&["helius"], 1);
+        f.usage.usage(0).add(42);
 
-        rollover_if_new_period(&client, at(datetime!(2026-08-17 12:00 UTC)));
+        f.roll(datetime!(2026-08-17 12:00 UTC));
 
-        assert_eq!(client.nodes_usage.usage(0).get(), 42);
-        assert_eq!(marker(&client, "helius"), Some(date!(2026 - 08 - 01)));
+        assert_eq!(f.used(0), 42);
+        assert_eq!(f.marker("helius"), Some(date!(2026 - 08 - 01)));
     }
 
     #[test]
     fn a_second_call_in_the_same_period_changes_nothing() {
-        let client = client(&["helius"], 1);
-        rollover_if_new_period(&client, at(datetime!(2026-08-17 12:00 UTC)));
-        client.nodes_usage.usage(0).add(42);
+        let f = Fixture::new(&["helius"], 1);
+        f.roll(datetime!(2026-08-17 12:00 UTC));
+        f.usage.usage(0).add(42);
 
-        rollover_if_new_period(&client, at(datetime!(2026-08-31 23:55 UTC)));
+        f.roll(datetime!(2026-08-31 23:55 UTC));
 
         assert_eq!(
-            client.nodes_usage.usage(0).get(),
+            f.used(0),
             42,
             "still the same month"
         );
@@ -260,48 +305,48 @@ mod tests {
         // The restart case, without the restart: down 31.08 23:55, up 01.09
         // 00:05 is the same comparison, and the marker on disk is what carries
         // it across the process boundary.
-        let client = client(&["helius"], 1);
-        rollover_if_new_period(&client, at(datetime!(2026-08-31 23:55 UTC)));
-        client.nodes_usage.usage(0).add(49_900_000);
+        let f = Fixture::new(&["helius"], 1);
+        f.roll(datetime!(2026-08-31 23:55 UTC));
+        f.usage.usage(0).add(49_900_000);
 
-        rollover_if_new_period(&client, at(datetime!(2026-09-01 00:05 UTC)));
+        f.roll(datetime!(2026-09-01 00:05 UTC));
 
-        assert_eq!(client.nodes_usage.usage(0).get(), 0);
-        assert_eq!(marker(&client, "helius"), Some(date!(2026 - 09 - 01)));
+        assert_eq!(f.used(0), 0);
+        assert_eq!(f.marker("helius"), Some(date!(2026 - 09 - 01)));
 
         // A minute later, the same September tick must not zero what the new
         // month has already spent.
-        client.nodes_usage.usage(0).add(7);
-        rollover_if_new_period(&client, at(datetime!(2026-09-01 00:06 UTC)));
+        f.usage.usage(0).add(7);
+        f.roll(datetime!(2026-09-01 00:06 UTC));
 
-        assert_eq!(client.nodes_usage.usage(0).get(), 7);
+        assert_eq!(f.used(0), 7);
     }
 
     #[test]
     fn an_outage_spanning_months_resets_once_not_once_per_month() {
-        let client = client(&["helius"], 1);
-        rollover_if_new_period(&client, at(datetime!(2026-08-05 10:00 UTC)));
-        client.nodes_usage.usage(0).add(1_000);
+        let f = Fixture::new(&["helius"], 1);
+        f.roll(datetime!(2026-08-05 10:00 UTC));
+        f.usage.usage(0).add(1_000);
 
-        rollover_if_new_period(&client, at(datetime!(2026-10-02 10:00 UTC)));
+        f.roll(datetime!(2026-10-02 10:00 UTC));
 
-        assert_eq!(client.nodes_usage.usage(0).get(), 0);
-        assert_eq!(marker(&client, "helius"), Some(date!(2026 - 10 - 01)));
+        assert_eq!(f.used(0), 0);
+        assert_eq!(f.marker("helius"), Some(date!(2026 - 10 - 01)));
     }
 
     #[test]
     fn a_clock_that_went_backwards_resets_nothing() {
         // A container that boots before NTP has synced reads a date in the past.
         // Resetting on it would re-open a quota the provider considers spent.
-        let client = client(&["helius"], 1);
-        rollover_if_new_period(&client, at(datetime!(2026-08-17 12:00 UTC)));
-        client.nodes_usage.usage(0).add(42);
+        let f = Fixture::new(&["helius"], 1);
+        f.roll(datetime!(2026-08-17 12:00 UTC));
+        f.usage.usage(0).add(42);
 
-        rollover_if_new_period(&client, at(datetime!(2026-07-04 12:00 UTC)));
+        f.roll(datetime!(2026-07-04 12:00 UTC));
 
-        assert_eq!(client.nodes_usage.usage(0).get(), 42);
+        assert_eq!(f.used(0), 42);
         assert_eq!(
-            marker(&client, "helius"),
+            f.marker("helius"),
             Some(date!(2026 - 08 - 01)),
             "the marker must not move backwards either"
         );
@@ -311,64 +356,33 @@ mod tests {
     fn nodes_roll_over_on_their_own_reset_days() {
         // Two providers, two billing anchors: resetting a node on a day its
         // provider does not is how the balancer overspends a real quota.
-        let mut nodes = vec![];
-        for (name, reset_day) in [("first-of-month", 1u8), ("fifteenth", 15u8)] {
-            nodes.push(
-                RpcNode::new(NewNode {
-                    name: name.to_owned(),
-                    url: "http://localhost:9".into(),
-                    rps_limit: 1,
-                    max_concurrent: 1,
-                    tier: 0,
-                    method_costs: ProviderCostTable::default(),
-                    monthly_limit: u64::MAX,
-                    spillover_percent: 100,
-                    reset_day,
-                })
-                .unwrap(),
-            );
-        }
-        let client = RpcClient::new(nodes).unwrap();
+        let f = Fixture::with_reset_days(&[("first-of-month", 1), ("fifteenth", 15)]);
 
-        rollover_if_new_period(&client, at(datetime!(2026-08-20 12:00 UTC)));
-        client.nodes_usage.usage(0).add(10);
-        client.nodes_usage.usage(1).add(20);
+        f.roll(datetime!(2026-08-20 12:00 UTC));
+        f.usage.usage(0).add(10);
+        f.usage.usage(1).add(20);
 
-        rollover_if_new_period(&client, at(datetime!(2026-09-01 12:00 UTC)));
+        f.roll(datetime!(2026-09-01 12:00 UTC));
 
-        assert_eq!(client.nodes_usage.usage(0).get(), 0, "resets on the 1st");
+        assert_eq!(f.used(0), 0, "resets on the 1st");
         assert_eq!(
-            client.nodes_usage.usage(1).get(),
+            f.used(1),
             20,
             "its period runs 15.08 to 15.09"
         );
     }
 
-    #[tokio::test]
-    async fn a_node_dropped_from_the_config_stops_being_tracked() {
-        let client = client(&["a", "b"], 1);
-        rollover_if_new_period(&client, at(datetime!(2026-08-17 12:00 UTC)));
+    #[test]
+    fn a_node_dropped_from_the_config_stops_being_tracked() {
+        let f = Fixture::new(&["a", "b"], 1);
+        f.roll(datetime!(2026-08-17 12:00 UTC));
 
-        let mut kept: Vec<RpcNode> = Vec::new();
-        kept.push(
-            RpcNode::new(NewNode {
-                name: "a".into(),
-                url: "http://localhost:9".into(),
-                rps_limit: 1,
-                max_concurrent: 1,
-                tier: 0,
-                method_costs: ProviderCostTable::default(),
-                monthly_limit: u64::MAX,
-                spillover_percent: 100,
-                reset_day: 1,
-            })
-            .unwrap(),
-        );
-        client.reload(kept).await.unwrap();
+        // "b" is gone from the config, so the next round is handed the node set
+        // without it — exactly what a reload republishes.
+        let kept = [f.nodes[0].clone()];
+        f.roll_over(&kept, datetime!(2026-08-18 12:00 UTC));
 
-        rollover_if_new_period(&client, at(datetime!(2026-08-18 12:00 UTC)));
-
-        assert!(marker(&client, "a").is_some());
-        assert!(marker(&client, "b").is_none(), "stale markers are pruned");
+        assert!(f.marker("a").is_some());
+        assert!(f.marker("b").is_none(), "stale markers are pruned");
     }
 }

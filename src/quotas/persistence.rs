@@ -8,7 +8,6 @@
 use std::collections::BTreeMap;
 use std::fs::read_to_string;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -20,11 +19,9 @@ use tokio::io::AsyncWriteExt;
 use tracing::warn;
 
 use crate::core::node::RpcNode;
-use crate::core::rpc::RpcClient;
-use crate::quotas::period::{self, PeriodMap, lock_periods};
+use crate::quotas::period::PeriodMap;
 use crate::quotas::state::GlobalQuotaState;
 
-const FLUSH_PERIOD: Duration = Duration::from_mins(1);
 const TEMP_PATH: &str = "quotas_temp.json";
 const FINAL_PATH: &str = "quotas.json";
 
@@ -40,51 +37,17 @@ pub struct NodeUsage {
     pub period_start: Date,
 }
 
-/// Rolls the billing period over and writes every node's usage counter to
-/// [`FINAL_PATH`], once a minute.
+/// Writes one [`snapshot`] to [`FINAL_PATH`].
 ///
-/// The rollover shares this tick instead of running a loop of its own: it needs
-/// no other timer, and pairing the two means a reset and the marker that records
-/// it reach the disk together.
-///
-/// Entries are keyed by node name, not by the counter's array index: a reload
-/// can move a node to a different slot, but never to a different name, so the
-/// name is the only key that still means the same node on the next start.
-///
-/// Runs until the task is dropped. A failed flush is logged and retried on the
-/// next tick.
-pub async fn start_disk_flusher(rpc_client: RpcClient) {
-    let mut interval =
-        tokio::time::interval_at(tokio::time::Instant::now() + FLUSH_PERIOD, FLUSH_PERIOD);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    loop {
-        interval.tick().await;
-
-        // Before the flush, so a counter this tick zeroes is written out zeroed
-        // rather than a minute later.
-        period::rollover_if_new_period(&rpc_client, SystemTime::now());
-
-        flush(&rpc_client).await;
-    }
-}
-
-/// Writes the current usage of every node to [`FINAL_PATH`].
+/// Takes the snapshot rather than the client it came from: this module writes a
+/// file, and reaching into a live topology to work out what to put in it is the
+/// caller's job — see `flush_usage` in `main`. It is also what keeps the whole
+/// write path testable without an HTTP client.
 ///
 /// Failures are logged rather than returned: the periodic caller retries on the
 /// next tick, and the shutdown caller has no one left to report to.
-pub async fn flush(rpc_client: &RpcClient) {
-    // `load_full` rather than `load`: the guard would otherwise be held across
-    // the write below.
-    let topology = rpc_client.topology.load_full();
-    let usage = {
-        // Dropped before the write: the flusher is the only writer, but holding
-        // it across an await would block a reload's rollover for a disk write.
-        let periods = lock_periods(&rpc_client.periods);
-        snapshot(&topology.all, &rpc_client.nodes_usage, &periods)
-    };
-
-    match to_vec_pretty(&usage) {
+pub async fn flush(usage: &BTreeMap<&str, NodeUsage>) {
+    match to_vec_pretty(usage) {
         Ok(bytes) => {
             if let Err(e) = write_atomic_async(&bytes).await {
                 warn!(error = %e, "quota flush failed");
@@ -96,6 +59,10 @@ pub async fn flush(rpc_client: &RpcClient) {
 
 /// Pairs each node's name with its current usage and billing period.
 ///
+/// Entries are keyed by node name, not by the counter's array index: a reload
+/// can move a node to a different slot, but never to a different name, so the
+/// name is the only key that still means the same node on the next start.
+///
 /// `BTreeMap` keeps the output ordered by name, so the file stays diffable and
 /// hand-editable across flushes.
 ///
@@ -103,7 +70,7 @@ pub async fn flush(rpc_client: &RpcClient) {
 /// the rollover has not agreed to would be the one way this file can cause a
 /// wrong reset. Every caller rolls over first, so the gap closes on the next
 /// tick.
-fn snapshot<'a>(
+pub fn snapshot<'a>(
     nodes: &'a [Arc<RpcNode>],
     usage: &GlobalQuotaState,
     periods: &PeriodMap,
