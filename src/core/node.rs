@@ -4,6 +4,10 @@
 //! A node is built once per config load and never mutated afterwards. The
 //! request path only touches its atomics and its permits, so a reload can
 //! republish the whole set while requests are in flight.
+//!
+//! Nothing here reads a file or knows the shape of the config: the config layer
+//! fills in a [`NewNode`] and this turns it into a node. See
+//! [`crate::provider::load_config::build_nodes`].
 
 use anyhow::{Context, Result};
 use governor::{
@@ -23,7 +27,7 @@ use std::{
 use tokio::sync::{Semaphore, SemaphorePermit};
 use url::Url;
 
-use crate::provider::{cost_table::ProviderCostTable, load_config::ConfigNode, pricing_parser};
+use crate::protocol::cost_table::ProviderCostTable;
 
 /// A `governor` limiter with every knob at its default: one unkeyed bucket,
 /// state in memory, no middleware. Named because the full path appears in
@@ -113,39 +117,6 @@ impl RpcNode {
             spillover_threshold,
             reset_day: config.reset_day,
         })
-    }
-
-    /// Builds every node the config describes, pricing tables included.
-    ///
-    /// Shared by startup and by hot reload, which is why the provider TOMLs are
-    /// re-read here rather than once at boot: editing a price list and sending
-    /// SIGHUP has to be enough to apply it.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if a pricing file cannot be read or a node is invalid.
-    /// Nothing is published until the whole set builds, so a bad edit leaves the
-    /// running configuration alone.
-    pub fn build_nodes(configs: Vec<ConfigNode>) -> Result<Vec<Self>> {
-        configs
-            .into_iter()
-            .map(|n| {
-                let (costs, spillover_percent) =
-                    pricing_parser::load_from_path(&n.provider_pricing_path)?;
-
-                Self::new(NewNode {
-                    name: n.name,
-                    url: n.url,
-                    rps_limit: n.rps_limit,
-                    max_concurrent: n.max_concurrent,
-                    tier: n.tier,
-                    method_costs: costs,
-                    monthly_limit: n.monthly_limit,
-                    spillover_percent,
-                    reset_day: n.reset_day,
-                })
-            })
-            .collect::<Result<Vec<Self>, _>>()
     }
 
     /// Takes a concurrency permit for one attempt, once the rate limiter has a

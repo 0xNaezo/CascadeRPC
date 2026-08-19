@@ -8,7 +8,7 @@
 
 use bytes::Bytes;
 use reqwest::StatusCode;
-use rpc_load_balancer::{core::rpc::RpcClient, provider::cost_table::CostSpec};
+use rpc_load_balancer::{core::rpc::RpcClient, protocol::cost_table::CostSpec};
 
 mod common;
 

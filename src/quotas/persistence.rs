@@ -174,7 +174,7 @@ mod tests {
     use time::macros::date;
 
     use crate::core::node::NewNode;
-    use crate::provider::cost_table::ProviderCostTable;
+    use crate::protocol::cost_table::ProviderCostTable;
 
     fn node(id: usize, name: &str) -> Arc<RpcNode> {
         let mut node = RpcNode::new(NewNode {
