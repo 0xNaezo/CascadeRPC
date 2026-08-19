@@ -30,11 +30,9 @@ impl Settings {
     /// # Errors
     ///
     /// Returns an error if `CONFIG_PATH` is unset, the file cannot be read or
-    /// parsed, an interpolated environment variable is unset, or a node's
-    /// `reset_day` is outside `1..=31`.
+    /// parsed, a URL uses an unsupported `${VAR}` reference or names an unset
+    /// environment variable, or a node's `reset_day` is outside `1..=31`.
     pub fn load() -> Result<Self> {
-        dotenvy::dotenv().ok();
-
         let config_path = env::var("CONFIG_PATH")?;
 
         info!("Loading config from {config_path}");
@@ -138,6 +136,20 @@ fn resolve_env(s: &str) -> Result<String, ConfigError> {
     while let Some(i) = rest.find('$') {
         out.push_str(&rest[..i]);
         rest = &rest[i + 1..];
+
+        // `${VAR}` is the shell syntax most operators reach for first, and it is
+        // not the one implemented here. Passing it through as a literal puts the
+        // eight characters `${TOKEN}` in the upstream URL and the node answers
+        // 401 at request time; refusing the config is the cheaper failure.
+        if rest.starts_with('{') {
+            return Err(ConfigError::Foreign(
+                anyhow!(
+                    "unsupported `${{...}}` syntax in '{s}'; write the reference as $VAR instead"
+                )
+                .into(),
+            ));
+        }
+
         let end = rest
             .bytes()
             .position(|b| !b.is_ascii_alphanumeric() && b != b'_')
@@ -201,13 +213,18 @@ mod tests {
     }
 
     #[test]
-    fn brace_var_not_substituted() {
-        // ${VAR}: '{' is not alphanumeric, so '$' has no valid name after it
-        // and is pushed literally; '{VAR}' follows as plain text.
-        assert_eq!(
-            resolve_env("${CARGO_PKG_NAME}").unwrap(),
-            "${CARGO_PKG_NAME}"
+    fn brace_var_is_rejected() {
+        // ${VAR} is not supported, and passing it through as a literal would put
+        // the braces straight into an upstream URL.
+        assert!(
+            resolve_env("${CARGO_PKG_NAME}").is_err(),
+            "${{...}} should be refused, not passed through"
         );
+    }
+
+    #[test]
+    fn brace_var_is_rejected_mid_string() {
+        assert!(resolve_env("https://api.example.com/${TOKEN}").is_err());
     }
 
     #[test]

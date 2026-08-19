@@ -19,6 +19,12 @@ use crate::core::node::RpcNode;
 use crate::core::rpc::{GaugeGuard, RpcClient};
 use crate::protocol::registry::CUSTOM_METHODS;
 use crate::protocol::rpc_payload::{MethodExtractor, RpcErrorOnly};
+use crate::quotas::state::MAX_NODES;
+
+// `route` tracks the nodes a request has already tried in a `u64` bitmask, one
+// bit per quota slot. The two numbers are set in different modules, so the
+// agreement between them is checked here rather than trusted to a comment.
+const _: () = assert!(MAX_NODES <= u64::BITS as usize);
 
 /// Wall-clock budget for one client request, retries and rate-limit sleeps
 /// included. Shorter than the per-attempt HTTP timeout on purpose: a single
@@ -55,17 +61,27 @@ impl RouteError {
         }
     }
 
+    /// Always JSON-RPC, whatever the HTTP status: a client that speaks JSON-RPC
+    /// to this endpoint gets a body it can parse on 502 and 504 too, not only on
+    /// the 400 it shares with the upstreams.
+    ///
+    /// `-32000` is the first of the codes the spec reserves for
+    /// implementation-defined server errors, which is what a balancer running
+    /// out of nodes or out of time is.
     const fn body(self) -> &'static [u8] {
         match self {
             Self::BadRequest => {
                 br#"{"jsonrpc":"2.0","error":{"code":-32700,"message":"Parse error"},"id":null}"#
             }
             Self::AllNodesFailed => {
-                b"All nodes failed with server/network errors (no rate limits to wait for)"
+                br#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"All nodes failed with server/network errors (no rate limits to wait for)"},"id":null}"#
             }
-            // Spells out GLOBAL_TIMEOUT: a `const fn` cannot format it in, so
-            // the two are kept in step by hand.
-            Self::Timeout => b"Global timeout (1s) exceeded while retrying nodes",
+            // No timeout value in the message: spelling out GLOBAL_TIMEOUT here
+            // is something a `const fn` cannot do, and a hand-kept copy of it
+            // goes stale the first time the budget is retuned.
+            Self::Timeout => {
+                br#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"Global timeout exceeded while retrying nodes"},"id":null}"#
+            }
         }
     }
 
@@ -165,7 +181,7 @@ impl RpcClient {
         body_bytes: &Bytes,
         method_id: usize,
     ) -> Result<(StatusCode, Bytes), RouteError> {
-        // One bit per quota slot: `node.id` is below `MAX_NODES` == 64 by
+        // One bit per quota slot: `node.id` is below `MAX_NODES` by
         // construction, `assign_ids` rejects larger configs. Without it every
         // round would book the cost of a steadily failing node all over again.
         let mut tried: u64 = 0;
