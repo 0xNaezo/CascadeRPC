@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::env;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
@@ -76,21 +75,6 @@ fn parse_file(path: &str) -> Result<(CostSpec, u8)> {
         },
         spillover_percent,
     ))
-}
-
-/// Loads routing cost tables for all providers from `PROVIDER_CONFIG_DIR`
-/// (required).
-///
-/// Keys are provider names (file names without `.toml`), values are
-/// `method -> cost` maps from each file's `[routing]` table.
-///
-/// # Errors
-///
-/// Returns an error if the directory cannot be read or any TOML file fails to parse.
-pub fn load_all() -> Result<HashMap<String, HashMap<String, u32>>> {
-    let dir = env::var("PROVIDER_CONFIG_DIR")?;
-
-    load_from_dir(Path::new(&dir))
 }
 
 /// Loads the routing cost table and `spillover_percent` from a single provider
