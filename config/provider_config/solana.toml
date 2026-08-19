@@ -1,6 +1,8 @@
-[routing]
+[limits]
 
-Unknown = 1
+unknown_method_cost = 1
+
+[routing]
 
 # Accounts
 getAccountInfo = 1

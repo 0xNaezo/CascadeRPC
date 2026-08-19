@@ -1,10 +1,9 @@
 [limits]
 
 spillover_percent = 95
+unknown_method_cost = 20
 
 [routing]
-
-Unknown = 20
 
 # Solana standard JSON-RPC methods
 getAccountInfo = 10
