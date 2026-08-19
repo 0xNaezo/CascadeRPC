@@ -216,7 +216,7 @@ fn resolve_env(s: &str) -> Result<String, ConfigError> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::resolve_env;
 
@@ -234,12 +234,14 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn env_var_substituted_from_environment() {
         // CARGO_PKG_NAME is always set by cargo during tests (= crate name).
         assert_eq!(resolve_env("$CARGO_PKG_NAME").unwrap(), "rpc-load-balancer");
     }
 
     #[test]
+    #[serial]
     fn env_var_substituted_with_surrounding_text() {
         // CARGO_PKG_VERSION (= "0.1.0") avoids unsafe std::env::set_var races.
         assert_eq!(
@@ -275,10 +277,299 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn missing_env_var_returns_error() {
         assert!(
             resolve_env("$RPC_LB_TEST_DEFINITELY_UNSET_VAR_XYZ123").is_err(),
             "missing env var should error"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // `Settings::load` and `build_nodes`
+    //
+    // `load` reads `CONFIG_PATH`, so every test below touches process-global
+    // state and runs under `#[serial]`. That lock is also what makes the
+    // `set_var` calls sound: edition 2024 marks them unsafe precisely because
+    // a concurrent `getenv` in another thread would be a data race.
+    // -----------------------------------------------------------------------
+
+    use serial_test::serial;
+    use std::path::{Path, PathBuf};
+
+    use super::{ConfigNode, Settings, build_nodes};
+    use crate::protocol::methods::RpcMethod;
+    use crate::protocol::registry::CUSTOM_METHODS;
+
+    /// Absolute, so a test does not depend on the directory cargo runs it from.
+    const PRICING_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/config/provider_config");
+
+    /// Scratch directory unique to one test run, removed even on panic.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let dir =
+                std::env::temp_dir().join(format!("rpc_lb_{tag}_{}_{unique}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+
+            Self(dir)
+        }
+
+        /// Writes `body` as the config file and points `CONFIG_PATH` at it.
+        fn config(&self, body: &str) -> PathBuf {
+            let path = self.0.join("config.toml");
+            std::fs::write(&path, body).unwrap();
+            set_config_path(&path);
+
+            path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    fn set_config_path(path: &Path) {
+        // SAFETY: every test that reads or writes the environment is `#[serial]`,
+        // so no other thread is inside `getenv`/`setenv` while this runs.
+        unsafe { std::env::set_var("CONFIG_PATH", path) };
+    }
+
+    /// A whole config file: fixed `[server]`, plus the node keys given.
+    fn config_with(node_keys: &str) -> String {
+        format!("[server]\nhost = \"127.0.0.1\"\nport = 3000\n\n{node_keys}")
+    }
+
+    /// Every node key except `monthly_limit`, which each test sets itself.
+    fn node_base(url: &str) -> String {
+        format!(
+            "[[nodes]]\nname = \"n1\"\nurl = \"{url}\"\ntier = 0\nrps_limit = 1\n\
+             max_concurrent = 1\nprovider_pricing_path = \"{PRICING_DIR}/helius.toml\"\n"
+        )
+    }
+
+    /// Node keys with a `monthly_limit` and anything else the test needs.
+    fn node(monthly_limit: u64, extra: &str) -> String {
+        format!(
+            "{}monthly_limit = {monthly_limit}\n{extra}",
+            node_base("http://127.0.0.1:1")
+        )
+    }
+
+    /// A `ConfigNode` pointing at a real provider file, for the `build_nodes`
+    /// tests that skip the file-reading half.
+    fn config_node(name: &str, pricing_file: &str) -> ConfigNode {
+        ConfigNode {
+            name: name.to_owned(),
+            url: "http://127.0.0.1:1".to_owned(),
+            tier: 0,
+            rps_limit: 1,
+            max_concurrent: 1,
+            monthly_limit: 1000,
+            provider_pricing_path: format!("{PRICING_DIR}/{pricing_file}"),
+            reset_day: 1,
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn zero_monthly_limit_reads_as_unlimited() {
+        let dir = TempDir::new("cfg_unlimited");
+        dir.config(&config_with(&node(0, "")));
+
+        let settings = Settings::load().unwrap();
+
+        // Not 0: the quota accounting has no separate "no limit" state, so
+        // unmetered is spelled as a limit nothing can reach.
+        assert_eq!(settings.nodes[0].monthly_limit, u64::MAX);
+    }
+
+    #[test]
+    #[serial]
+    fn a_real_monthly_limit_is_left_alone() {
+        let dir = TempDir::new("cfg_limit");
+        dir.config(&config_with(&node(1000, "")));
+
+        assert_eq!(Settings::load().unwrap().nodes[0].monthly_limit, 1000);
+    }
+
+    #[test]
+    #[serial]
+    fn reset_day_zero_is_rejected() {
+        let dir = TempDir::new("cfg_day_zero");
+        dir.config(&config_with(&node(1000, "reset_day = 0\n")));
+
+        // Left through, the node's counter would never reset again.
+        assert!(Settings::load().is_err(), "reset_day 0 must be refused");
+    }
+
+    #[test]
+    #[serial]
+    fn reset_day_above_31_is_rejected() {
+        let dir = TempDir::new("cfg_day_32");
+        dir.config(&config_with(&node(1000, "reset_day = 32\n")));
+
+        assert!(Settings::load().is_err(), "reset_day 32 must be refused");
+    }
+
+    #[test]
+    #[serial]
+    fn reset_day_bounds_are_inclusive() {
+        for day in [1, 31] {
+            let dir = TempDir::new("cfg_day_bounds");
+            dir.config(&config_with(&node(1000, &format!("reset_day = {day}\n"))));
+
+            let settings = Settings::load().unwrap_or_else(|e| panic!("day {day}: {e}"));
+            assert_eq!(settings.nodes[0].reset_day, day);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn reset_day_defaults_to_the_first() {
+        let dir = TempDir::new("cfg_day_default");
+        dir.config(&config_with(&node(1000, "")));
+
+        assert_eq!(Settings::load().unwrap().nodes[0].reset_day, 1);
+    }
+
+    #[test]
+    #[serial]
+    fn enable_metrics_defaults_to_false() {
+        let dir = TempDir::new("cfg_metrics_default");
+        dir.config(&config_with(&node(1000, "")));
+
+        // The scrape endpoint exposes node names and spend, so its default is
+        // the closed one.
+        assert!(!Settings::load().unwrap().server.enable_metrics);
+    }
+
+    #[test]
+    #[serial]
+    fn enable_metrics_is_read_when_set() {
+        let dir = TempDir::new("cfg_metrics_on");
+        dir.config(&format!(
+            "[server]\nhost = \"127.0.0.1\"\nport = 3000\nenable_metrics = true\n\n{}",
+            node(1000, "")
+        ));
+
+        assert!(Settings::load().unwrap().server.enable_metrics);
+    }
+
+    #[test]
+    #[serial]
+    fn a_missing_config_path_env_var_errors() {
+        // SAFETY: `#[serial]`, as above.
+        unsafe { std::env::remove_var("CONFIG_PATH") };
+
+        assert!(
+            Settings::load().is_err(),
+            "no CONFIG_PATH must fail, not fall back to a default file"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_missing_config_file_errors() {
+        let dir = TempDir::new("cfg_missing");
+        set_config_path(&dir.0.join("does_not_exist.toml"));
+
+        assert!(Settings::load().is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn a_config_that_does_not_parse_errors() {
+        let dir = TempDir::new("cfg_broken");
+        dir.config("this is not toml {{{");
+
+        assert!(Settings::load().is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn env_substitution_reaches_the_node_url() {
+        let dir = TempDir::new("cfg_env_url");
+        // CARGO_PKG_NAME is always set by cargo during tests, so no `set_var`
+        // for the substituted variable itself.
+        dir.config(&config_with(&format!(
+            "{}monthly_limit = 1000\n",
+            node_base("http://$CARGO_PKG_NAME.test/rpc")
+        )));
+
+        assert_eq!(
+            Settings::load().unwrap().nodes[0].url,
+            "http://rpc-load-balancer.test/rpc"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn an_unset_url_variable_stops_the_load() {
+        let dir = TempDir::new("cfg_env_unset");
+        dir.config(&config_with(&format!(
+            "{}monthly_limit = 1000\n",
+            node_base("http://$RPC_LB_TEST_DEFINITELY_UNSET_XYZ123.test")
+        )));
+
+        // Substituting an empty string would produce a URL that fails at
+        // request time, far from the cause.
+        assert!(Settings::load().is_err());
+    }
+
+    #[test]
+    fn build_nodes_prices_each_node_from_its_own_file() {
+        let nodes = build_nodes(
+            vec![
+                config_node("helius", "helius.toml"),
+                config_node("alchemy", "alchemy.toml"),
+            ],
+            &CUSTOM_METHODS,
+        )
+        .unwrap();
+
+        let get_balance = RpcMethod::GetBalance as usize;
+
+        // Same method, two prices: the tables did not get crossed.
+        assert_eq!(nodes[0].method_costs.cost(get_balance), 1);
+        assert_eq!(nodes[1].method_costs.cost(get_balance), 10);
+    }
+
+    #[test]
+    fn build_nodes_carries_the_spillover_percent_from_the_pricing_file() {
+        let nodes =
+            build_nodes(vec![config_node("helius", "helius.toml")], &CUSTOM_METHODS).unwrap();
+
+        // helius.toml declares 95%, over a monthly_limit of 1000.
+        assert_eq!(nodes[0].spillover_threshold, 950);
+    }
+
+    #[test]
+    fn build_nodes_fails_the_whole_set_if_one_pricing_file_is_missing() {
+        let result = build_nodes(
+            vec![
+                config_node("helius", "helius.toml"),
+                config_node("ghost", "no_such_provider.toml"),
+            ],
+            &CUSTOM_METHODS,
+        );
+
+        // All or nothing: a half-built set published on reload would drop the
+        // nodes after the bad one.
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn build_nodes_rejects_a_node_the_domain_layer_refuses() {
+        let mut bad = config_node("zero-rps", "helius.toml");
+        bad.rps_limit = 0;
+
+        assert!(build_nodes(vec![bad], &CUSTOM_METHODS).is_err());
     }
 }
