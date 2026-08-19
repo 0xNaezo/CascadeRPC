@@ -293,11 +293,7 @@ mod tests {
 
         f.roll(datetime!(2026-08-31 23:55 UTC));
 
-        assert_eq!(
-            f.used(0),
-            42,
-            "still the same month"
-        );
+        assert_eq!(f.used(0), 42, "still the same month");
     }
 
     #[test]
@@ -365,11 +361,7 @@ mod tests {
         f.roll(datetime!(2026-09-01 12:00 UTC));
 
         assert_eq!(f.used(0), 0, "resets on the 1st");
-        assert_eq!(
-            f.used(1),
-            20,
-            "its period runs 15.08 to 15.09"
-        );
+        assert_eq!(f.used(1), 20, "its period runs 15.08 to 15.09");
     }
 
     #[test]

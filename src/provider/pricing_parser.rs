@@ -273,7 +273,8 @@ mod tests {
              [custom]\nparser_test_doSomething = 77\n",
         );
 
-        let (table, spillover) = load_from_path(path.to_string_lossy().as_ref(), &CUSTOM_METHODS).unwrap();
+        let (table, spillover) =
+            load_from_path(path.to_string_lossy().as_ref(), &CUSTOM_METHODS).unwrap();
 
         assert_eq!(spillover, 50);
         assert_eq!(table.cost(RpcMethod::GetBalance as usize), 1);

@@ -28,8 +28,8 @@ use rpc_load_balancer::{
         node::{NewNode, RpcNode},
         rpc::RpcClient,
     },
-    protocol::registry::CUSTOM_METHODS,
     protocol::cost_table::{CostSpec, ProviderCostTable},
+    protocol::registry::CUSTOM_METHODS,
 };
 
 // ---------------------------------------------------------------------------

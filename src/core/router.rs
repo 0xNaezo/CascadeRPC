@@ -265,3 +265,34 @@ async fn wait_rate_limited(best_time: Duration) {
 
     tokio::time::sleep(best_time).await;
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    /// The balancer's own failures go back to a client that speaks JSON-RPC and
+    /// nothing else. Pinned on the bytes rather than on the message text: the
+    /// integration tests match a substring, which reads the same inside and
+    /// outside a JSON envelope and would not notice the envelope going away.
+    #[test]
+    fn every_route_error_answers_with_parseable_json_rpc() {
+        for (error, expected_code) in [
+            (RouteError::BadRequest, -32700),
+            (RouteError::AllNodesFailed, -32000),
+            (RouteError::Timeout, -32000),
+        ] {
+            let body: serde_json::Value = serde_json::from_slice(error.body())
+                .unwrap_or_else(|e| panic!("{error:?} body is not JSON: {e}"));
+
+            assert_eq!(body["jsonrpc"], "2.0", "{error:?}");
+            assert_eq!(body["error"]["code"], expected_code, "{error:?}");
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .is_some_and(|m| !m.is_empty()),
+                "{error:?} carries no message"
+            );
+        }
+    }
+}
