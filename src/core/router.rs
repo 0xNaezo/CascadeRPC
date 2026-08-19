@@ -1,3 +1,11 @@
+//! Routing one client request: pick a node, bill it, send, and decide whether
+//! the answer is final or the next node gets a turn.
+//!
+//! The order is not decided here — the health check loop publishes it and this
+//! walks it front to back, taking the first node that will accept the request.
+//! What this module owns is everything after that choice: the global time
+//! budget, quota booking, and which upstream failures are worth another node.
+
 use bytes::Bytes;
 use memchr::memmem;
 use metrics::{Unit, counter, gauge, histogram};
@@ -12,6 +20,11 @@ use crate::core::rpc::{GaugeGuard, RpcClient};
 use crate::protocol::registry::CUSTOM_METHODS;
 use crate::protocol::rpc_payload::{MethodExtractor, RpcErrorOnly};
 
+/// Wall-clock budget for one client request, retries and rate-limit sleeps
+/// included. Shorter than the per-attempt HTTP timeout on purpose: a single
+/// upstream may not spend the whole budget on its own.
+///
+/// Keep [`RouteError::body`]'s timeout message in step with this value.
 const GLOBAL_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Upstream bodies up to this size are always parsed, larger ones only when
@@ -50,6 +63,8 @@ impl RouteError {
             Self::AllNodesFailed => {
                 b"All nodes failed with server/network errors (no rate limits to wait for)"
             }
+            // Spells out GLOBAL_TIMEOUT: a `const fn` cannot format it in, so
+            // the two are kept in step by hand.
             Self::Timeout => b"Global timeout (1s) exceeded while retrying nodes",
         }
     }
@@ -68,7 +83,8 @@ impl RouteError {
     }
 }
 
-/// Whether a node may take the request right now.
+/// Whether a node may take the request right now, and what to do with it if
+/// not.
 enum Admission<'a> {
     /// Node accepted the request; the permit is held for the attempt.
     Ready(SemaphorePermit<'a>),

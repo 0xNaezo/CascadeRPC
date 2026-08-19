@@ -1,3 +1,9 @@
+//! The HTTP surface: one endpoint that proxies RPC requests, one that reports
+//! node health, and optionally a Prometheus scrape endpoint.
+//!
+//! Handlers hold no state of their own — everything comes from the shared
+//! [`RpcClient`], which is why they can be cloned across connections freely.
+
 use std::sync::atomic::Ordering;
 
 use crate::core::rpc::RpcClient;
@@ -13,11 +19,19 @@ use reqwest::StatusCode;
 use serde::Serialize;
 use tokio::signal;
 
-/// Starts the HTTP server on the configured host and port and serves RPC endpoints.
+/// Binds the listener and serves until SIGINT or SIGTERM.
+///
+/// Routes `GET /health`, `POST /send-request`, and `GET /metrics` when metrics
+/// are enabled — the recorder is only installed in that case, so the metrics the
+/// rest of the crate emits go nowhere otherwise.
+///
+/// Returns once shutdown is complete, which is what lets the caller flush the
+/// quota counters one last time.
 ///
 /// # Errors
 ///
-/// Returns an error if the TCP listener fails to bind or the server encounters a fatal error.
+/// Returns an error if the metrics recorder cannot be installed, the TCP
+/// listener cannot bind, or the server fails fatally while running.
 pub async fn init_server(
     rpc_client: RpcClient,
     port: u16,
@@ -48,6 +62,9 @@ pub async fn init_server(
         .await?)
 }
 
+/// Proxies one JSON-RPC request. The body is forwarded verbatim, and so is the
+/// answer: both halves of the router's result already carry the status to
+/// reply with.
 async fn send_request(State(rpc_client): State<RpcClient>, body: Bytes) -> (StatusCode, Bytes) {
     match rpc_client.send(body).await {
         Ok(response) | Err(response) => response,
@@ -70,6 +87,12 @@ struct HealthResponse {
     nodes: Vec<NodeHealth>,
 }
 
+/// Reports what the last health check round measured, per node.
+///
+/// Reads only the per-node atomics, so it costs nothing and never dials an
+/// upstream: `up`/`down` and the latency are as fresh as the last probe.
+/// `degraded` means the balancer is still serving but with fewer nodes than
+/// configured; `critical` means it is failing open over the whole set.
 pub async fn health(State(rpc_client): State<RpcClient>) -> impl IntoResponse {
     let nodes: Vec<NodeHealth> = rpc_client
         .topology

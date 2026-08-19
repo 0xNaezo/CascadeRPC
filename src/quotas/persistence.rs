@@ -1,3 +1,10 @@
+//! The usage file: what every node has spent, and which billing period that
+//! spend belongs to.
+//!
+//! Written once a minute and on shutdown, read once at startup. It exists so a
+//! restart does not re-open a monthly quota the provider still considers spent
+//! — see [`crate::quotas::period`] for the half that decides when it should be.
+
 use std::collections::BTreeMap;
 use std::fs::read_to_string;
 use std::sync::Arc;
@@ -40,9 +47,9 @@ pub struct NodeUsage {
 /// no other timer, and pairing the two means a reset and the marker that records
 /// it reach the disk together.
 ///
-/// Entries are keyed by node name, not by the counter's array index: the index
-/// is the node's position in the config, so reordering the TOML would hand a
-/// node someone else's usage on the next start.
+/// Entries are keyed by node name, not by the counter's array index: a reload
+/// can move a node to a different slot, but never to a different name, so the
+/// name is the only key that still means the same node on the next start.
 ///
 /// Runs until the task is dropped. A failed flush is logged and retried on the
 /// next tick.
@@ -178,7 +185,6 @@ mod tests {
             tier: 0,
             method_costs: ProviderCostTable::default(),
             monthly_limit: 1000,
-            billing_type: "credits".into(),
             spillover_percent: 95,
             reset_day: 1,
         })

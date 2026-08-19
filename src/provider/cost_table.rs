@@ -1,3 +1,10 @@
+//! What one provider charges for each method, as a flat array the router can
+//! index on the request path.
+//!
+//! The TOML is read into a [`CostSpec`] and compiled once into a
+//! [`ProviderCostTable`] per node; from then on pricing a request is a single
+//! bounds-checked load.
+
 use std::collections::HashMap;
 
 use crate::protocol::methods::{RpcMethod, get_standard_method_id};

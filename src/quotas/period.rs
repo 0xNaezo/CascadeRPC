@@ -157,7 +157,6 @@ mod tests {
                     tier: 0,
                     method_costs: ProviderCostTable::default(),
                     monthly_limit: u64::MAX,
-                    billing_type: "credits".into(),
                     spillover_percent: 100,
                     reset_day,
                 })
@@ -323,7 +322,6 @@ mod tests {
                     tier: 0,
                     method_costs: ProviderCostTable::default(),
                     monthly_limit: u64::MAX,
-                    billing_type: "credits".into(),
                     spillover_percent: 100,
                     reset_day,
                 })
@@ -361,7 +359,6 @@ mod tests {
                 tier: 0,
                 method_costs: ProviderCostTable::default(),
                 monthly_limit: u64::MAX,
-                billing_type: "credits".into(),
                 spillover_percent: 100,
                 reset_day: 1,
             })

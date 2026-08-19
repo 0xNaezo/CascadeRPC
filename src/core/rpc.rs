@@ -1,3 +1,13 @@
+//! The shared client every request is served from: the node set, the order the
+//! router walks it in, and the quota counters it bills against.
+//!
+//! Cheap to clone and cloned into every task that needs it — the state lives
+//! behind `Arc`s, so a handler, the health check loop and the flusher all see
+//! the same topology and the same counters.
+//!
+//! Routing itself lives in `core::router` and probing in `core::health`; this
+//! module owns what both of them share.
+
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -22,9 +32,15 @@ use crate::{
     },
 };
 
+/// Holds a gauge up for as long as the guard lives.
+///
+/// For counting things that are *currently* happening: the increment and the
+/// matching decrement cannot drift apart, because the decrement is `Drop` and
+/// runs on every path out — including a cancelled future.
 pub struct GaugeGuard(metrics::Gauge);
 
 impl GaugeGuard {
+    /// Increments the gauge; it goes back down when the guard is dropped.
     #[must_use]
     pub fn new(gauge: metrics::Gauge) -> Self {
         gauge.increment(1);
@@ -77,10 +93,21 @@ impl Topology {
     }
 }
 
+/// Everything a request needs, shared by every task that serves one.
+///
+/// `Clone` is cheap and is how the state is handed out: each field is behind an
+/// `Arc`, so clones share one topology and one set of counters.
 #[derive(Clone)]
 pub struct RpcClient {
+    /// One pooled HTTP client for every upstream, with a 2-second timeout. The
+    /// router's own budget is shorter, so this only bounds the health probes'
+    /// worst case.
     pub client: Client,
+    /// The live node set and routing order, republished whole by a health check
+    /// round or a reload. Read with `load()` on the request path, never locked.
     pub topology: Arc<ArcSwap<Topology>>,
+    /// Usage counters, indexed by `node.id`. Billed on admission, before the
+    /// request is sent.
     pub nodes_usage: Arc<GlobalQuotaState>,
     /// Which billing period each node's counter in [`Self::nodes_usage`] is
     /// credited to — the other half of what the usage file on disk holds. See
@@ -184,12 +211,18 @@ fn assign_ids(prev: &[Arc<RpcNode>], new: &mut [RpcNode], usage: &GlobalQuotaSta
 }
 
 impl RpcClient {
-    /// Builds a new [`RpcClient`] with a 2-second HTTP timeout.
+    /// Builds the client the balancer runs on: one pooled HTTP client with a
+    /// 2-second timeout, the ranked node set, and counters at zero.
+    ///
+    /// Usage is seeded separately, by [`Self::load_quotas`], because it comes
+    /// from disk and only makes sense together with the billing periods it was
+    /// counted in.
     ///
     /// # Errors
     ///
-    /// Returns an error if the underlying HTTP client cannot be initialized
-    /// (e.g. TLS backend failure).
+    /// Returns an error if the HTTP client cannot be initialized (e.g. a TLS
+    /// backend failure), if the set is larger than [`MAX_NODES`], or if two
+    /// nodes share a name.
     pub fn new(mut nodes: Vec<RpcNode>) -> Result<Self> {
         let client = Client::builder().timeout(Duration::new(2, 0)).build()?;
 
@@ -266,6 +299,9 @@ impl RpcClient {
         }
     }
 
+    /// Records one attempt against one upstream node: how it ended, and how
+    /// long it took. Every path out of an attempt goes through here, so the
+    /// `outcome` label partitions the attempts rather than sampling them.
     pub fn record_upstream(node: &RpcNode, outcome: &'static str, duration_seconds: f64) {
         counter!(
             description: "Attempts sent to upstream RPC nodes",
@@ -284,11 +320,14 @@ impl RpcClient {
         .record(duration_seconds);
     }
 
-    /// Sends a JSON-RPC request to the given URL.
+    /// Posts a body to one upstream URL, verbatim. Shared by the router and the
+    /// health probe, which is why it takes the URL rather than a node.
     ///
     /// # Errors
     ///
-    /// Returns an error if the HTTP request fails.
+    /// Returns an error if the request cannot be completed at all: DNS,
+    /// connection, TLS, or the client's own timeout. An HTTP error status is a
+    /// completed request and comes back as `Ok`.
     pub async fn send_request(client: Client, body: Bytes, url: Url) -> Result<Response> {
         let result = client
             .post(url)
@@ -300,6 +339,16 @@ impl RpcClient {
         Ok(result)
     }
 
+    /// Whether an HTTP status leaves room to try another node.
+    ///
+    /// A deny-list, so the default is to retry: the listed statuses are the ones
+    /// that say something about the *request*, and repeating it against another
+    /// node would only produce the same answer more slowly. Everything else —
+    /// 5xx, 429, an unassigned code — is the node's problem, not the request's.
+    ///
+    /// Success is "retryable" too, which reads oddly on its own: the caller uses
+    /// this to decide whether the response is final *on its status alone*, and a
+    /// 200 still has to be checked for a JSON-RPC error inside the body.
     #[must_use]
     pub fn is_retryable_error(error_code: StatusCode) -> bool {
         let http_status = error_code.as_u16();
@@ -315,6 +364,13 @@ impl RpcClient {
         true
     }
 
+    /// Whether a JSON-RPC error code leaves room to try another node.
+    ///
+    /// The same deny-list shape as [`Self::is_retryable_error`], over the four
+    /// codes the spec defines for a malformed or unanswerable request: parse
+    /// error, invalid request, method not found, invalid params. Another node
+    /// would reject the identical body identically, so those are forwarded to
+    /// the client as they are.
     #[must_use]
     pub fn is_retryable_json_rpc_error(error_code: i32) -> bool {
         let not_retryable = [-32700, -32601, -32602, -32600];
@@ -345,7 +401,6 @@ mod tests {
                     tier: 0,
                     method_costs: ProviderCostTable::default(),
                     monthly_limit: u64::MAX,
-                    billing_type: "credits".into(),
                     spillover_percent: 100,
                     reset_day: 1,
                 })

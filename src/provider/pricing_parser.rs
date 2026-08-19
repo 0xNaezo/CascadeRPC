@@ -1,3 +1,10 @@
+//! Reading a provider's pricing file into the cost table its nodes are served
+//! from.
+//!
+//! One file per provider, named by each node in the balancer config and re-read
+//! on every reload, so editing a price list and sending SIGHUP is enough to
+//! apply it.
+
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -10,8 +17,12 @@ use crate::provider::cost_table::{CostSpec, ProviderCostTable};
 
 const DEFAULT_SPILLOVER_PERCENT: u8 = 95;
 
+/// The optional `[limits]` section of a provider file.
 #[derive(Debug, Deserialize)]
 struct ProviderLimits {
+    /// Share of the node's `monthly_limit` it may spend before the router
+    /// starts skipping it, in percent. Left out, [`DEFAULT_SPILLOVER_PERCENT`]
+    /// keeps a small reserve.
     #[serde(default = "default_spillover_percent")]
     spillover_percent: u8,
     /// Price for a method neither `[routing]` nor `[custom]` names. Left out,
@@ -24,8 +35,12 @@ const fn default_spillover_percent() -> u8 {
     DEFAULT_SPILLOVER_PERCENT
 }
 
+/// One provider pricing file, as parsed.
 #[derive(Debug, Deserialize)]
 struct ProviderRouting {
+    /// `[routing]`: prices for methods the [`crate::protocol::methods`] table
+    /// knows. A name it does not know is a typo and is dropped when the table is
+    /// built.
     routing: HashMap<String, u32>,
     /// Methods outside the standard set, under whatever names the provider gave
     /// them. Separate from `[routing]` so that section keeps its property: a
@@ -96,11 +111,17 @@ pub fn load_from_path(path: &str) -> Result<(ProviderCostTable, u8)> {
     ))
 }
 
-/// Loads routing cost tables from all `*.toml` files in `dir`.
+/// Reads every `*.toml` in `dir` and returns each provider's `[routing]` table,
+/// keyed by file stem.
+///
+/// Not on any runtime path — nodes name their pricing file individually, via
+/// [`load_from_path`]. This exists for the crate's own consistency checks over
+/// the shipped provider configs, which need every priced name in one place.
 ///
 /// # Errors
 ///
-/// Returns an error if the directory cannot be read or any TOML file fails to parse.
+/// Returns an error if the directory cannot be read or any TOML file fails to
+/// parse.
 pub fn load_from_dir(dir: &Path) -> Result<HashMap<String, HashMap<String, u32>>> {
     let mut out = HashMap::new();
 

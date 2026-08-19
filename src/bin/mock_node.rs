@@ -10,7 +10,8 @@ use axum::{
 };
 use tokio::signal;
 
-// static response, zero allocation per request
+// Static response: no allocation per request, so the mock never competes with
+// the balancer for CPU under load.
 static OK_BODY: &str = r#"{"jsonrpc":"2.0","result":"ok","id":1}"#;
 
 struct NodeState {

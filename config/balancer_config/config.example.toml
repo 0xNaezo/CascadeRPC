@@ -29,7 +29,6 @@ tier = 1
 rps_limit = 10
 max_concurrent = 4
 monthly_limit = 50_000_000
-billing_type = "compute_units"
 reset_day = 15 # billed on the 15th, not the 1st
 provider_pricing_path = "config/provider_config/helius.toml"
 
@@ -40,7 +39,6 @@ tier = 0
 rps_limit = 20
 max_concurrent = 8
 monthly_limit = 20_000_000
-billing_type = "compute_units"
 provider_pricing_path = "config/provider_config/alchemy.toml"
 
 [[nodes]]
@@ -50,5 +48,4 @@ tier = 2
 rps_limit = 5
 max_concurrent = 2
 monthly_limit = 0
-billing_type = "requests"
 provider_pricing_path = "config/provider_config/solana.toml"
