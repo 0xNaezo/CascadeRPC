@@ -13,38 +13,53 @@ use axum::{
     routing::{get, post},
 };
 use bytes::Bytes;
-use metrics_exporter_prometheus::PrometheusBuilder;
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use reqwest::StatusCode;
 use serde::Serialize;
 use tokio::signal;
 
+/// Installs the process-wide Prometheus recorder and hands back the handle the
+/// scrape endpoint renders from.
+///
+/// Separate from [`init_server`], and called before it: the recorder is global,
+/// and a metric emitted before one exists is dropped rather than buffered. Doing
+/// this last would silently lose everything measured during startup — the quota
+/// gauges published off the restored counters, among them.
+///
+/// # Errors
+///
+/// Returns an error if a recorder is already installed in this process.
+pub fn install_metrics_recorder() -> anyhow::Result<PrometheusHandle> {
+    Ok(PrometheusBuilder::new()
+        .with_recommended_naming(true)
+        .install_recorder()?)
+}
+
 /// Binds the listener and serves until SIGINT or SIGTERM.
 ///
-/// Routes `GET /health`, `POST /send-request`, and `GET /metrics` when metrics
-/// are enabled — the recorder is only installed in that case, so the metrics the
-/// rest of the crate emits go nowhere otherwise.
+/// Routes `GET /health`, `POST /send-request`, and `GET /metrics` when a handle
+/// from [`install_metrics_recorder`] is passed — without one nothing scrapes the
+/// metrics the rest of the crate emits, and they go nowhere.
 ///
 /// Returns once shutdown is complete, which is what lets the caller flush the
 /// quota counters one last time.
 ///
 /// # Errors
 ///
-/// Returns an error if the metrics recorder cannot be installed, the TCP
-/// listener cannot bind, or the server fails fatally while running.
+/// Returns an error if the TCP listener cannot bind, or the server fails
+/// fatally while running.
 pub async fn init_server(
     rpc_client: RpcClient,
     port: u16,
     host: String,
-    enable_metrics: bool,
+    metrics: Option<PrometheusHandle>,
 ) -> anyhow::Result<()> {
     let mut app = Router::new()
         .route("/health", get(health))
         .route("/send-request", post(send_request))
         .with_state(rpc_client);
 
-    if enable_metrics {
-        let builder = PrometheusBuilder::new().with_recommended_naming(true);
-        let handle = builder.install_recorder()?;
+    if let Some(handle) = metrics {
         app = app.route(
             "/metrics",
             get(move || {
