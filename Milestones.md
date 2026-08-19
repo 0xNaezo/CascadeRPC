@@ -5,7 +5,7 @@ The core high-performance engine of CascadeRPC is already built and validated. T
 ## Milestone 1: Stateful Architecture & Intelligent HTTP Routing
 
 - **Deliverables:**
-  - [ ] **Persistent Quota Engine (Anti-Bill-Shock):** Integrating a local embedded database to persist monthly API usage (CUs/Credits) across restarts. Crucial for protecting developers from unexpected overage billing on premium tiers.
+  - [x] **Persistent Quota Engine (Anti-Bill-Shock):** Integrating a local embedded database to persist monthly API usage (CUs/Credits) across restarts. Crucial for protecting developers from unexpected overage billing on premium tiers.
   - [ ] **Zero-Cost Passive Probing:** Overhauling the health check system. Instead of active pings that burn API credits, the proxy will passively monitor real user traffic, calculating Exponential Moving Average (EMA) for latency and instantly penalizing nodes on HTTP 429 / 5xx errors.
   - [ ] **Compute-Unit (CU) Aware Routing:** Implementing dynamic traffic distribution based on RPC method weights. E.g., routing expensive getProgramAccounts to unlimited public tiers while reserving premium Helius limits for latency-critical sendTransaction calls.
 
