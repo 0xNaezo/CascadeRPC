@@ -12,7 +12,7 @@ mod common;
 
 use common::{
     OK_BODY, SERVER_ERROR_BODY, assert_err_contains, build_client, build_client_one, node,
-    spawn_mock,
+    node_handle, spawn_mock,
 };
 
 /// Quota slot of a node, resolved by name so the tests below stay readable.
@@ -237,16 +237,18 @@ async fn retry_loop_bills_the_failing_node_once() {
     let a = spawn_mock(200, SERVER_ERROR_BODY).await;
     let b = spawn_mock(200, OK_BODY).await;
 
-    let node_b = node("B", &b.url)
-        .rps(10)
-        .priced(&[("getBalance", 10)])
-        .build();
     let client = build_client(vec![
         node("A", &a.url).priced(&[("getBalance", 10)]).build(),
-        node_b.clone(),
+        node("B", &b.url)
+            .rps(10)
+            .priced(&[("getBalance", 10)])
+            .build(),
     ]);
 
-    // Drain B's 10-token burst so the first pass finds it rate-limited.
+    // Drain B's 10-token burst so the first pass finds it rate-limited. Through
+    // the client's own handle: the bucket the router meets is the only one that
+    // counts.
+    let node_b = node_handle(&client, "B");
     for _ in 0..10 {
         drop(node_b.acquire_and_check().await.unwrap());
     }

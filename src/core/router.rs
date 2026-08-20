@@ -174,7 +174,15 @@ impl RpcClient {
         loop {
             // Reloaded once per attempt round, so a config swap reaches the
             // retry loop without disturbing the round already in flight.
-            let topology = self.topology.load();
+            //
+            // `load_full` and not `load`: the round below awaits a full upstream
+            // round-trip, and an `arc_swap` guard held across that await burns
+            // one of the eight per-thread debt slots for the whole request. With
+            // hundreds of tasks per worker the slots stay empty, every `load`
+            // falls back to the slow path anyway, and the writer in the health
+            // check loop pays for it too. One honest `Arc` clone per round is
+            // cheaper than a guard nobody can afford to hold.
+            let topology = self.topology.load_full();
 
             let mut best_time: Option<Duration> = None;
 

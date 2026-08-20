@@ -317,6 +317,22 @@ pub fn build_client_one(node: RpcNode) -> RpcClient {
     build_client(vec![node])
 }
 
+/// The client's own handle on one of its nodes.
+///
+/// A node moves into the client when the topology is built, so a test that has
+/// to touch the very limiter the router will meet — draining a rate-limit burst,
+/// say — has to ask the client for it rather than keep a copy of its own.
+pub fn node_handle(client: &RpcClient, name: &str) -> Arc<RpcNode> {
+    client
+        .topology
+        .load()
+        .all
+        .iter()
+        .find(|node| node.name == name)
+        .unwrap_or_else(|| panic!("no node named {name}"))
+        .clone()
+}
+
 // ---------------------------------------------------------------------------
 // Assertions
 // ---------------------------------------------------------------------------

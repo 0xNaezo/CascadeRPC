@@ -108,7 +108,10 @@ async fn fails_open_when_every_node_is_unhealthy() {
     );
     for rpc_node in &table.active {
         assert!(
-            !rpc_node.healthy.load(std::sync::atomic::Ordering::Relaxed),
+            !rpc_node
+                .status
+                .healthy
+                .load(std::sync::atomic::Ordering::Relaxed),
             "{} is in the table despite being unhealthy — that is the point",
             rpc_node.name
         );
@@ -133,6 +136,7 @@ async fn unreachable_node_sorts_last_when_failing_open() {
     assert_eq!(names(&table), ["responding", "unreachable"]);
     assert_eq!(
         table.active[1]
+            .status
             .latency
             .load(std::sync::atomic::Ordering::Relaxed),
         u32::MAX

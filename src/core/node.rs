@@ -18,10 +18,7 @@ use governor::{
 };
 use std::{
     num::NonZeroU32,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU32},
-    },
+    sync::atomic::{AtomicBool, AtomicU32},
     time::Duration,
 };
 use tokio::sync::{Semaphore, SemaphorePermit};
@@ -55,7 +52,31 @@ pub struct NewNode {
     pub reset_day: u8,
 }
 
-#[derive(Clone)]
+/// The two limiters every attempt goes through, kept on a cache line of their
+/// own.
+///
+/// The alignment is the point: unpadded, the allocator is free to lay a node's
+/// bucket next to another node's health flag, and one health round then
+/// invalidates the line the router reads its limiter from.
+#[repr(align(64))]
+pub struct NodeLimits {
+    pub rate_limiting: DefaultDirectRateLimiter,
+    pub concurrency: Semaphore,
+}
+
+/// What the last probe measured for a node, on a cache line of its own.
+///
+/// Written once per health round and read on every ranking — the opposite
+/// traffic to [`NodeLimits`], which is why the two do not share a line.
+#[repr(align(64))]
+pub struct NodeStatus {
+    pub healthy: AtomicBool,
+    pub latency: AtomicU32,
+}
+
+/// A node is always shared as `Arc<RpcNode>` (see [`crate::core::topology`]),
+/// so nothing inside it carries an `Arc` of its own: the fields are inline and
+/// share the node's single allocation.
 pub struct RpcNode {
     /// Index of this node's counter in [`crate::quotas::state::GlobalQuotaState`],
     /// assigned by `assign_ids` and tied to [`Self::name`], not to the node's
@@ -63,12 +84,10 @@ pub struct RpcNode {
     pub id: usize,
     pub name: String,
     pub url: Url,
-    pub rate_limiting: Arc<DefaultDirectRateLimiter>,
-    pub concurrency_limiting: Arc<Semaphore>,
+    pub limits: NodeLimits,
     pub tier: u8,
-    pub latency: Arc<AtomicU32>,
-    pub healthy: Arc<AtomicBool>,
-    pub method_costs: Arc<ProviderCostTable>,
+    pub status: NodeStatus,
+    pub method_costs: ProviderCostTable,
     /// Usage past which the router stops routing to this node: `monthly_limit`
     /// scaled by `spillover_percent`. Traffic spills to the next tier a little
     /// before the provider's quota is actually gone.
@@ -113,12 +132,16 @@ impl RpcNode {
             metrics: NodeMetrics::new(&config.name),
             name: config.name,
             url,
-            rate_limiting: Arc::new(RateLimiter::direct(quota)),
-            concurrency_limiting: Arc::new(Semaphore::new(config.max_concurrent)),
+            limits: NodeLimits {
+                rate_limiting: RateLimiter::direct(quota),
+                concurrency: Semaphore::new(config.max_concurrent),
+            },
             tier: config.tier,
-            latency: Arc::new(AtomicU32::new(u32::MAX)),
-            healthy: Arc::new(AtomicBool::new(true)),
-            method_costs: Arc::new(config.method_costs),
+            status: NodeStatus {
+                healthy: AtomicBool::new(true),
+                latency: AtomicU32::new(u32::MAX),
+            },
+            method_costs: config.method_costs,
             spillover_threshold,
             reset_day: config.reset_day,
         })
@@ -134,7 +157,7 @@ impl RpcNode {
     /// alive, nothing ever closes it — reports `Duration::MAX` so that the
     /// router treats the node as the worst option rather than the best.
     pub async fn acquire_and_check(&self) -> Result<SemaphorePermit<'_>, Duration> {
-        if let Err(err) = self.rate_limiting.check() {
+        if let Err(err) = self.limits.rate_limiting.check() {
             let clock = DefaultClock::default();
 
             let time = err.wait_time_from(clock.now());
@@ -143,7 +166,8 @@ impl RpcNode {
         }
 
         let permit = self
-            .concurrency_limiting
+            .limits
+            .concurrency
             .acquire()
             .await
             .map_err(|_| Duration::MAX)?;
@@ -228,9 +252,15 @@ mod tests {
 
         // Assumed up until the first probe says otherwise, and sorted last by
         // `Topology::rank` until one measures it.
-        assert!(node.healthy.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(
+            node.status
+                .healthy
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
         assert_eq!(
-            node.latency.load(std::sync::atomic::Ordering::Relaxed),
+            node.status
+                .latency
+                .load(std::sync::atomic::Ordering::Relaxed),
             u32::MAX
         );
         assert_eq!(node.id, 0, "the real slot is handed out by assign_ids");
@@ -269,13 +299,32 @@ mod tests {
             .acquire_and_check()
             .await
             .expect("first attempt admitted");
-        assert_eq!(node.concurrency_limiting.available_permits(), 0);
+        assert_eq!(node.limits.concurrency.available_permits(), 0);
 
         drop(permit);
 
         // Without this the node would be permanently at capacity after one
         // request.
-        assert_eq!(node.concurrency_limiting.available_permits(), 1);
+        assert_eq!(node.limits.concurrency.available_permits(), 1);
+    }
+
+    #[test]
+    fn the_hot_cells_sit_on_cache_lines_of_their_own() {
+        // The whole point of `#[repr(align(64))]` on `NodeLimits` and
+        // `NodeStatus`: a health round writing `status` must not invalidate the
+        // line the router reads `limits` from. Dropping the attribute, or
+        // putting either field back behind an `Arc`, breaks this silently.
+        let node = node_with(1, 1, "http://localhost:9").unwrap();
+
+        let limits = std::ptr::from_ref(&node.limits).addr();
+        let status = std::ptr::from_ref(&node.status).addr();
+
+        assert_eq!(limits % 64, 0, "limits are not on a line boundary");
+        assert_eq!(status % 64, 0, "status is not on a line boundary");
+        assert!(
+            limits.abs_diff(status) >= 64,
+            "limits and status share a cache line"
+        );
     }
 
     #[tokio::test]
@@ -287,6 +336,6 @@ mod tests {
 
         // The third would block rather than fail, so this asserts on the
         // semaphore instead of awaiting it.
-        assert_eq!(node.concurrency_limiting.available_permits(), 0);
+        assert_eq!(node.limits.concurrency.available_permits(), 0);
     }
 }
