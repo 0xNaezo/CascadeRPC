@@ -10,6 +10,7 @@
 use bytes::Bytes;
 use memchr::memmem;
 use reqwest::{Client, Response, StatusCode};
+use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::time::Instant;
 use tracing::debug;
@@ -30,9 +31,18 @@ pub const HTTP_BACKSTOP: Duration = Duration::from_secs(2);
 
 /// Upstream bodies up to this size are always parsed, larger ones only when
 /// they contain an `"error"` key. Any plausible non-JSON upstream answer (a
-/// gateway error page, a rate-limit notice) fits well below the limit, while
-/// the payloads worth not parsing start an order of magnitude above it.
-const VALIDATE_BELOW: usize = 64 * 1024;
+/// gateway error page, a rate-limit notice) fits below this, so the "invalid
+/// JSON means retry" guarantee still holds where invalid JSON actually shows
+/// up. Real payloads are an order of magnitude larger and are only parsed when
+/// the `"error"` key is present at all — parsing them costs time proportional
+/// to the response size and answers a question a substring search settles.
+const VALIDATE_BELOW: usize = 512;
+
+/// The substring gate for large bodies. Built once: the finder precomputes a
+/// prefilter, and rebuilding it per response was most of the cost of the
+/// search.
+static ERROR_KEY: LazyLock<memmem::Finder<'static>> =
+    LazyLock::new(|| memmem::Finder::new(br#""error""#));
 
 /// Outcome of a single attempt against one node.
 pub enum Attempt {
@@ -115,7 +125,7 @@ async fn classify_response(node: &RpcNode, response: Response, started: Instant)
         return Attempt::Done(status_code, body);
     }
 
-    if body.len() <= VALIDATE_BELOW || memmem::find(body.as_ref(), br#""error""#).is_some() {
+    if body.len() <= VALIDATE_BELOW || ERROR_KEY.find(body.as_ref()).is_some() {
         let parse_error: RpcErrorOnly = match serde_json::from_slice(body.as_ref()) {
             Ok(res) => res,
             Err(e) => {

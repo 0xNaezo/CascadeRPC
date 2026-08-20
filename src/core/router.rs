@@ -264,10 +264,62 @@ impl RpcClient {
 }
 
 /// Extracts the JSON-RPC method name from the raw request body.
+///
+/// Tries a scan first and falls back to a full parse, which keeps the fast path
+/// free to give up on anything it is not sure about.
 fn extract_method(body_bytes: &[u8]) -> Result<&str, RouteError> {
+    if let Some(method) = scan_leading_method(body_bytes) {
+        return Ok(method);
+    }
+
     serde_json::from_slice::<MethodExtractor<'_>>(body_bytes)
         .map(|extractor| extractor.method)
         .map_err(|_| RouteError::BadRequest)
+}
+
+/// Reads the method name when `method` is the object's first key, which is
+/// where every real client puts it.
+///
+/// Deliberately narrow: only the leading key is looked at, so a `"method"`
+/// nested inside `params` can never be mistaken for the real one, and anything
+/// unusual — a batch, an escape sequence in the name, a different first key —
+/// returns `None` and pays for a full parse instead.
+///
+/// One deliberate difference from the parse it replaces: the bytes after the
+/// name are not looked at, so a body with a well-formed leading `method` and a
+/// broken tail is now routed instead of answered as a parse error. The upstream
+/// rejects it either way, and validating the tail is the whole cost this
+/// avoids.
+fn scan_leading_method(body: &[u8]) -> Option<&str> {
+    let rest = expect_byte(skip_ws(body), b'{')?;
+    let rest = expect_byte(skip_ws(rest), b'"')?;
+    let rest = rest.strip_prefix(b"method\"")?;
+    let rest = expect_byte(skip_ws(rest), b':')?;
+    let rest = expect_byte(skip_ws(rest), b'"')?;
+
+    let end = memchr::memchr2(b'"', b'\\', rest)?;
+
+    if rest[end] != b'"' {
+        return None;
+    }
+
+    std::str::from_utf8(&rest[..end]).ok()
+}
+
+/// Drops leading JSON whitespace.
+fn skip_ws(body: &[u8]) -> &[u8] {
+    let first_value = body
+        .iter()
+        .position(|byte| !matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
+        .unwrap_or(body.len());
+
+    &body[first_value..]
+}
+
+/// Consumes one expected byte, or gives up.
+fn expect_byte(body: &[u8], byte: u8) -> Option<&[u8]> {
+    body.split_first()
+        .and_then(|(first, rest)| (*first == byte).then_some(rest))
 }
 
 /// Waits for the first node to leave its rate limit, tracking how many
@@ -282,6 +334,43 @@ async fn wait_rate_limited(best_time: Duration) {
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// The scan is only a shortcut, so on every body it accepts it must name
+    /// the same method a full parse would. Bodies it declines are not listed
+    /// here — they fall back to serde and are its problem.
+    #[test]
+    fn scan_agrees_with_the_parse_it_replaces() {
+        let corpus: &[&[u8]] = &[
+            br#"{"method":"getSlot","params":[],"id":1,"jsonrpc":"2.0"}"#,
+            br#"{ "method" : "getSlot" , "id":1}"#,
+            b"\n\t{\"method\":\"getBalance\",\"id\":1}",
+            br#"{"method":"","id":1}"#,
+            // "method" also appears nested, and must not win.
+            br#"{"method":"outer","params":[{"method":"inner"}],"id":1}"#,
+            // Declined by the scan, still routable through serde.
+            br#"{"jsonrpc":"2.0","method":"getSlot","id":1}"#,
+            br#"[{"method":"getSlot","id":1}]"#,
+            br#"{"method":"get\u0053lot","id":1}"#,
+            b"",
+            b"not json at all",
+        ];
+
+        for body in corpus {
+            let Some(scanned) = scan_leading_method(body) else {
+                continue;
+            };
+
+            let parsed = serde_json::from_slice::<MethodExtractor<'_>>(body)
+                .unwrap_or_else(|e| panic!("scan accepted a body serde rejects: {e}"));
+
+            assert_eq!(
+                scanned,
+                parsed.method,
+                "disagreement on {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
 
     /// The balancer's own failures go back to a client that speaks JSON-RPC and
     /// nothing else. Pinned on the bytes rather than on the message text: the
