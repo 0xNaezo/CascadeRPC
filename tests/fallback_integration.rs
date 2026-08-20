@@ -162,7 +162,7 @@ async fn sleep_and_retry_after_rate_limit_exhaustion() {
     // Waits ~100ms (1s quota / 10 rps), comfortably inside the 1s global
     // timeout; an rps=1 variant would sleep ~1s and race it.
     for _ in 0..10 {
-        drop(rpc_node.acquire_and_check().await.unwrap());
+        drop(rpc_node.try_admit().unwrap());
     }
 
     let (status, _) = client.send(Bytes::from(OK_BODY)).await.unwrap();
@@ -342,7 +342,7 @@ async fn timeout_while_waiting_out_a_rate_limit() {
     let client = build_client_one(node("A", &mock.url).rps(1).build());
     let rpc_node = node_handle(&client, "A");
 
-    drop(rpc_node.acquire_and_check().await.unwrap());
+    drop(rpc_node.try_admit().unwrap());
 
     let (status, err) = client
         .send(Bytes::from(OK_BODY))
@@ -351,6 +351,37 @@ async fn timeout_while_waiting_out_a_rate_limit() {
 
     assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
     assert_err_contains(&err, "Global timeout");
+}
+
+/// A node at its concurrency cap has not accepted the request, so the request
+/// belongs to the next node — not to a queue in front of the busy one. Before
+/// this the router awaited the permit and the request sat on tier 1 while
+/// tier 2 was idle.
+#[tokio::test]
+async fn a_saturated_node_spills_to_the_next_one() {
+    let a = spawn_mock_latency(200, OK_BODY, Duration::from_millis(500)).await;
+    let b = spawn_mock(200, OK_BODY).await;
+
+    let client = build_client(vec![
+        node("A", &a.url).tier(0).max_concurrent(1).build(),
+        node("B", &b.url).tier(1).build(),
+    ]);
+
+    // A's only permit, held for the whole request below.
+    let node_a = node_handle(&client, "A");
+    let _held = node_a.try_admit().unwrap();
+
+    let started = tokio::time::Instant::now();
+    let (status, _) = client.send(Bytes::from(OK_BODY)).await.unwrap();
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(b.hits(), 1, "the request should have gone to B");
+    assert_eq!(a.hits(), 0, "A had no permit to serve it with");
+    assert!(
+        started.elapsed() < Duration::from_millis(400),
+        "spilling to B must not wait on A's permit: took {:?}",
+        started.elapsed()
+    );
 }
 
 #[tokio::test]

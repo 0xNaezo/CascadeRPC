@@ -81,13 +81,17 @@ pub enum SkipReason {
     RateLimit,
     QuotaExhausted,
     MethodUnsupported,
+    /// Node was at its concurrency cap, so the request went to the next node
+    /// instead of queueing on this one.
+    Saturated,
 }
 
 impl SkipReason {
-    const ALL: [Self; 3] = [
+    const ALL: [Self; 4] = [
         Self::RateLimit,
         Self::QuotaExhausted,
         Self::MethodUnsupported,
+        Self::Saturated,
     ];
     const COUNT: usize = Self::ALL.len();
 
@@ -96,6 +100,7 @@ impl SkipReason {
             Self::RateLimit => "rate_limit",
             Self::QuotaExhausted => "quota_exhausted",
             Self::MethodUnsupported => "method_unsupported",
+            Self::Saturated => "saturated",
         }
     }
 }

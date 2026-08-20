@@ -2,7 +2,12 @@
 //! node health, and optionally a Prometheus scrape endpoint.
 //!
 //! Handlers hold no state of their own — everything comes from the shared
-//! [`RpcClient`], which is why they can be cloned across connections freely.
+//! [`RpcClient`].
+//!
+//! The state is an `Arc<RpcClient>` and not an `RpcClient`: axum clones the
+//! state into every request, and the client's own `Clone` is four `Arc` bumps
+//! and a `reqwest::Client` clone. Behind one `Arc` that is one bump per
+//! request, in and out.
 
 use crate::core::rpc::RpcClient;
 use crate::core::topology::NodeHealth;
@@ -16,6 +21,7 @@ use bytes::Bytes;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use reqwest::StatusCode;
 use serde::Serialize;
+use std::sync::Arc;
 use tokio::signal;
 
 /// Installs the process-wide Prometheus recorder and hands back the handle the
@@ -56,7 +62,7 @@ pub fn install_metrics_recorder() -> anyhow::Result<PrometheusHandle> {
 /// Returns an error if the TCP listener cannot bind, or the server fails
 /// fatally while running.
 pub async fn init_server(
-    rpc_client: RpcClient,
+    rpc_client: Arc<RpcClient>,
     port: u16,
     host: String,
     metrics: Option<PrometheusHandle>,
@@ -86,7 +92,10 @@ pub async fn init_server(
 /// Proxies one JSON-RPC request. The body is forwarded verbatim, and so is the
 /// answer: both halves of the router's result already carry the status to
 /// reply with.
-async fn send_request(State(rpc_client): State<RpcClient>, body: Bytes) -> (StatusCode, Bytes) {
+async fn send_request(
+    State(rpc_client): State<Arc<RpcClient>>,
+    body: Bytes,
+) -> (StatusCode, Bytes) {
     match rpc_client.send(body).await {
         Ok(response) | Err(response) => response,
     }
@@ -109,7 +118,7 @@ struct HealthResponse {
 ///
 /// The per-node reading is [`RpcClient::health_snapshot`]; what is left here is
 /// the summary the endpoint puts around it.
-pub async fn health(State(rpc_client): State<RpcClient>) -> impl IntoResponse {
+pub async fn health(State(rpc_client): State<Arc<RpcClient>>) -> impl IntoResponse {
     let nodes = rpc_client.health_snapshot();
 
     let active_nodes = nodes.iter().filter(|n| n.status == "up").count();

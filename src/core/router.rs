@@ -16,7 +16,7 @@ use tokio::sync::SemaphorePermit;
 use tokio::time::{Instant, timeout};
 use tracing::trace;
 
-use crate::core::node::RpcNode;
+use crate::core::node::{RpcNode, Unavailable};
 use crate::core::rpc::RpcClient;
 use crate::core::upstream::{self, Attempt};
 use crate::metrics::{self, RequestOutcome, SkipReason};
@@ -108,6 +108,9 @@ enum Admission<'a> {
     Skip,
     /// Node is rate-limited; the duration is how long until it frees up.
     RateLimited(Duration),
+    /// Node is at its concurrency cap. Nothing is wrong with it and it has not
+    /// served the request, so it is neither marked tried nor counted as failed.
+    Saturated,
 }
 
 impl RpcClient {
@@ -185,6 +188,7 @@ impl RpcClient {
             let topology = self.topology.load_full();
 
             let mut best_time: Option<Duration> = None;
+            let mut saturated = None;
 
             for node in &topology.active {
                 let bit = 1u64 << node.id;
@@ -193,7 +197,7 @@ impl RpcClient {
                     continue;
                 }
 
-                let _permit = match self.admit(node, method_id).await {
+                let _permit = match self.admit(node, method_id) {
                     Admission::Ready(permit) => {
                         tried |= bit;
 
@@ -210,37 +214,121 @@ impl RpcClient {
 
                         continue;
                     }
+                    Admission::Saturated => {
+                        saturated.get_or_insert(node);
+
+                        continue;
+                    }
                 };
 
-                trace!(node = %node.name, "sending request");
-
-                if let Attempt::Done(status_code, body) =
-                    upstream::attempt(&self.client, node, body_bytes.clone()).await
-                {
-                    return Ok((status_code, body));
+                if let Some(response) = self.attempt_on(node, body_bytes).await {
+                    return Ok(response);
                 }
             }
 
-            let Some(best_time) = best_time else {
+            if let Some(best_time) = best_time {
+                wait_rate_limited(best_time).await;
+
+                continue;
+            }
+
+            // Nothing here failed — whatever is left is merely busy, and busy
+            // is not a reason to answer 502. Parking is the old behaviour,
+            // kept for the one case it was meant for: it happens only after
+            // the request has been offered to every other node, and the global
+            // budget still bounds it.
+            let Some(node) = saturated else {
                 return Err(RouteError::AllNodesFailed);
             };
 
-            wait_rate_limited(best_time).await;
+            match self.admit_waiting(node, method_id).await {
+                Admission::Ready(_permit) => {
+                    tried |= 1u64 << node.id;
+
+                    if let Some(response) = self.attempt_on(node, body_bytes).await {
+                        return Ok(response);
+                    }
+                }
+                // The wait cost this round its permit and the node turned out
+                // to be unusable anyway; the next round has the others.
+                Admission::Skip => tried |= 1u64 << node.id,
+                Admission::RateLimited(time) => wait_rate_limited(time).await,
+                // Only a closed semaphore reaches here, and nothing closes one.
+                Admission::Saturated => return Err(RouteError::AllNodesFailed),
+            }
+        }
+    }
+
+    /// Sends one attempt to a node, and reports the response if it is the one
+    /// the client gets.
+    ///
+    /// `None` means the attempt failed in a way another node may not — see
+    /// [`upstream::attempt`] for which those are.
+    async fn attempt_on(&self, node: &RpcNode, body_bytes: &Bytes) -> Option<(StatusCode, Bytes)> {
+        trace!(node = %node.name, "sending request");
+
+        match upstream::attempt(&self.client, node, body_bytes.clone()).await {
+            Attempt::Done(status_code, body) => Some((status_code, body)),
+            Attempt::Retry => None,
         }
     }
 
     /// Checks rate limit, remaining quota and method pricing for a node, and
     /// books the method cost against its usage once the node is accepted.
-    async fn admit<'a>(&self, node: &'a RpcNode, method_id: usize) -> Admission<'a> {
-        let permit = match node.acquire_and_check().await {
+    fn admit<'a>(&self, node: &'a RpcNode, method_id: usize) -> Admission<'a> {
+        let permit = match node.try_admit() {
             Ok(permit) => permit,
-            Err(time) => {
+            Err(Unavailable::RateLimited(time)) => {
                 node.metrics.record_skip(SkipReason::RateLimit);
 
                 return Admission::RateLimited(time);
             }
+            Err(Unavailable::Saturated) => {
+                node.metrics.record_skip(SkipReason::Saturated);
+
+                return Admission::Saturated;
+            }
         };
 
+        self.book(node, method_id, permit)
+    }
+
+    /// Waits for the node to have a permit, then admits the request on it.
+    ///
+    /// The permit is used rather than released and re-taken: the semaphore
+    /// hands a freed permit to the first waiter, so a request that dropped one
+    /// to go back around the loop would find the node busy again — every time,
+    /// as long as anything else is queued.
+    ///
+    /// Reached only when every node is saturated at once, which is the one
+    /// case where there is nothing better for a request to do than wait.
+    async fn admit_waiting<'a>(&self, node: &'a RpcNode, method_id: usize) -> Admission<'a> {
+        let permit = {
+            let _guard = metrics::sleeping_on_rate_limit();
+
+            match node.limits.concurrency.acquire().await {
+                Ok(permit) => permit,
+                Err(_) => return Admission::Saturated,
+            }
+        };
+
+        if let Err(time) = node.check_rate() {
+            node.metrics.record_skip(SkipReason::RateLimit);
+
+            return Admission::RateLimited(time);
+        }
+
+        self.book(node, method_id, permit)
+    }
+
+    /// Books the method cost against a node's quota, with the permit for the
+    /// attempt already in hand.
+    fn book<'a>(
+        &self,
+        node: &RpcNode,
+        method_id: usize,
+        permit: SemaphorePermit<'a>,
+    ) -> Admission<'a> {
         let used = self.nodes_usage.usage(node.id);
 
         if used.get() > node.spillover_threshold {

@@ -38,7 +38,9 @@ fn set_state(client: &RpcClient, name: &str, up: bool, latency_ms: u32) {
 }
 
 async fn health_json(client: &RpcClient) -> Value {
-    let response = health(State(client.clone())).await.into_response();
+    let response = health(State(std::sync::Arc::new(client.clone())))
+        .await
+        .into_response();
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();

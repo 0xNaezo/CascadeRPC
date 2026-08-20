@@ -9,6 +9,7 @@
 
 use bytes::Bytes;
 use memchr::memmem;
+use reqwest::header::{CONTENT_TYPE, HeaderValue};
 use reqwest::{Client, Response, StatusCode};
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -44,6 +45,13 @@ const VALIDATE_BELOW: usize = 512;
 static ERROR_KEY: LazyLock<memmem::Finder<'static>> =
     LazyLock::new(|| memmem::Finder::new(br#""error""#));
 
+/// The only content type an upstream is ever posted.
+///
+/// Pre-parsed: passing the pair as `&str` made reqwest validate the name,
+/// lower-case it, and validate the value again on every single request. As a
+/// `HeaderValue` the header costs a clone of a refcount.
+const JSON: HeaderValue = HeaderValue::from_static("application/json");
+
 /// Outcome of a single attempt against one node.
 pub enum Attempt {
     /// Response is final and goes back to the client.
@@ -73,7 +81,7 @@ pub fn client() -> reqwest::Result<Client> {
 pub async fn post(client: &Client, body: Bytes, url: Url) -> reqwest::Result<Response> {
     client
         .post(url)
-        .header("content-type", "application/json")
+        .header(CONTENT_TYPE, JSON)
         .body(body)
         .send()
         .await
@@ -181,13 +189,16 @@ async fn classify_response(node: &RpcNode, response: Response, started: Instant)
 /// problem, not the request's, and a success still has a body that may carry a
 /// JSON-RPC error inside it.
 #[must_use]
-pub fn is_final_status(status: StatusCode) -> bool {
-    let final_statuses = [
-        400, 402, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413, 414, 415, 416, 417, 418, 421,
-        422, 423, 424, 425, 426, 428, 431, 451,
-    ];
-
-    final_statuses.contains(&status.as_u16())
+pub const fn is_final_status(status: StatusCode) -> bool {
+    // A `matches!` and not an array `contains`: the same list, but the compiler
+    // turns ranges into comparisons instead of walking 26 elements per
+    // response. 401 and 403 are deliberately absent — an upstream rejecting the
+    // balancer's own credentials is that node's problem, and another node may
+    // well accept the request.
+    matches!(
+        status.as_u16(),
+        400 | 402 | 404..=418 | 421..=426 | 428 | 431 | 451
+    )
 }
 
 /// Whether a JSON-RPC error code leaves room to try another node.
