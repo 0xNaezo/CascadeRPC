@@ -16,7 +16,7 @@ use tracing::debug;
 use url::Url;
 
 use crate::core::node::RpcNode;
-use crate::metrics::record_upstream;
+use crate::metrics::Outcome;
 use crate::protocol::rpc_payload::RpcErrorOnly;
 
 /// Backstop on a single HTTP request to an upstream.
@@ -79,11 +79,8 @@ pub async fn attempt(client: &Client, node: &RpcNode, body: Bytes) -> Attempt {
     match post(client, body, node.url.clone()).await {
         Ok(response) => classify_response(node, response, started).await,
         Err(e) => {
-            record_upstream(
-                &node.name,
-                "transport_error",
-                started.elapsed().as_secs_f64(),
-            );
+            node.metrics
+                .record_attempt(Outcome::TransportError, started.elapsed().as_secs_f64());
             debug!(node = %node.name, error = %e, "upstream HTTP request failed");
 
             Attempt::Retry
@@ -99,7 +96,8 @@ async fn classify_response(node: &RpcNode, response: Response, started: Instant)
     let body = match response.bytes().await {
         Ok(body) => body,
         Err(e) => {
-            record_upstream(&node.name, "body_error", started.elapsed().as_secs_f64());
+            node.metrics
+                .record_attempt(Outcome::BodyError, started.elapsed().as_secs_f64());
             debug!(
                 node = %node.name,
                 error = %e,
@@ -111,11 +109,8 @@ async fn classify_response(node: &RpcNode, response: Response, started: Instant)
     };
 
     if is_final_status(status_code) {
-        record_upstream(
-            &node.name,
-            "forwarded_http_error",
-            started.elapsed().as_secs_f64(),
-        );
+        node.metrics
+            .record_attempt(Outcome::ForwardedHttpError, started.elapsed().as_secs_f64());
 
         return Attempt::Done(status_code, body);
     }
@@ -124,7 +119,8 @@ async fn classify_response(node: &RpcNode, response: Response, started: Instant)
         let parse_error: RpcErrorOnly = match serde_json::from_slice(body.as_ref()) {
             Ok(res) => res,
             Err(e) => {
-                record_upstream(&node.name, "invalid_json", started.elapsed().as_secs_f64());
+                node.metrics
+                    .record_attempt(Outcome::InvalidJson, started.elapsed().as_secs_f64());
                 debug!(
                     node = %node.name,
                     error = %e,
@@ -137,20 +133,14 @@ async fn classify_response(node: &RpcNode, response: Response, started: Instant)
 
         if let Some(err) = parse_error.error {
             if !is_retryable_json_rpc_error(err.code) {
-                record_upstream(
-                    &node.name,
-                    "forwarded_rpc_error",
-                    started.elapsed().as_secs_f64(),
-                );
+                node.metrics
+                    .record_attempt(Outcome::ForwardedRpcError, started.elapsed().as_secs_f64());
 
                 return Attempt::Done(status_code, body);
             }
 
-            record_upstream(
-                &node.name,
-                "retryable_rpc_error",
-                started.elapsed().as_secs_f64(),
-            );
+            node.metrics
+                .record_attempt(Outcome::RetryableRpcError, started.elapsed().as_secs_f64());
             debug!(
                 node = %node.name,
                 code = err.code,
@@ -162,11 +152,12 @@ async fn classify_response(node: &RpcNode, response: Response, started: Instant)
     }
 
     let outcome = if status_code.is_success() {
-        "success"
+        Outcome::Success
     } else {
-        "forwarded_http_error"
+        Outcome::ForwardedHttpError
     };
-    record_upstream(&node.name, outcome, started.elapsed().as_secs_f64());
+    node.metrics
+        .record_attempt(outcome, started.elapsed().as_secs_f64());
 
     Attempt::Done(status_code, body)
 }

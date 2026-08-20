@@ -19,7 +19,7 @@ use tracing::trace;
 use crate::core::node::RpcNode;
 use crate::core::rpc::RpcClient;
 use crate::core::upstream::{self, Attempt};
-use crate::metrics;
+use crate::metrics::{self, RequestOutcome, SkipReason};
 use crate::protocol::registry::CUSTOM_METHODS;
 use crate::protocol::rpc_payload::MethodExtractor;
 use crate::quotas::state::MAX_NODES;
@@ -86,11 +86,11 @@ impl RouteError {
     }
 
     /// Value of the `outcome` label in `rpc_requests` / `rpc_request_duration`.
-    const fn outcome(self) -> &'static str {
+    const fn outcome(self) -> RequestOutcome {
         match self {
-            Self::BadRequest => "bad_request",
-            Self::AllNodesFailed => "bad_gateway",
-            Self::Timeout => "timeout",
+            Self::BadRequest => RequestOutcome::BadRequest,
+            Self::AllNodesFailed => RequestOutcome::BadGateway,
+            Self::Timeout => RequestOutcome::Timeout,
         }
     }
 
@@ -131,7 +131,7 @@ impl RpcClient {
         let result = self.dispatch(&body_bytes).await;
 
         let outcome = match result {
-            Ok(_) => "forwarded",
+            Ok(_) => RequestOutcome::Forwarded,
             Err(error) => error.outcome(),
         };
         metrics::record_request(outcome, request_started.elapsed().as_secs_f64());
@@ -227,7 +227,7 @@ impl RpcClient {
         let permit = match node.acquire_and_check().await {
             Ok(permit) => permit,
             Err(time) => {
-                metrics::record_skip(&node.name, "rate_limit");
+                node.metrics.record_skip(SkipReason::RateLimit);
 
                 return Admission::RateLimited(time);
             }
@@ -236,7 +236,7 @@ impl RpcClient {
         let used = self.nodes_usage.usage(node.id);
 
         if used.get() > node.spillover_threshold {
-            metrics::record_skip(&node.name, "quota_exhausted");
+            node.metrics.record_skip(SkipReason::QuotaExhausted);
 
             return Admission::Skip;
         }
@@ -244,7 +244,7 @@ impl RpcClient {
         let method_cost = node.method_costs.cost(method_id);
 
         if method_cost == u32::MAX {
-            metrics::record_skip(&node.name, "method_unsupported");
+            node.metrics.record_skip(SkipReason::MethodUnsupported);
 
             return Admission::Skip;
         }

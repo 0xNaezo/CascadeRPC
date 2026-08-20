@@ -22,7 +22,11 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use metrics_exporter_prometheus::PrometheusHandle;
-use rpc_load_balancer::{core::rpc::RpcClient, metrics, server};
+use rpc_load_balancer::{
+    core::rpc::RpcClient,
+    metrics::{self, NodeMetrics, Outcome, RequestOutcome, SkipReason},
+    server,
+};
 use serial_test::serial;
 
 mod common;
@@ -176,13 +180,25 @@ async fn a_skipped_node_is_counted_with_its_reason() {
     }
 
     // A skip sends nothing, so it must not land in the latency histogram as an
-    // observation of zero.
-    assert_eq!(
-        series(
-            "rpc_upstream_duration_seconds_count",
-            &[r#"node="s-quota""#]
-        ),
-        None
+    // observation of zero. The node's histograms exist from the moment it is
+    // built — one handle per outcome, resolved up front — so the claim is that
+    // every one of them is still empty, not that the series is absent.
+    let observed: Vec<f64> = scrape()
+        .lines()
+        .filter(|line| {
+            line.starts_with("rpc_upstream_duration_seconds_count")
+                && line.contains(r#"node="s-quota""#)
+        })
+        .filter_map(|line| line.rsplit(' ').next()?.parse().ok())
+        .collect();
+
+    assert!(
+        !observed.is_empty(),
+        "the node's histograms were never registered"
+    );
+    assert!(
+        observed.iter().all(|count| *count == 0.0),
+        "a skipped node recorded a duration: {observed:?}"
     );
 }
 
@@ -384,10 +400,11 @@ async fn every_metric_renders_help_and_type() {
 
     // Touch every emission site once so nothing is missing merely because it
     // was never called.
-    metrics::record_upstream("h-node", "success", 0.01);
-    metrics::record_request("forwarded", 0.01);
+    let node = NodeMetrics::new("h-node");
+    node.record_attempt(Outcome::Success, 0.01);
+    node.record_skip(SkipReason::RateLimit);
+    metrics::record_request(RequestOutcome::Forwarded, 0.01);
     metrics::record_probe("h-node", 0, true, 0.01);
-    metrics::record_skip("h-node", "rate_limit");
     metrics::set_healthy_nodes(1);
     metrics::set_node_quota("h-node", 1, 2);
     drop(metrics::sleeping_on_rate_limit());
