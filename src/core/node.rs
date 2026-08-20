@@ -27,6 +27,7 @@ use std::{
 use tokio::sync::{Semaphore, SemaphorePermit};
 use url::Url;
 
+use crate::metrics::NodeMetrics;
 use crate::protocol::cost_table::ProviderCostTable;
 
 /// A `governor` limiter with every knob at its default: one unkeyed bucket,
@@ -75,6 +76,9 @@ pub struct RpcNode {
     /// Day of the month this node's usage counter is zeroed on. See
     /// [`crate::quotas::period`].
     pub reset_day: u8,
+    /// This node's metric handles, resolved once here so the request path never
+    /// goes back through the registry. See [`NodeMetrics`].
+    pub metrics: NodeMetrics,
 }
 
 impl RpcNode {
@@ -106,6 +110,7 @@ impl RpcNode {
             // sees the whole node set and can keep a name on the counter it
             // was already spending.
             id: 0,
+            metrics: NodeMetrics::new(&config.name),
             name: config.name,
             url,
             rate_limiting: Arc::new(RateLimiter::direct(quota)),

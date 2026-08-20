@@ -30,9 +30,16 @@ use tokio::signal;
 ///
 /// Returns an error if a recorder is already installed in this process.
 pub fn install_metrics_recorder() -> anyhow::Result<PrometheusHandle> {
-    Ok(PrometheusBuilder::new()
+    let handle = PrometheusBuilder::new()
         .with_recommended_naming(true)
-        .install_recorder()?)
+        .install_recorder()?;
+
+    // Here and not at the call site: a description registered against a
+    // recorder that is not the one rendering is a metric that scrapes without
+    // a HELP line, and nothing fails loudly when that happens.
+    crate::metrics::describe_all();
+
+    Ok(handle)
 }
 
 /// Binds the listener and serves until SIGINT or SIGTERM.

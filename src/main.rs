@@ -29,8 +29,12 @@ async fn main() -> Result<()> {
 
     let server_config = config.server;
 
-    // Before anything emits: the recorder is global, and what is measured
-    // before it exists is dropped, not held for it.
+    // Before anything emits, and before `build_nodes` below: the recorder is
+    // global, and what is measured before it exists is dropped, not held for
+    // it. `RpcNode::new` resolves its metric handles once, at construction —
+    // built against no recorder they are no-ops for the life of the process,
+    // so swapping these two statements would silently take every per-node
+    // metric off the scrape without failing anything.
     let metrics_handle = server_config
         .enable_metrics
         .then(server::install_metrics_recorder)
