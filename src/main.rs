@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
@@ -62,8 +63,11 @@ async fn main() -> Result<()> {
         server_config.clone(),
     ));
 
+    // The HTTP layer is the one place the client is cloned per request, so it
+    // gets the `Arc`; the background tasks above clone it once at startup and
+    // do not care.
     server::init_server(
-        rpc_client.clone(),
+        Arc::new(rpc_client.clone()),
         server_config.port,
         server_config.host,
         metrics_handle,

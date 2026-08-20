@@ -357,7 +357,7 @@ pub async fn spawn_server(client: RpcClient, metrics: Option<PrometheusHandle>) 
     let port = free_port().await;
 
     tokio::spawn(server::init_server(
-        client,
+        std::sync::Arc::new(client),
         port,
         "127.0.0.1".to_owned(),
         metrics,

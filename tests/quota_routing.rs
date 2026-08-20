@@ -250,7 +250,7 @@ async fn retry_loop_bills_the_failing_node_once() {
     // counts.
     let node_b = node_handle(&client, "B");
     for _ in 0..10 {
-        drop(node_b.acquire_and_check().await.unwrap());
+        drop(node_b.try_admit().unwrap());
     }
 
     let (status, body) = client.send(Bytes::from(OK_BODY)).await.unwrap();

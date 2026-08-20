@@ -18,6 +18,7 @@ use governor::{
 };
 use std::{
     num::NonZeroU32,
+    sync::LazyLock,
     sync::atomic::{AtomicBool, AtomicU32},
     time::Duration,
 };
@@ -32,6 +33,13 @@ use crate::protocol::cost_table::ProviderCostTable;
 /// [`RpcNode`]'s type.
 pub type DefaultDirectRateLimiter<MW = NoOpMiddleware<<DefaultClock as Clock>::Instant>> =
     RateLimiter<NotKeyed, InMemoryState, DefaultClock, MW>;
+
+/// The clock the rate limiter's wait times are measured against.
+///
+/// One per process: `DefaultClock` is a `QuantaClock`, and building one per
+/// rate-limited attempt was calibration work repeated on the hot path for a
+/// value that never changes.
+static CLOCK: LazyLock<DefaultClock> = LazyLock::new(DefaultClock::default);
 
 /// What [`RpcNode::new`] needs to build a node, gathered into one struct
 /// because the list is long enough that positional arguments stop being
@@ -72,6 +80,20 @@ pub struct NodeLimits {
 pub struct NodeStatus {
     pub healthy: AtomicBool,
     pub latency: AtomicU32,
+}
+
+/// Why a node cannot take an attempt right now.
+///
+/// Both are temporary by construction — the router treats neither as a failure
+/// of the node.
+#[derive(Debug)]
+pub enum Unavailable {
+    /// Rate limiter has no token; the duration is how long until it does.
+    RateLimited(Duration),
+    /// Every concurrency permit is in use. Also covers a closed semaphore,
+    /// which nothing in the crate ever does, and which would read as a node
+    /// that is permanently busy rather than as a panic.
+    Saturated,
 }
 
 /// A node is always shared as `Arc<RpcNode>` (see [`crate::core::topology`]),
@@ -147,37 +169,54 @@ impl RpcNode {
         })
     }
 
-    /// Takes a concurrency permit for one attempt, once the rate limiter has a
-    /// token to spare. The permit is held for as long as the attempt runs.
+    /// Takes a concurrency permit for one attempt, if the node can serve one
+    /// right now. The permit is held for as long as the attempt runs.
+    ///
+    /// Never waits. A node at its concurrency cap is a node that is not
+    /// accepting the request, and the router's job is to offer it to the next
+    /// node rather than to queue on this one — see [`Unavailable::Saturated`].
     ///
     /// # Errors
     ///
-    /// Returns how long until the rate limiter frees up, which the router
-    /// sleeps on. A closed semaphore — which cannot happen while the node is
-    /// alive, nothing ever closes it — reports `Duration::MAX` so that the
-    /// router treats the node as the worst option rather than the best.
-    pub async fn acquire_and_check(&self) -> Result<SemaphorePermit<'_>, Duration> {
-        if let Err(err) = self.limits.rate_limiting.check() {
-            let clock = DefaultClock::default();
-
-            let time = err.wait_time_from(clock.now());
-
-            return Err(time);
-        }
-
+    /// Returns why the node cannot take the attempt: out of permits, or out of
+    /// rate-limit tokens together with how long until one returns.
+    pub fn try_admit(&self) -> Result<SemaphorePermit<'_>, Unavailable> {
+        // Permit before token: a rate-limit token taken for an attempt that
+        // then finds no permit is spent on nothing, and a saturated node would
+        // drain its own bucket while it is too busy to use it.
         let permit = self
             .limits
             .concurrency
-            .acquire()
-            .await
-            .map_err(|_| Duration::MAX)?;
+            .try_acquire()
+            .map_err(|_| Unavailable::Saturated)?;
 
-        Ok(permit)
+        // Dropping `permit` on this path hands it straight back: the attempt it
+        // was taken for is not happening.
+        self.check_rate()
+            .map_err(Unavailable::RateLimited)
+            .map(|()| permit)
+    }
+
+    /// Takes a rate-limit token, or reports how long until one returns.
+    ///
+    /// Separate from [`Self::try_admit`] because a caller that already waited
+    /// for a permit still has to pass the rate limiter, and must not go back
+    /// through the permit half to do it.
+    ///
+    /// # Errors
+    ///
+    /// Returns how long the bucket needs to refill. The token is consumed on
+    /// success, so every `Ok` here is an attempt that has to happen.
+    pub fn check_rate(&self) -> Result<(), Duration> {
+        self.limits
+            .rate_limiting
+            .check()
+            .map_err(|err| err.wait_time_from(CLOCK.now()))
     }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -267,18 +306,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acquire_and_check_reports_the_wait_when_the_bucket_is_empty() {
+    async fn try_admit_reports_the_wait_when_the_bucket_is_empty() {
         let node = node_with(1, 10, "http://localhost:9").unwrap();
 
-        let _first = node
-            .acquire_and_check()
-            .await
-            .expect("first call has a token");
+        let _first = node.try_admit().expect("first call has a token");
 
-        let wait = node
-            .acquire_and_check()
-            .await
-            .expect_err("one token per second, so the second call is limited");
+        let Err(Unavailable::RateLimited(wait)) = node.try_admit() else {
+            panic!("one token per second, so the second call is limited");
+        };
 
         // The router sleeps on this value, so a zero would spin.
         assert!(
@@ -295,10 +330,7 @@ mod tests {
     async fn a_permit_is_released_when_the_attempt_is_dropped() {
         let node = node_with(100, 1, "http://localhost:9").unwrap();
 
-        let permit = node
-            .acquire_and_check()
-            .await
-            .expect("first attempt admitted");
+        let permit = node.try_admit().expect("first attempt admitted");
         assert_eq!(node.limits.concurrency.available_permits(), 0);
 
         drop(permit);
@@ -331,11 +363,31 @@ mod tests {
     async fn concurrency_is_capped_at_max_concurrent() {
         let node = node_with(100, 2, "http://localhost:9").unwrap();
 
-        let _a = node.acquire_and_check().await.unwrap();
-        let _b = node.acquire_and_check().await.unwrap();
+        let _a = node.try_admit().unwrap();
+        let _b = node.try_admit().unwrap();
 
-        // The third would block rather than fail, so this asserts on the
-        // semaphore instead of awaiting it.
+        assert!(
+            matches!(node.try_admit(), Err(Unavailable::Saturated)),
+            "a third attempt must be turned away, not queued"
+        );
         assert_eq!(node.limits.concurrency.available_permits(), 0);
+    }
+
+    /// A node with no permits left must not spend a rate-limit token being
+    /// turned away — it would drain its own bucket while too busy to use it.
+    #[tokio::test]
+    async fn a_saturated_node_keeps_its_rate_limit_tokens() {
+        let node = node_with(2, 1, "http://localhost:9").unwrap();
+
+        let held = node.try_admit().expect("first attempt admitted");
+
+        assert!(matches!(node.try_admit(), Err(Unavailable::Saturated)));
+
+        drop(held);
+
+        drop(
+            node.try_admit()
+                .expect("the second token is still there once a permit frees up"),
+        );
     }
 }

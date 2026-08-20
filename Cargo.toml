@@ -15,7 +15,10 @@ reqwest = { version = "0.13", features = ["json"] }
 serde = { version = "1.0.222", features = ["derive"] }
 serde_json = "1.0.149"
 anyhow = "1"
-tracing = "0.1"
+# `release_max_level_info` compiles every `trace!`/`debug!` out of a release
+# build: the request path has one of each per attempt, and even disabled they
+# cost a runtime level check on every request.
+tracing = { version = "0.1", features = ["release_max_level_info"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dotenvy = "0.15.7"
 axum = "0.8"
