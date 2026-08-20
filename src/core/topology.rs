@@ -62,7 +62,7 @@ impl Topology {
     pub fn rank(all: &[Arc<RpcNode>]) -> Vec<Arc<RpcNode>> {
         let mut active: Vec<Arc<RpcNode>> = all
             .iter()
-            .filter(|node| node.healthy.load(Ordering::Relaxed))
+            .filter(|node| node.status.healthy.load(Ordering::Relaxed))
             .cloned()
             .collect();
 
@@ -70,7 +70,7 @@ impl Topology {
             active.extend_from_slice(all);
         }
 
-        active.sort_by_key(|node| (node.tier, node.latency.load(Ordering::Relaxed)));
+        active.sort_by_key(|node| (node.tier, node.status.latency.load(Ordering::Relaxed)));
 
         active
     }
@@ -86,8 +86,8 @@ impl Topology {
         self.all
             .iter()
             .map(|node| {
-                let is_up = node.healthy.load(Ordering::Relaxed);
-                let latency = node.latency.load(Ordering::Relaxed);
+                let is_up = node.status.healthy.load(Ordering::Relaxed);
+                let latency = node.status.latency.load(Ordering::Relaxed);
 
                 NodeHealth {
                     name: node.name.clone(),
@@ -244,9 +244,9 @@ mod tests {
         let mut built = named(&["slow_t0", "fast_t0", "fast_t1"]);
         built[2].tier = 1;
         let all = arced(built);
-        all[0].latency.store(200, Ordering::Relaxed);
-        all[1].latency.store(1, Ordering::Relaxed);
-        all[2].latency.store(1, Ordering::Relaxed);
+        all[0].status.latency.store(200, Ordering::Relaxed);
+        all[1].status.latency.store(1, Ordering::Relaxed);
+        all[2].status.latency.store(1, Ordering::Relaxed);
 
         assert_eq!(
             names_of(&Topology::rank(&all)),
@@ -257,7 +257,7 @@ mod tests {
     #[test]
     fn rank_drops_unhealthy_nodes() {
         let all = arced(named(&["up", "down"]));
-        all[1].healthy.store(false, Ordering::Relaxed);
+        all[1].status.healthy.store(false, Ordering::Relaxed);
 
         assert_eq!(names_of(&Topology::rank(&all)), ["up"]);
     }
@@ -268,7 +268,7 @@ mod tests {
         // everything.
         let all = arced(named(&["a", "b"]));
         for node in &all {
-            node.healthy.store(false, Ordering::Relaxed);
+            node.status.healthy.store(false, Ordering::Relaxed);
         }
 
         assert_eq!(names_of(&Topology::rank(&all)), ["a", "b"]);
@@ -280,9 +280,9 @@ mod tests {
         // and reporting it as if it did is how a dashboard shows a dead node as
         // the fastest one.
         let all = arced(named(&["up", "down"]));
-        all[0].latency.store(12, Ordering::Relaxed);
-        all[1].latency.store(7, Ordering::Relaxed);
-        all[1].healthy.store(false, Ordering::Relaxed);
+        all[0].status.latency.store(12, Ordering::Relaxed);
+        all[1].status.latency.store(7, Ordering::Relaxed);
+        all[1].status.healthy.store(false, Ordering::Relaxed);
 
         let health = Topology::new(all).health();
 

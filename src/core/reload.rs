@@ -230,6 +230,7 @@ mod tests {
         // A brand-new node carries nothing but default health; without the
         // probe round the router would rank it on `u32::MAX` for a whole tick.
         let latency = rpc_client.topology.load().all[0]
+            .status
             .latency
             .load(Ordering::Relaxed);
 

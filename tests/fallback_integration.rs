@@ -11,7 +11,7 @@ mod common;
 
 use common::{
     BATCH_BODY, INVALID_PARAMS_BODY, NO_ERROR_BODY, OK_BODY, SERVER_ERROR_BODY,
-    assert_err_contains, build_client, build_client_one, dead_url, node, spawn_mock,
+    assert_err_contains, build_client, build_client_one, dead_url, node, node_handle, spawn_mock,
     spawn_mock_latency,
 };
 
@@ -155,8 +155,8 @@ async fn fallback_success_on_transport_error() {
 #[tokio::test]
 async fn sleep_and_retry_after_rate_limit_exhaustion() {
     let mock = spawn_mock(200, OK_BODY).await;
-    let rpc_node = node("A", &mock.url).rps(10).build();
-    let client = build_client_one(rpc_node.clone());
+    let client = build_client_one(node("A", &mock.url).rps(10).build());
+    let rpc_node = node_handle(&client, "A");
 
     // Burn the 10-token burst directly (no HTTP), leaving the bucket empty.
     // Waits ~100ms (1s quota / 10 rps), comfortably inside the 1s global
@@ -339,8 +339,8 @@ async fn timeout_while_waiting_out_a_rate_limit() {
     // budget. The router sleeps out the rate limit and wakes with only
     // microseconds left, so the 100ms upstream cannot finish in time.
     let mock = spawn_mock_latency(200, OK_BODY, Duration::from_millis(100)).await;
-    let rpc_node = node("A", &mock.url).rps(1).build();
-    let client = build_client_one(rpc_node.clone());
+    let client = build_client_one(node("A", &mock.url).rps(1).build());
+    let rpc_node = node_handle(&client, "A");
 
     drop(rpc_node.acquire_and_check().await.unwrap());
 

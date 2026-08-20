@@ -33,8 +33,8 @@ fn set_state(client: &RpcClient, name: &str, up: bool, latency_ms: u32) {
         .find(|node| node.name == name)
         .unwrap_or_else(|| panic!("no node named {name}"));
 
-    target.healthy.store(up, Ordering::Relaxed);
-    target.latency.store(latency_ms, Ordering::Relaxed);
+    target.status.healthy.store(up, Ordering::Relaxed);
+    target.status.latency.store(latency_ms, Ordering::Relaxed);
 }
 
 async fn health_json(client: &RpcClient) -> Value {

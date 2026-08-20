@@ -75,8 +75,8 @@ impl HealthCheckLoop {
                     started.elapsed().as_secs_f64(),
                 );
 
-                node.latency.store(latency, Ordering::Relaxed);
-                let was_healthy = node.healthy.swap(health, Ordering::Relaxed);
+                node.status.latency.store(latency, Ordering::Relaxed);
+                let was_healthy = node.status.healthy.swap(health, Ordering::Relaxed);
 
                 if health {
                     debug!(node = %node.name, latency_ms = latency, "node healthy");
@@ -98,7 +98,7 @@ impl HealthCheckLoop {
         // reads the same flags the router will.
         let healthy_nodes = all
             .iter()
-            .filter(|node| node.healthy.load(Ordering::Relaxed))
+            .filter(|node| node.status.healthy.load(Ordering::Relaxed))
             .count();
 
         metrics::set_healthy_nodes(healthy_nodes);
