@@ -137,7 +137,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "up{job=\"rpc-load-balancer\"}",
+          "expr": "up{job=\"cascaderpc\"}",
           "instant": true,
           "legendFormat": "Prometheus target",
           "range": false,
@@ -1208,7 +1208,7 @@
   "timepicker": {},
   "timezone": "browser",
   "title": "CascadeRPC",
-  "uid": "rpc-load-balancer",
+  "uid": "cascaderpc",
   "version": 3,
   "weekStart": "monday"
 }

@@ -8,7 +8,7 @@
 use std::sync::atomic::Ordering;
 
 use axum::{extract::State, response::IntoResponse};
-use rpc_load_balancer::{core::rpc::RpcClient, server::health};
+use cascaderpc::{core::rpc::RpcClient, server::health};
 use serde_json::Value;
 
 mod common;

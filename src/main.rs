@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
-use rpc_load_balancer::{
+use cascaderpc::{
     core::{healthcheck::HealthCheckLoop, node::RpcNode, reload, rpc::RpcClient},
     metrics,
     protocol::registry::CUSTOM_METHODS,

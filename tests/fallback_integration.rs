@@ -422,7 +422,7 @@ async fn max_concurrent_caps_in_flight_requests() {
 // ---------------------------------------------------------------------------
 
 /// Sends `count` requests, only to burn the first node's rate-limit tokens.
-async fn drain_tokens(client: &rpc_load_balancer::core::rpc::RpcClient, count: usize) {
+async fn drain_tokens(client: &cascaderpc::core::rpc::RpcClient, count: usize) {
     for _ in 0..count {
         let _ = client.send(Bytes::from(OK_BODY)).await;
     }
