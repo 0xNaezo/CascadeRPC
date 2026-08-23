@@ -1,0 +1,15 @@
+# The build context is the repository root, and target/ is the largest thing in
+# it by far — sending it to the daemon costs more than the build.
+target/
+
+.git/
+.env
+quotas.json
+quotas_temp.json
+
+# Not part of the binary.
+docs/
+monitoring/
+examples/
+tests/
+*.md

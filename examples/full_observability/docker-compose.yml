@@ -1,0 +1,70 @@
+name: rpc-lb-observability
+
+services:
+  balancer:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    environment:
+      CONFIG_PATH: /etc/rpc-lb/config.toml
+      # `:?` fails the whole `up` with this message when a key is missing.
+      # Without it the balancer would start, fail to resolve the $VAR in a node
+      # URL, and exit — the same outcome, further from the cause.
+      HELIUS_API_KEY: ${HELIUS_API_KEY:?set it in examples/full_observability/.env}
+      HELIUS_API_KEY_2: ${HELIUS_API_KEY_2:?set it in examples/full_observability/.env}
+      ALCHEMY_API_KEY: ${ALCHEMY_API_KEY:?set it in examples/full_observability/.env}
+      ALCHEMY_API_KEY_2: ${ALCHEMY_API_KEY_2:?set it in examples/full_observability/.env}
+    ports:
+      # /send-request proxies to your paid upstreams and /metrics reports what
+      # they have cost. Neither belongs on a public interface.
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./config.toml:/etc/rpc-lb/config.toml:ro
+      # Shared with the rest of the repository, not copied: prices are a fact
+      # about the provider, and one copy of them cannot drift from another.
+      - ../../config/provider_config:/etc/rpc-lb/provider_config:ro
+      # quotas.json. Without it, a restart re-opens quotas the providers still
+      # consider spent.
+      - quotas:/data
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    # The name matters: the provisioned Grafana datasource points at
+    # http://prometheus:9090.
+    ports:
+      - "127.0.0.1:9090:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      - balancer
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    ports:
+      - "127.0.0.1:3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set it in examples/full_observability/.env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      # Datasource, dashboard provider and the CascadeRPC dashboard are mounted
+      # from monitoring/ rather than duplicated here.
+      - ../../monitoring/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ../../monitoring/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ../../monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  quotas:
+  prometheus-data:
+  grafana-data:

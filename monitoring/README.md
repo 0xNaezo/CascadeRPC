@@ -3,6 +3,11 @@
 The load balancer runs on the host at `0.0.0.0:3000`. Prometheus and Grafana
 run in Docker and reach it through `host.docker.internal`.
 
+For a fully containerized version — balancer, Prometheus and Grafana in one
+compose project, scraping over the compose network — see
+[`../examples/full_observability`](../examples/full_observability). It reuses the
+datasource, dashboard provider and `CascadeRPC` dashboard from this directory.
+
 ## Start
 
 From the repository root, prepare and run the load balancer:
