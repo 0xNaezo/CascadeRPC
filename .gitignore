@@ -3,3 +3,4 @@
 config/balancer_config/config.toml
 /quotas.json
 /quotas_temp.json
+/bench/
