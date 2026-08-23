@@ -22,9 +22,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::{Router, extract::State, response::IntoResponse, routing::post};
-use metrics_exporter_prometheus::PrometheusHandle;
-use reqwest::StatusCode;
-use rpc_load_balancer::{
+use cascaderpc::{
     core::{
         node::{NewNode, RpcNode},
         rpc::RpcClient,
@@ -33,6 +31,8 @@ use rpc_load_balancer::{
     protocol::registry::CUSTOM_METHODS,
     server,
 };
+use metrics_exporter_prometheus::PrometheusHandle;
+use reqwest::StatusCode;
 
 // ---------------------------------------------------------------------------
 // Request/response bodies

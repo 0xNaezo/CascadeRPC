@@ -7,7 +7,7 @@
 //! them and 404 in production.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use rpc_load_balancer::core::rpc::RpcClient;
+use cascaderpc::core::rpc::RpcClient;
 
 mod common;
 

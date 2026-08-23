@@ -7,8 +7,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use bytes::Bytes;
+use cascaderpc::{core::rpc::RpcClient, protocol::cost_table::CostSpec};
 use reqwest::StatusCode;
-use rpc_load_balancer::{core::rpc::RpcClient, protocol::cost_table::CostSpec};
 
 mod common;
 

@@ -359,14 +359,11 @@ pub fn describe_all() {
         "rpc_upstream_skips",
         "Nodes passed over without sending a request"
     );
-    describe_counter!(
-        "rpc_requests",
-        "Client requests handled by the RPC load balancer"
-    );
+    describe_counter!("rpc_requests", "Client requests handled by CascadeRPC");
     describe_histogram!(
         "rpc_request_duration",
         Unit::Seconds,
-        "End-to-end RPC load balancer request duration"
+        "End-to-end CascadeRPC request duration"
     );
     describe_gauge!(
         "rpc_sleep_queue_size",

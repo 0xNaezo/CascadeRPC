@@ -21,12 +21,12 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use bytes::Bytes;
-use metrics_exporter_prometheus::PrometheusHandle;
-use rpc_load_balancer::{
+use cascaderpc::{
     core::rpc::RpcClient,
     metrics::{self, NodeMetrics, Outcome, RequestOutcome, SkipReason},
     server,
 };
+use metrics_exporter_prometheus::PrometheusHandle;
 use serial_test::serial;
 
 mod common;

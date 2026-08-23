@@ -96,7 +96,7 @@ impl Balancer {
     fn start(scratch: &Scratch, port: u16) -> Self {
         // Cargo sets this for integration tests, so nothing has to guess where
         // the built binary landed.
-        let child = Command::new(env!("CARGO_BIN_EXE_rpc-load-balancer"))
+        let child = Command::new(env!("CARGO_BIN_EXE_cascaderpc"))
             .env("CONFIG_PATH", scratch.0.join("config.toml"))
             // The usage file is resolved against the working directory.
             .current_dir(&scratch.0)
@@ -320,7 +320,7 @@ async fn a_corrupt_quotas_file_stops_the_process() {
 async fn a_missing_config_path_exits_nonzero() {
     let scratch = Scratch::new("no_config_path");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rpc-load-balancer"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cascaderpc"))
         .env_remove("CONFIG_PATH")
         .current_dir(&scratch.0)
         .stdout(Stdio::null())

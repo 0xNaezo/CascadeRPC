@@ -237,7 +237,7 @@ mod tests {
     #[serial]
     fn env_var_substituted_from_environment() {
         // CARGO_PKG_NAME is always set by cargo during tests (= crate name).
-        assert_eq!(resolve_env("$CARGO_PKG_NAME").unwrap(), "rpc-load-balancer");
+        assert_eq!(resolve_env("$CARGO_PKG_NAME").unwrap(), "cascaderpc");
     }
 
     #[test]
@@ -505,7 +505,7 @@ mod tests {
 
         assert_eq!(
             Settings::load().unwrap().nodes[0].url,
-            "http://rpc-load-balancer.test/rpc"
+            "http://cascaderpc.test/rpc"
         );
     }
 

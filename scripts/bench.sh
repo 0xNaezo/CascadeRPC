@@ -100,7 +100,7 @@ else
 fi
 
 mkdir -p "$BENCH_DIR"
-cargo build --release --bin rpc-load-balancer --bin mock_node
+cargo build --release --bin cascaderpc --bin mock_node
 
 pids=()
 cleanup() {
@@ -112,7 +112,7 @@ trap cleanup EXIT
 "$bin/mock_node" > "$BENCH_DIR/mock.log" 2>&1 &
 pids+=($!)
 
-CONFIG_PATH="$CONFIG" "$bin/rpc-load-balancer" > "$BENCH_DIR/balancer.log" 2>&1 &
+CONFIG_PATH="$CONFIG" "$bin/cascaderpc" > "$BENCH_DIR/balancer.log" 2>&1 &
 balancer=$!
 pids+=($balancer)
 

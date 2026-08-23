@@ -11,8 +11,8 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
 # --locked: the image is built from the committed Cargo.lock or not at all.
-# --bin rpc-load-balancer leaves the mock_node binary out of the release build.
-RUN cargo build --release --locked --bin rpc-load-balancer
+# --bin cascaderpc leaves the mock_node binary out of the release build.
+RUN cargo build --release --locked --bin cascaderpc
 
 FROM debian:trixie-slim
 
@@ -29,11 +29,11 @@ RUN apt-get update \
 # the quota file writable without running as root.
 RUN useradd --system --uid 10001 --create-home --home-dir /data balancer
 
-COPY --from=build /src/target/release/rpc-load-balancer /usr/local/bin/rpc-load-balancer
+COPY --from=build /src/target/release/cascaderpc /usr/local/bin/cascaderpc
 
 WORKDIR /data
 USER balancer
 
 # No CMD arguments: everything is configured through CONFIG_PATH and the
 # environment the config's $VAR references resolve against.
-ENTRYPOINT ["rpc-load-balancer"]
+ENTRYPOINT ["cascaderpc"]

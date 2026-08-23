@@ -209,7 +209,7 @@ Requires Rust (edition 2024). For a container instead, [`examples/basic_setup`](
 `docker compose up` with no API keys.
 
 ```bash
-git clone <repo-url> && cd rpc-load-balancer
+git clone <repo-url> && cd cascaderpc
 
 # 1. Configure nodes
 cp config/balancer_config/config.example.toml config/balancer_config/config.toml
