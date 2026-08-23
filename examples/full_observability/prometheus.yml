@@ -1,0 +1,17 @@
+# The example's own scrape config: the balancer is a container on this compose
+# network, so the target is the service name.
+#
+# It is not monitoring/prometheus.yml, which targets host.docker.internal —
+# that one is for a balancer running on the host with only the monitoring stack
+# in Docker.
+global:
+  scrape_interval: 5s
+  scrape_timeout: 2s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: rpc-load-balancer
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - balancer:3000

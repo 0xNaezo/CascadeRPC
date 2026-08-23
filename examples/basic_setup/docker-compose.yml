@@ -1,0 +1,30 @@
+name: rpc-lb-basic
+
+services:
+  balancer:
+    # The build context is the repository root: the image is built from this
+    # checkout's sources, not pulled.
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    environment:
+      # The balancer reads its config path from the environment and refuses to
+      # start without it — there is no default file.
+      CONFIG_PATH: /etc/rpc-lb/config.toml
+    ports:
+      # Bound to the loopback interface: /send-request is an unauthenticated
+      # proxy to your paid upstreams and has no business on a public interface.
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./config.toml:/etc/rpc-lb/config.toml:ro
+      # The pricing files are shared with the rest of the repository rather than
+      # copied here: what a provider charges is a fact about the provider, and
+      # one copy cannot drift from another.
+      - ../../config/provider_config:/etc/rpc-lb/provider_config:ro
+      # quotas.json lives here. Without this volume every restart would re-open
+      # a monthly quota the provider still considers spent.
+      - quotas:/data
+    restart: unless-stopped
+
+volumes:
+  quotas:

@@ -1,0 +1,87 @@
+# Balancer config for the `full_observability` example: five nodes across three
+# tiers, with the Prometheus endpoint turned on.
+#
+# Paths are absolute because they are container paths: docker-compose.yml mounts
+# this file at /etc/rpc-lb/config.toml and the shared provider pricing directory
+# at /etc/rpc-lb/provider_config. The process runs in /data, where it writes
+# quotas.json.
+#
+# `$VAR` references are resolved from the container's environment at load. Only
+# that bare form is recognized — `${VAR}` is refused, because passing it through
+# would put the braces themselves into the upstream URL and turn a config
+# mistake into a 401 at request time.
+#
+# Two API keys per provider: a node's usage is the account's usage, so two nodes
+# sharing one key would spend one quota twice as fast while each counted half of
+# it. If you only have one key per provider, delete the `-secondary` nodes
+# rather than pointing them at the same key.
+
+[server]
+host = "0.0.0.0"
+port = 3000
+# The scrape endpoint reports node names, per-node spend, and health. It is
+# published on the loopback interface and reachable on the compose network, and
+# that is the boundary it is safe behind.
+enable_metrics = true
+
+# --- Tier 0: paid, fast, tried first ----------------------------------------
+#
+# Two nodes in one tier are alternatives, not a queue: a request that finds the
+# first one rate-limited or saturated goes to the second without waiting.
+
+[[nodes]]
+name = "helius-primary" # identity, not a label: quotas.json and every metric are keyed by it
+url = "https://mainnet.helius-rpc.com/?api-key=$HELIUS_API_KEY"
+tier = 0
+rps_limit = 50
+max_concurrent = 16
+monthly_limit = 50_000_000                                        # credits per period; threshold = 95% of it
+reset_day = 15                                                    # this account bills on the 15th, not the 1st
+provider_pricing_path = "/etc/rpc-lb/provider_config/helius.toml"
+
+[[nodes]]
+name = "alchemy-primary"
+url = "https://solana-mainnet.g.alchemy.com/v2/$ALCHEMY_API_KEY"
+tier = 0
+rps_limit = 30
+max_concurrent = 12
+monthly_limit = 20_000_000
+provider_pricing_path = "/etc/rpc-lb/provider_config/alchemy.toml"
+
+# --- Tier 1: paid, smaller plans, reached when tier 0 has nothing to offer ---
+#
+# Both share their provider's pricing file with the tier-0 node above. Prices
+# belong to the provider; the plan size, the rate limit and the billing day
+# belong to the account and live here.
+
+[[nodes]]
+name = "helius-secondary"
+url = "https://mainnet.helius-rpc.com/?api-key=$HELIUS_API_KEY_2"
+tier = 1
+rps_limit = 20
+max_concurrent = 8
+monthly_limit = 10_000_000
+provider_pricing_path = "/etc/rpc-lb/provider_config/helius.toml"
+
+[[nodes]]
+name = "alchemy-secondary"
+url = "https://solana-mainnet.g.alchemy.com/v2/$ALCHEMY_API_KEY_2"
+tier = 1
+rps_limit = 20
+max_concurrent = 8
+monthly_limit = 5_000_000
+provider_pricing_path = "/etc/rpc-lb/provider_config/alchemy.toml"
+
+# --- Tier 2: free, slow, the tail that keeps answering ----------------------
+#
+# `monthly_limit = 0` is unmetered, so this node never drops out on quota and
+# the cascade always has somewhere to end.
+
+[[nodes]]
+name = "public-mainnet"
+url = "https://api.mainnet-beta.solana.com"
+tier = 2
+rps_limit = 5
+max_concurrent = 2
+monthly_limit = 0
+provider_pricing_path = "/etc/rpc-lb/provider_config/solana.toml"

@@ -1,0 +1,39 @@
+# Balancer config for the `basic_setup` example.
+#
+# Paths are absolute because they are container paths: docker-compose.yml
+# mounts this file at /etc/rpc-lb/config.toml and the shared provider pricing
+# directory at /etc/rpc-lb/provider_config. The process itself runs in /data,
+# which is where it writes quotas.json.
+#
+# Both nodes are public endpoints that need no API key, so this example runs
+# with `docker compose up` and nothing else.
+
+[server]
+host = "0.0.0.0" # inside the container; the port is published on 127.0.0.1 only
+port = 3000
+enable_metrics = false # see the full_observability example for the metrics side
+
+# Tier 0 is tried first. The quota here is a deliberately small fiction — a
+# public endpoint bills nobody — so that the cascade to tier 1 can be watched
+# without waiting for a real monthly limit.
+[[nodes]]
+name = "solana-mainnet-beta"
+url = "https://api.mainnet-beta.solana.com"
+tier = 0
+rps_limit = 5
+max_concurrent = 2
+monthly_limit = 1_000_000                                      # threshold = 95% of this = 950_000
+provider_pricing_path = "/etc/rpc-lb/provider_config/solana.toml"
+
+# Tier 1 is only reached when every tier-0 node is unusable: rate-limited,
+# saturated, over its spillover threshold, unhealthy, or unable to price the
+# method. `monthly_limit = 0` reads as unmetered, so this node never drops out
+# on quota.
+[[nodes]]
+name = "publicnode"
+url = "https://solana-rpc.publicnode.com"
+tier = 1
+rps_limit = 5
+max_concurrent = 2
+monthly_limit = 0
+provider_pricing_path = "/etc/rpc-lb/provider_config/solana.toml"

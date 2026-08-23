@@ -140,7 +140,8 @@ Providers do not bill per request - they bill per credit, and a `getProgramAccou
 
 ## Configuration
 
-Two kinds of file, both re-read on SIGHUP:
+Two kinds of file, both re-read on SIGHUP. For runnable, containerized versions of
+both, see [`examples/`](examples).
 
 **Balancer config** (`config/balancer_config/config.toml`, path from `CONFIG_PATH`) - the `[server]` section plus one `[[nodes]]` block per upstream. See [`config.example.toml`](config/balancer_config/config.example.toml) for the annotated version.
 
@@ -199,11 +200,13 @@ Prometheus metrics on `/metrics` (opt-in), pre-provisioned Grafana dashboard in 
 
 `GET /health` returns structured JSON: overall status (`ok` / `degraded` / `critical`), per-node up/down state, tier, and last measured latency.
 
-See [`monitoring/README.md`](monitoring/README.md) for the local Prometheus + Grafana docker-compose setup.
+See [`monitoring/README.md`](monitoring/README.md) for the local Prometheus + Grafana docker-compose setup, or
+[`examples/full_observability`](examples/full_observability) for the same stack with the balancer containerized alongside it.
 
 ## Quick start
 
-Requires Rust (edition 2024).
+Requires Rust (edition 2024). For a container instead, [`examples/basic_setup`](examples/basic_setup) runs on
+`docker compose up` with no API keys.
 
 ```bash
 git clone <repo-url> && cd rpc-load-balancer
