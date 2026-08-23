@@ -34,11 +34,13 @@ use crate::protocol::cost_table::ProviderCostTable;
 pub type DefaultDirectRateLimiter<MW = NoOpMiddleware<<DefaultClock as Clock>::Instant>> =
     RateLimiter<NotKeyed, InMemoryState, DefaultClock, MW>;
 
-/// The clock the rate limiter's wait times are measured against.
+/// The clock every rate limiter is built on and measured against.
 ///
 /// One per process: `DefaultClock` is a `QuantaClock`, and building one per
 /// rate-limited attempt was calibration work repeated on the hot path for a
-/// value that never changes.
+/// value that never changes. Handing the same clock to the limiter keeps the
+/// bucket's own timestamps and the wait time reported for it on one source
+/// instead of two instances that merely happen to agree.
 static CLOCK: LazyLock<DefaultClock> = LazyLock::new(DefaultClock::default);
 
 /// What [`RpcNode::new`] needs to build a node, gathered into one struct
@@ -155,7 +157,7 @@ impl RpcNode {
             name: config.name,
             url,
             limits: NodeLimits {
-                rate_limiting: RateLimiter::direct(quota),
+                rate_limiting: RateLimiter::direct_with_clock(quota, CLOCK.clone()),
                 concurrency: Semaphore::new(config.max_concurrent),
             },
             tier: config.tier,
