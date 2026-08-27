@@ -2,6 +2,7 @@
 //! forwarded to the client and which send the request to the next node.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -173,16 +174,51 @@ async fn sleep_and_retry_after_rate_limit_exhaustion() {
 
 #[tokio::test]
 async fn global_timeout_fails_fast() {
-    let mock = spawn_mock_latency(200, OK_BODY, Duration::from_millis(1500)).await;
-    let client = build_client_one(node("slow", &mock.url).build());
+    // One stalled node no longer reaches the global budget: its attempt has a
+    // deadline of its own, so it is cut off and penalized long before the
+    // request runs out of time. What the budget still bounds is the *sum* — a
+    // set of nodes that each stall in turn.
+    let first = spawn_mock_latency(200, OK_BODY, Duration::from_millis(1500)).await;
+    let second = spawn_mock_latency(200, OK_BODY, Duration::from_millis(1500)).await;
+    let third = spawn_mock_latency(200, OK_BODY, Duration::from_millis(1500)).await;
+
+    let client = build_client(vec![
+        node("slow_a", &first.url).build(),
+        node("slow_b", &second.url).build(),
+        node("slow_c", &third.url).build(),
+    ]);
 
     let (status, err) = client
         .send(Bytes::from(OK_BODY))
         .await
-        .expect_err("a node slower than the 1s budget should time out");
+        .expect_err("a set of nodes that all stall should exhaust the 1s budget");
 
     assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
     assert_err_contains(&err, "Global timeout");
+}
+
+#[tokio::test]
+async fn a_single_stalled_node_is_given_up_on_before_the_global_budget() {
+    // The attempt deadline is what catches a node that accepts the connection
+    // and then says nothing. Without it the global timeout drops the attempt
+    // mid-flight and the stall is never recorded against the node.
+    let mock = spawn_mock_latency(200, OK_BODY, Duration::from_millis(1500)).await;
+    let client = build_client_one(node("slow", &mock.url).build());
+
+    let started = tokio::time::Instant::now();
+    let (status, _) = client
+        .send(Bytes::from(OK_BODY))
+        .await
+        .expect_err("a node that never answers cannot serve the request");
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the stalled node was given the whole request budget"
+    );
+    assert!(node_handle(&client, "slow").is_penalized(
+        cascaderpc::core::node::seconds_since_start(tokio::time::Instant::now())
+    ));
 }
 
 #[tokio::test]
@@ -474,6 +510,14 @@ async fn a_node_already_tried_is_not_retried_after_a_reload() {
     // Spend both of the serving node's tokens.
     drain_tokens(&client, 2).await;
 
+    // The drain above already broke the tier-0 node, and a penalized node is
+    // skipped before it is ever offered a request — which is not the path under
+    // test. Clearing the penalty puts it back in front of the first round.
+    node_handle(&client, "failing")
+        .penalty
+        .until_s
+        .store(0, Ordering::Relaxed);
+
     let failing_before = failing.hits();
     let serving_before = serving.hits();
 
@@ -496,8 +540,9 @@ async fn a_node_already_tried_is_not_retried_after_a_reload() {
     assert_eq!(status, StatusCode::OK);
 
     // One attempt, one quota booking: the bitmask is keyed on the node's slot,
-    // and a reload that keeps a name keeps its slot, so the second round must
-    // walk straight past it.
+    // and a reload that keeps a name keeps its slot — as well as the penalty
+    // the failed attempt earned it — so the second round must walk straight
+    // past it on both counts.
     assert_eq!(
         failing.hits() - failing_before,
         1,

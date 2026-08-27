@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tracing::{info, warn};
 
-use crate::core::node::RpcNode;
+use crate::core::node::{RpcNode, UNMEASURED};
 use crate::quotas::state::{GlobalQuotaState, MAX_NODES};
 
 /// Every node the config describes, plus the order the router walks them in.
@@ -30,7 +30,8 @@ pub struct Topology {
     pub ranked: Vec<Arc<RpcNode>>,
 }
 
-/// One node's line in the `/health` response.
+/// One node's line in the `/health` response. `status` is `up`, `down`, or
+/// `unknown` for a node no request has reached yet.
 #[derive(Serialize)]
 pub struct NodeHealth {
     pub name: String,
@@ -94,10 +95,19 @@ impl Topology {
                 NodeHealth {
                     name: node.name.clone(),
                     tier: node.tier,
-                    status: if is_up { "up" } else { "down" },
+                    // Health is inferred from traffic, so a node no request has
+                    // reached yet has not been found well — it has not been
+                    // asked. Reporting it `up` is a claim the balancer cannot
+                    // make, and it is how a config full of dead URLs passes an
+                    // operator's smoke test before the first request lands.
+                    status: match (is_up, ema_us) {
+                        (false, _) => "down",
+                        (true, UNMEASURED) => "unknown",
+                        (true, _) => "up",
+                    },
                     // A node nothing has answered for reports no latency rather
                     // than the 4294967 ms the sentinel would render as.
-                    latency_ms: (is_up && ema_us != u32::MAX).then_some(ema_us / 1000),
+                    latency_ms: (is_up && ema_us != UNMEASURED).then_some(ema_us / 1000),
                 }
             })
             .collect()
@@ -116,6 +126,12 @@ impl Topology {
 /// with. A rename is indistinguishable from "one node left, another arrived",
 /// so a renamed node starts from zero; both halves of that are logged rather
 /// than hidden.
+///
+/// A surviving node also keeps the latency average and the penalty its own
+/// traffic earned it. Nothing measures a node during a reload, so dropping
+/// those would leave the balancer routing on config order until real requests
+/// rebuilt them — one of which is a request handed to a node that was penalized
+/// a moment earlier.
 ///
 /// # Errors
 ///
@@ -145,19 +161,30 @@ pub(crate) fn assign_ids(
         }
     }
 
-    let prev_ids: HashMap<&str, usize> = prev
-        .iter()
-        .map(|node| (node.name.as_str(), node.id))
-        .collect();
+    let previous: HashMap<&str, &Arc<RpcNode>> =
+        prev.iter().map(|node| (node.name.as_str(), node)).collect();
 
     let mut taken = [false; MAX_NODES];
     let mut arrived: Vec<usize> = Vec::new();
 
     for (position, node) in new.iter_mut().enumerate() {
-        match prev_ids.get(node.name.as_str()).copied() {
-            Some(id) => {
-                node.id = id;
-                taken[id] = true;
+        match previous.get(node.name.as_str()).copied() {
+            Some(old) => {
+                node.id = old.id;
+                taken[old.id] = true;
+
+                // Health is measured from traffic, and a reload sends none: a
+                // surviving node that starts over as unmeasured and unpenalized
+                // is handed traffic again the instant an operator adds an
+                // unrelated node to the config, however broken it still is.
+                node.latency.ema_us.store(
+                    old.latency.ema_us.load(Ordering::Relaxed),
+                    Ordering::Relaxed,
+                );
+                node.penalty.until_s.store(
+                    old.penalty.until_s.load(Ordering::Relaxed),
+                    Ordering::Relaxed,
+                );
             }
             None => arrived.push(position),
         }
@@ -201,7 +228,7 @@ pub(crate) fn assign_ids(
 mod tests {
     use super::*;
 
-    use crate::core::node::NewNode;
+    use crate::core::node::{NewNode, seconds_since_start};
     use crate::protocol::cost_table::ProviderCostTable;
 
     /// Nodes under the given names, in the given order — a stand-in for the
@@ -266,7 +293,7 @@ mod tests {
         // instead of waiting for the next ranking round — and so that failing
         // open when every node is penalized stays the request path's decision.
         let all = arced(named(&["up", "penalized"]));
-        all[1].penalize(tokio::time::Instant::now(), 0);
+        all[1].penalize(0);
 
         assert_eq!(names_of(&Topology::rank(&all)), ["up", "penalized"]);
     }
@@ -277,26 +304,49 @@ mod tests {
         // now, and reporting it as if it did is how a dashboard shows a dead
         // node as the fastest one.
         let all = arced(named(&["up", "down"]));
-        let at = tokio::time::Instant::now();
         all[0].latency.ema_us.store(12_400, Ordering::Relaxed);
         all[1].latency.ema_us.store(7_000, Ordering::Relaxed);
-        all[1].penalize(at, 0);
+        all[1].penalize(0);
 
-        let health = Topology::new(all).health(crate::core::node::seconds_since_start(at));
+        let now_s = seconds_since_start(tokio::time::Instant::now());
+        let health = Topology::new(all).health(now_s);
 
         assert_eq!((health[0].status, health[0].latency_ms), ("up", Some(12)));
         assert_eq!((health[1].status, health[1].latency_ms), ("down", None));
     }
 
     #[test]
-    fn health_reports_no_latency_for_a_node_nothing_has_answered_for() {
-        // The sentinel renders as 4294967 ms otherwise, which reads on a
-        // dashboard as a node that is up and catastrophically slow rather than
-        // as one no request has reached yet.
+    fn health_reports_a_node_nothing_has_answered_for_as_unknown() {
+        // Not `up`: nothing has found this node well, nothing has asked it. And
+        // no latency — the sentinel renders as 4294967 ms otherwise, which
+        // reads on a dashboard as a node that is up and catastrophically slow.
         let all = arced(named(&["fresh"]));
 
         let health = Topology::new(all).health(0);
 
-        assert_eq!((health[0].status, health[0].latency_ms), ("up", None));
+        assert_eq!((health[0].status, health[0].latency_ms), ("unknown", None));
+    }
+
+    #[test]
+    fn a_reload_leaves_a_surviving_node_the_health_its_traffic_earned() {
+        // Nothing measures a node during a reload. Starting a survivor over as
+        // unmeasured and unpenalized hands traffic straight back to a node that
+        // broke a moment ago, every time an operator edits an unrelated line of
+        // the config.
+        let usage = GlobalQuotaState::default();
+        let prev = arced(named(&["kept", "leaving"]));
+        prev[0].latency.ema_us.store(31_000, Ordering::Relaxed);
+        prev[0].penalize(0);
+
+        let mut new = named(&["kept", "arriving"]);
+        assign_ids(&prev, &mut new, &usage).unwrap();
+
+        assert_eq!(new[0].latency.ema_us.load(Ordering::Relaxed), 31_000);
+        assert!(new[0].is_penalized(seconds_since_start(tokio::time::Instant::now())));
+
+        // The node that was not there before starts with nothing, as it must:
+        // there is no measurement to inherit.
+        assert_eq!(new[1].latency.ema_us.load(Ordering::Relaxed), UNMEASURED);
+        assert!(!new[1].is_penalized(0));
     }
 }

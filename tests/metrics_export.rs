@@ -268,10 +268,16 @@ async fn end_to_end_outcomes_partition_rpc_requests() {
     )
     .await;
 
-    // Slower than the router's one-second budget for a whole request.
+    // No single node reaches the router's one-second budget any more: an
+    // attempt is given a deadline of its own and the node is penalized instead.
+    // Three that all stall in turn still add up past it.
     let sluggish = spawn_mock_latency(200, OK_BODY, Duration::from_millis(1500)).await;
     send(
-        &build_client_one(node("r-slow", &sluggish.url).build()),
+        &build_client(vec![
+            node("r-slow-a", &sluggish.url).build(),
+            node("r-slow-b", &sluggish.url).build(),
+            node("r-slow-c", &sluggish.url).build(),
+        ]),
         OK_BODY,
     )
     .await;
@@ -353,8 +359,8 @@ async fn an_unlimited_node_reports_a_threshold_it_cannot_reach() {
 async fn the_node_health_gauge_carries_the_tier_label() {
     handle();
 
-    metrics::set_node_state("p-up", 2, false, 12_000);
-    metrics::set_node_state("p-down", 0, true, 500_000);
+    metrics::set_node_state("p-up", 2, false, Some(12_000));
+    metrics::set_node_state("p-down", 0, true, Some(500_000));
 
     // The tier is on the gauge so an alert can say "every tier-0 node is down"
     // without joining against the config.
@@ -381,13 +387,16 @@ async fn the_node_health_gauge_carries_the_tier_label() {
 async fn a_node_nothing_has_answered_for_publishes_no_latency() {
     handle();
 
-    metrics::set_node_state("p-fresh", 0, false, u32::MAX);
+    metrics::set_node_state("p-fresh", 0, false, Some(4_000));
+    metrics::set_node_state("p-fresh", 0, false, None);
 
-    // The sentinel would render as 4295 seconds, which reads on a dashboard as
-    // a node that is up and catastrophically slow rather than as one no request
-    // has reached yet.
+    // `NaN` and not a missing series: a gauge keeps its last value forever, so
+    // dropping the sample would leave the 4 ms above on the dashboard for good.
+    // The sentinel itself would render as 4295 seconds, which reads as a node
+    // that is up and catastrophically slow rather than one no request has
+    // reached yet.
     assert!(
-        !scrape().contains(r#"rpc_node_latency_ema{node="p-fresh"}"#),
+        expect_series("rpc_node_latency_ema", &[r#"node="p-fresh""#]).is_nan(),
         "the unmeasured sentinel was published as a latency"
     );
 }
@@ -418,7 +427,7 @@ async fn every_metric_renders_help_and_type() {
     node.record_attempt(Outcome::Success, 0.01);
     node.record_skip(SkipReason::RateLimit);
     metrics::record_request(RequestOutcome::Forwarded, 0.01);
-    metrics::set_node_state("h-node", 0, false, 10_000);
+    metrics::set_node_state("h-node", 0, false, Some(10_000));
     metrics::set_healthy_nodes(1);
     metrics::set_node_quota("h-node", 1, 2);
     drop(metrics::sleeping_on_rate_limit());

@@ -8,10 +8,13 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bytes::Bytes;
-use cascaderpc::core::{ranking::RankLoop, rpc::RpcClient, topology::Topology};
+use cascaderpc::core::{
+    node::seconds_since_start, ranking::RankLoop, rpc::RpcClient, topology::Topology,
+};
 use reqwest::StatusCode;
 use tokio::time::Instant;
 
@@ -20,7 +23,7 @@ mod common;
 use common::{
     NOT_JSON_BODY, OK_BODY, RATE_LIMITED_BODY, RATE_LIMITED_JSON_BODY, build_client,
     build_client_one, dead_url, node, node_handle, spawn_flaky_mock, spawn_mock,
-    spawn_rate_limited_mock,
+    spawn_mock_latency, spawn_rate_limited_mock,
 };
 
 /// One `getBalance` request, the body every mock in this file is priced for.
@@ -39,6 +42,8 @@ fn names(table: &Topology) -> Vec<&str> {
     table.ranked.iter().map(|node| node.name.as_str()).collect()
 }
 
+/// Whether `/health` reports the node as taking traffic. A node nothing has
+/// reached yet reports `unknown`, which is neither up nor down.
 fn is_up(client: &RpcClient, name: &str) -> bool {
     client
         .health_snapshot()
@@ -90,12 +95,11 @@ async fn ranking_orders_by_tier_then_measured_latency() {
         node("fast_t0", &fast_t0.url).tier(0).build(),
     ]);
 
-    // Backdating the start of the attempt is how a test states a latency: the
-    // node records the round trip from the instant it was handed.
-    let now = Instant::now();
-    node_handle(&client, "slow_t0").observe_answer(now - Duration::from_millis(200));
-    node_handle(&client, "fast_t0").observe_answer(now);
-    node_handle(&client, "fast_t1").observe_answer(now);
+    // The node records the round trip it is handed, so a test states a latency
+    // by handing it one.
+    node_handle(&client, "slow_t0").observe_answer(Duration::from_millis(200));
+    node_handle(&client, "fast_t0").observe_answer(Duration::ZERO);
+    node_handle(&client, "fast_t1").observe_answer(Duration::ZERO);
 
     RankLoop::rerank(&client).await;
 
@@ -213,6 +217,105 @@ async fn a_retry_after_header_is_accepted_from_the_upstream() {
     assert!(!is_up(&client, "limited"));
     assert_eq!(send(&client).await, StatusCode::OK);
     assert_eq!(limited.hits(), 1);
+
+    // Being penalized at all proves nothing: the balancer's own 5-second
+    // cooldown looks exactly the same from here. Only the deadline says whether
+    // the header was read.
+    let until_s = node_handle(&client, "limited")
+        .penalty
+        .until_s
+        .load(Ordering::Relaxed);
+
+    assert!(
+        until_s - seconds_since_start(Instant::now()) > 30,
+        "the header was ignored and the default penalty applied"
+    );
+}
+
+#[tokio::test]
+async fn a_retry_after_cannot_take_a_node_out_indefinitely() {
+    // Unclamped, the upstream decides how long the balancer refuses to route to
+    // it — and nothing offers a penalized node a request until every other node
+    // is penalized too, so it never gets the chance to clear the penalty early.
+    let limited = spawn_rate_limited_mock("86400").await;
+    let good = spawn_mock(200, OK_BODY).await;
+
+    let client = build_client(vec![
+        node("limited", &limited.url).build(),
+        node("good", &good.url).build(),
+    ]);
+
+    send(&client).await;
+
+    let until_s = node_handle(&client, "limited")
+        .penalty
+        .until_s
+        .load(Ordering::Relaxed);
+
+    assert!(
+        until_s - seconds_since_start(Instant::now()) < 3600,
+        "an upstream took itself out of rotation for a day"
+    );
+}
+
+#[tokio::test]
+async fn a_stalled_node_is_penalized_instead_of_eating_the_whole_budget() {
+    // The failure mode passive health exists to catch and the one it is least
+    // able to see: a node that accepts the connection and then says nothing
+    // never reaches a classification at all unless the attempt has a deadline of
+    // its own, shorter than the router's global budget. Without one the global
+    // timeout drops the attempt mid-flight, the penalty is never recorded, and
+    // the stalled node stays first in the routing order 504-ing every request.
+    let stalled = spawn_mock_latency(200, OK_BODY, Duration::from_millis(800)).await;
+    let good = spawn_mock(200, OK_BODY).await;
+
+    let client = build_client(vec![
+        node("stalled", &stalled.url).build(),
+        node("good", &good.url).build(),
+    ]);
+
+    assert_eq!(
+        send(&client).await,
+        StatusCode::OK,
+        "the request was spent waiting on the stalled node"
+    );
+    assert_eq!(good.hits(), 1);
+    assert!(!is_up(&client, "stalled"), "the stall went unpenalized");
+
+    assert_eq!(send(&client).await, StatusCode::OK);
+    assert_eq!(stalled.hits(), 1, "the stalled node kept taking traffic");
+}
+
+#[tokio::test]
+async fn a_rejection_is_not_a_measurement() {
+    // A node that refuses everything — a wrong path, an exhausted plan, a
+    // method it does not serve — refuses in microseconds. Folding that into the
+    // latency average would make the node that serves nothing the fastest one
+    // in its tier, and the ranking would hand it all of the traffic.
+    let refusing = spawn_mock(404, OK_BODY).await;
+    let client = build_client_one(node("refusing", &refusing.url).build());
+
+    assert_eq!(send(&client).await, StatusCode::NOT_FOUND);
+
+    let health = client.health_snapshot();
+    assert_eq!(health[0].latency_ms, None, "a refusal was measured");
+    assert_eq!(health[0].status, "unknown");
+}
+
+#[tokio::test]
+async fn a_rejection_does_not_clear_a_standing_penalty() {
+    // Fail-open hands a penalized node a request; answering it with a 404 is
+    // not evidence that whatever broke the node is fixed.
+    let refusing = spawn_mock(404, OK_BODY).await;
+    let client = build_client_one(node("refusing", &refusing.url).build());
+
+    node_handle(&client, "refusing").penalize(0);
+
+    assert_eq!(send(&client).await, StatusCode::NOT_FOUND);
+    assert!(
+        !is_up(&client, "refusing"),
+        "a refusal was taken for a recovery"
+    );
 }
 
 #[tokio::test]

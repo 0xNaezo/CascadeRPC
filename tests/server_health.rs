@@ -6,25 +6,32 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 
 use axum::{extract::State, response::IntoResponse};
-use tokio::time::Instant;
-use cascaderpc::{core::rpc::RpcClient, server::health};
+use cascaderpc::{core::node::UNMEASURED, core::rpc::RpcClient, server::health};
 use serde_json::Value;
 
 mod common;
 
 use common::{build_client, node};
 
-/// Three nodes, all up, with distinct latencies. No sockets involved: the
-/// handler never dials the URLs.
+/// Three nodes, all measured and up. No sockets involved: the handler never
+/// dials the URLs.
+///
+/// The measurement matters: a node nothing has answered for reports `unknown`,
+/// not `up`, so a set left at its defaults would not exercise the `ok` summary.
 fn client() -> RpcClient {
-    build_client(vec![
+    let client = build_client(vec![
         node("alpha", "http://127.0.0.1:1").tier(0).build(),
         node("beta", "http://127.0.0.1:2").tier(1).build(),
         node("gamma", "http://127.0.0.1:3").tier(2).build(),
-    ])
+    ]);
+
+    for name in ["alpha", "beta", "gamma"] {
+        set_state(&client, name, true, 10);
+    }
+
+    client
 }
 
 fn set_state(client: &RpcClient, name: &str, up: bool, latency_ms: u32) {
@@ -35,7 +42,7 @@ fn set_state(client: &RpcClient, name: &str, up: bool, latency_ms: u32) {
         .find(|node| node.name == name)
         .unwrap_or_else(|| panic!("no node named {name}"));
 
-    // Saturating so a test can pass the `u32::MAX` sentinel through unchanged
+    // Saturating so a test can pass the `UNMEASURED` sentinel through unchanged
     // and mean "nothing has measured this node".
     target
         .latency
@@ -45,9 +52,9 @@ fn set_state(client: &RpcClient, name: &str, up: bool, latency_ms: u32) {
     if up {
         target.penalty.until_s.store(0, Ordering::Relaxed);
     } else {
-        // Backdated by a minute so the penalty is unambiguously live however
-        // long the test takes to reach the handler.
-        target.penalize(Instant::now() + Duration::from_mins(1), 0);
+        // Seconds long, so the penalty is unambiguously live however long the
+        // test takes to reach the handler.
+        target.penalize(0);
     }
 }
 
@@ -104,7 +111,7 @@ async fn latency_is_reported_for_up_nodes_and_hidden_for_down_ones() {
     // sentinel), which would be misleading to publish.
     let client = client();
     set_state(&client, "alpha", true, 42);
-    set_state(&client, "beta", false, u32::MAX);
+    set_state(&client, "beta", false, UNMEASURED);
 
     let body = health_json(&client).await;
     let nodes = body["nodes"].as_array().unwrap();
@@ -118,6 +125,25 @@ async fn latency_is_reported_for_up_nodes_and_hidden_for_down_ones() {
     assert_eq!(beta["name"], "beta");
     assert_eq!(beta["status"], "down");
     assert_eq!(beta["latency_ms"], Value::Null);
+}
+
+#[tokio::test]
+async fn a_node_no_request_has_reached_reports_unknown() {
+    // Health is inferred from traffic. Calling a node `up` before anything has
+    // asked it is how a config full of dead URLs passes a smoke test.
+    let client = client();
+    set_state(&client, "gamma", true, UNMEASURED);
+
+    let body = health_json(&client).await;
+    let gamma = &body["nodes"].as_array().unwrap()[2];
+
+    assert_eq!(gamma["status"], "unknown");
+    assert_eq!(gamma["latency_ms"], Value::Null);
+
+    // Unknown still counts as available: the router will offer it a request,
+    // which is what the summary is reporting on.
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["active_nodes"], 3);
 }
 
 #[tokio::test]

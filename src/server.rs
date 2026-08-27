@@ -109,19 +109,24 @@ struct HealthResponse {
     nodes: Vec<NodeHealth>,
 }
 
-/// Reports what the last health check round measured, per node.
+/// Reports what the balancer's own traffic says about each node.
 ///
-/// Costs nothing and never dials an upstream: `up`/`down` and the latency are as
-/// fresh as the last probe. `degraded` means the balancer is still serving but
-/// with fewer nodes than configured; `critical` means it is failing open over
-/// the whole set.
+/// Costs nothing and never dials an upstream, so a node's line is as fresh as
+/// the last request that reached it — and `unknown` until one does. `degraded`
+/// means the balancer is still serving but with fewer nodes than configured;
+/// `critical` means every node is penalized and it is failing open over the
+/// whole set.
+///
+/// An `unknown` node counts as available: the router will offer it a request,
+/// which is the question this summary answers. Whether it is well is what the
+/// per-node line reports, and that one does not guess.
 ///
 /// The per-node reading is [`RpcClient::health_snapshot`]; what is left here is
 /// the summary the endpoint puts around it.
 pub async fn health(State(rpc_client): State<Arc<RpcClient>>) -> impl IntoResponse {
     let nodes = rpc_client.health_snapshot();
 
-    let active_nodes = nodes.iter().filter(|n| n.status == "up").count();
+    let active_nodes = nodes.iter().filter(|n| n.status != "down").count();
     let total_nodes = nodes.len();
 
     let status = if active_nodes == 0 {

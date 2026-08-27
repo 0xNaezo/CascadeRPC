@@ -1,5 +1,5 @@
 //! One upstream RPC node: its address, the limits it is served under, and the
-//! health the probe loop measures for it.
+//! health its own traffic measures for it.
 //!
 //! A node is built once per config load and never mutated afterwards. The
 //! request path only touches its atomics and its permits, so a reload can
@@ -24,6 +24,7 @@ use std::{
 };
 use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio::time::Instant;
+use tracing::{info, warn};
 use url::Url;
 
 use crate::metrics::NodeMetrics;
@@ -63,6 +64,14 @@ static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 /// nothing next to the counter and the reset that an explicit exponent needs.
 const PENALTY_SECS: u32 = 5;
 
+/// Ceiling on the cooldown a `Retry-After` header can buy an upstream.
+///
+/// Without it the node decides how long the balancer refuses to route to it,
+/// and a penalized node is only ever offered a request again when *every* other
+/// node is penalized too — so a header of `86400` takes a node out for a day
+/// and nothing short of that outage brings it back.
+const MAX_RETRY_AFTER_SECS: u32 = 300;
+
 /// The EMA's smoothing shift: `alpha = 1 / 2^LATENCY_SHIFT`.
 ///
 /// A shift and not a float multiply — this runs on every answered attempt.
@@ -71,14 +80,18 @@ const LATENCY_SHIFT: u32 = 3;
 /// Latency of a node nothing has measured yet. Sorts last in
 /// [`crate::core::topology::Topology::rank`], so an unknown node is offered the
 /// request only once every measured one has turned it down.
-const UNMEASURED: u32 = u32::MAX;
+///
+/// Public because every reader of `ema_us` has to test for it — the `/health`
+/// listing and the metrics gauge both report "no measurement" rather than the
+/// 4295 seconds the sentinel would otherwise render as.
+pub const UNMEASURED: u32 = u32::MAX;
 
 /// Seconds from [`EPOCH`] to `at`, the unit every penalty deadline is in.
 ///
-/// Takes the instant rather than reading the clock: both callers already have
-/// one — the router the instant it stamped the request with, the upstream layer
-/// the instant it started the attempt at — and a clock read per request is not
-/// free at the rates this balancer is built for.
+/// Takes the instant rather than reading the clock: the request path already
+/// holds one — the instant it stamped the request with — and a second clock
+/// read per request is not free at the rates this balancer is built for. The
+/// callers that are not on that path pass `Instant::now()` themselves.
 #[must_use]
 pub fn seconds_since_start(at: Instant) -> u32 {
     u32::try_from(at.saturating_duration_since(*EPOCH).as_secs()).unwrap_or(u32::MAX)
@@ -289,16 +302,21 @@ impl RpcNode {
     /// Folds one answered attempt into the node's latency, and clears any
     /// penalty standing against it.
     ///
-    /// `started` is the instant the attempt began, which the caller already
-    /// holds for its own metrics — measuring the round trip costs no extra
-    /// clock read.
+    /// `round_trip` is the duration the caller already measured for its own
+    /// metrics, passed in rather than re-read here: the two used to read the
+    /// clock once each for the same number.
+    ///
+    /// Only a node that actually served the request gets here. A fast rejection
+    /// — a 404, a `method not found` — is not evidence the node is well, and
+    /// folding its microseconds into the average would make the node that
+    /// refuses everything the fastest one in its tier.
     ///
     /// The read-modify-write is three relaxed operations and not a CAS loop: a
     /// lost update under concurrency drops one sample out of an average, which
     /// is the kind of error an average is made of. Paying a retry loop per
     /// answer to avoid it would be the more expensive mistake.
-    pub fn observe_answer(&self, started: Instant) {
-        let sample_us = u32::try_from(started.elapsed().as_micros()).unwrap_or(UNMEASURED - 1);
+    pub fn observe_answer(&self, round_trip: Duration) {
+        let sample_us = u32::try_from(round_trip.as_micros()).unwrap_or(UNMEASURED - 1);
 
         let ema_us = self.latency.ema_us.load(Ordering::Relaxed);
         let next_us = if ema_us == UNMEASURED {
@@ -314,8 +332,15 @@ impl RpcNode {
         // reads a zero and writes nothing. The store is for the node that just
         // answered while serving a penalty, which is how a recovered node
         // returns to rotation without waiting the deadline out.
-        if self.penalty.until_s.load(Ordering::Relaxed) != 0 {
+        let until_s = self.penalty.until_s.load(Ordering::Relaxed);
+        if until_s != 0 {
             self.penalty.until_s.store(0, Ordering::Relaxed);
+
+            // Only the edge, and only off the common path: the clock read and
+            // the log line are behind a penalty that was actually standing.
+            if until_s > seconds_since_start(Instant::now()) {
+                info!(node = %self.name, "node back in rotation");
+            }
         }
     }
 
@@ -324,16 +349,30 @@ impl RpcNode {
     /// `retry_after_s` is what the upstream asked for on a 429, or `0` when it
     /// asked for nothing; the longer of it and [`PENALTY_SECS`] wins, so a
     /// provider can extend its own cooldown but never shorten it below what the
-    /// balancer would have applied anyway.
+    /// balancer would have applied anyway — up to [`MAX_RETRY_AFTER_SECS`].
+    ///
+    /// The clock is read here rather than taken from the caller's start
+    /// instant: a failure that took most of a second to arrive would otherwise
+    /// date its own penalty back to before the attempt and serve it out that
+    /// much sooner. This is the failure path, where one clock read is free.
     ///
     /// The latency EMA is deliberately left alone: a node coming out of a
     /// penalty keeps the estimate it had when it broke, so it re-enters at the
     /// back of its tier and is offered a request only once the nodes ahead of it
     /// are busy. That is a probation period at the cost of not writing a field.
-    pub fn penalize(&self, at: Instant, retry_after_s: u32) {
-        let until_s = seconds_since_start(at).saturating_add(PENALTY_SECS.max(retry_after_s));
+    pub fn penalize(&self, retry_after_s: u32) {
+        let now_s = seconds_since_start(Instant::now());
+        let seconds = PENALTY_SECS.max(retry_after_s.min(MAX_RETRY_AFTER_SECS));
 
-        self.penalty.until_s.store(until_s, Ordering::Relaxed);
+        // `now_s` is truncated to a whole second, so the deadline is rounded up
+        // by one: without it a penalty applied at 4.9s would expire after 4.1s
+        // of real time rather than the 5 it promises.
+        let until_s = now_s.saturating_add(1).saturating_add(seconds);
+        let previous = self.penalty.until_s.swap(until_s, Ordering::Relaxed);
+
+        if previous <= now_s {
+            warn!(node = %self.name, seconds, "node taken out of rotation");
+        }
     }
 }
 
@@ -426,10 +465,9 @@ mod tests {
         // ranking long after it started answering in microseconds.
         let node = node_with(1, 1, "http://localhost:9").unwrap();
 
-        node.observe_answer(Instant::now());
+        node.observe_answer(Duration::from_micros(400));
 
-        let first = node.latency.ema_us.load(Ordering::Relaxed);
-        assert!(first < 1_000_000, "first sample was averaged in: {first}");
+        assert_eq!(node.latency.ema_us.load(Ordering::Relaxed), 400);
     }
 
     #[test]
@@ -440,7 +478,7 @@ mod tests {
         // A stream of near-instant answers has to pull the average down; with
         // `alpha = 1/8` thirty samples is well past the time constant.
         for _ in 0..30 {
-            node.observe_answer(Instant::now());
+            node.observe_answer(Duration::ZERO);
         }
 
         let ema = node.latency.ema_us.load(Ordering::Relaxed);
@@ -450,32 +488,67 @@ mod tests {
     #[test]
     fn a_penalty_expires_on_its_own() {
         let node = node_with(1, 1, "http://localhost:9").unwrap();
-        let at = Instant::now();
-        let now_s = seconds_since_start(at);
 
-        node.penalize(at, 0);
+        node.penalize(0);
+        let now_s = seconds_since_start(Instant::now());
 
         assert!(node.is_penalized(now_s), "penalty did not take effect");
         assert!(
-            !node.is_penalized(now_s + PENALTY_SECS),
+            !node.is_penalized(now_s + PENALTY_SECS + 1),
             "penalty outlived its deadline"
+        );
+    }
+
+    #[test]
+    fn a_penalty_is_never_shorter_than_it_promises() {
+        // `seconds_since_start` truncates to whole seconds, so a deadline built
+        // from it without rounding up serves out as little as `PENALTY_SECS - 1`
+        // seconds of real time.
+        let node = node_with(1, 1, "http://localhost:9").unwrap();
+
+        node.penalize(0);
+
+        let now_s = seconds_since_start(Instant::now());
+        let until_s = node.penalty.until_s.load(Ordering::Relaxed);
+
+        assert!(
+            until_s - now_s > PENALTY_SECS,
+            "deadline is {} seconds out, which can round down below {PENALTY_SECS}",
+            until_s - now_s
         );
     }
 
     #[test]
     fn retry_after_extends_a_penalty_but_cannot_cut_it_short() {
         let node = node_with(1, 1, "http://localhost:9").unwrap();
-        let at = Instant::now();
-        let now_s = seconds_since_start(at);
 
-        node.penalize(at, PENALTY_SECS * 4);
-        assert!(node.is_penalized(now_s + PENALTY_SECS * 3), "upstream asked for longer and was ignored");
+        node.penalize(PENALTY_SECS * 4);
+        let now_s = seconds_since_start(Instant::now());
+        assert!(
+            node.is_penalized(now_s + PENALTY_SECS * 3),
+            "upstream asked for longer and was ignored"
+        );
 
         // The other direction: a provider asking for one second must not buy
         // itself a shorter cooldown than the balancer would have applied.
         node.penalty.until_s.store(0, Ordering::Relaxed);
-        node.penalize(at, 1);
-        assert!(node.is_penalized(now_s + PENALTY_SECS - 1));
+        node.penalize(1);
+        assert!(node.is_penalized(seconds_since_start(Instant::now()) + PENALTY_SECS - 1));
+    }
+
+    #[test]
+    fn a_retry_after_cannot_take_a_node_out_for_longer_than_the_ceiling() {
+        // Unclamped, an upstream decides how long the balancer refuses to route
+        // to it — and nothing offers it a request again until every other node
+        // is penalized too, so it never gets the chance to clear it early.
+        let node = node_with(1, 1, "http://localhost:9").unwrap();
+
+        node.penalize(u32::MAX);
+
+        let now_s = seconds_since_start(Instant::now());
+        let until_s = node.penalty.until_s.load(Ordering::Relaxed);
+
+        assert!(until_s - now_s <= MAX_RETRY_AFTER_SECS + 1);
     }
 
     #[test]
@@ -484,12 +557,11 @@ mod tests {
         // offers the request anyway, and the node answers. Leaving the penalty
         // standing would keep the whole balancer failing open until it expired.
         let node = node_with(1, 1, "http://localhost:9").unwrap();
-        let at = Instant::now();
 
-        node.penalize(at, 0);
-        node.observe_answer(at);
+        node.penalize(0);
+        node.observe_answer(Duration::ZERO);
 
-        assert!(!node.is_penalized(seconds_since_start(at)));
+        assert!(!node.is_penalized(seconds_since_start(Instant::now())));
     }
 
     #[tokio::test]

@@ -86,6 +86,11 @@ pub enum SkipReason {
     Saturated,
     /// Node is serving a penalty from a failed attempt and is not being sent
     /// traffic until it expires.
+    ///
+    /// Counted per routing round, not per request: a request that walks the
+    /// table again — waiting out a rate limit, or failing open over a set where
+    /// every node is penalized — counts one skip per round, and the fail-open
+    /// round then does dial the node it just skipped.
     Penalized,
 }
 
@@ -300,12 +305,13 @@ pub fn sleeping_on_rate_limit() -> GaugeGuard {
 ///
 /// `ema_us` is reported in seconds, the base unit a Prometheus histogram of the
 /// same latency is already in, so the two are comparable without a conversion
-/// in the query. A node nothing has answered for reports the sentinel and is
-/// skipped rather than published as 4295 seconds.
+/// in the query. `None` — a node nothing has answered for — is published as
+/// `NaN`; the caller owns the sentinel that means it, so this module still does
+/// not need to know what a node is.
 ///
 /// On the macros and not on held handles: once per node per ranking round is
 /// nowhere near the rate that makes the registry hurt.
-pub fn set_node_state(node: &str, tier: u8, penalized: bool, ema_us: u32) {
+pub fn set_node_state(node: &str, tier: u8, penalized: bool, ema_us: Option<u32>) {
     gauge!(
         "rpc_node_healthy",
         "node" => node.to_owned(),
@@ -313,10 +319,12 @@ pub fn set_node_state(node: &str, tier: u8, penalized: bool, ema_us: u32) {
     )
     .set(if penalized { 0.0 } else { 1.0 });
 
-    if ema_us != u32::MAX {
-        gauge!("rpc_node_latency_ema", "node" => node.to_owned())
-            .set(f64::from(ema_us) / 1_000_000.0);
-    }
+    // `NaN` and not "skip the series": a gauge already published keeps its last
+    // value forever, so a node that goes back to unmeasured would otherwise
+    // leave a stale latency on the dashboard indefinitely. `NaN` renders as a
+    // gap, which is what "nothing has measured this" looks like.
+    gauge!("rpc_node_latency_ema", "node" => node.to_owned(), "tier" => tier.to_string())
+        .set(ema_us.map_or(f64::NAN, |us| f64::from(us) / 1_000_000.0));
 }
 
 /// Records how many nodes the latest ranking round left the router free to

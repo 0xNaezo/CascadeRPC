@@ -119,7 +119,9 @@ Smaller wins in the same loop: `lto = "fat"` + `codegen-units = 1` in the releas
 - **Token-bucket rate limiting per node** (`governor`) - provider RPS limits enforced locally, before any network I/O.
 - **Per-node concurrency caps** (`tokio::sync::Semaphore`) - a node at its `max_concurrent` is skipped, not queued on: the request spills to the next node instead of waiting for a permit.
 - **Config hot reload on SIGHUP** - node set and price lists are re-read without a restart; a reload that fails to apply is logged and dropped, and the balancer keeps serving what it already has.
-- **Zero-cost health** - node health is inferred from the traffic already flowing, so no provider credit is ever spent asking a node how it is. A failed attempt penalizes the node for 5 s; the penalty is fixed rather than exponential because a node that is still broken fails its first re-admitted request and is penalized again, which is the same backoff without the bookkeeping. `Retry-After` on a 429 extends the cooldown but cannot shorten it.
+- **Zero-cost health** - node health is inferred from the traffic already flowing, so no provider credit is ever spent asking a node how it is. A failed attempt penalizes the node for 5 s; the penalty is fixed rather than exponential because a node that is still broken fails its first re-admitted request and is penalized again, which is the same backoff without the bookkeeping. `Retry-After` on a 429 extends the cooldown but cannot shorten it, and is capped at 5 min so an upstream cannot take itself out of rotation indefinitely.
+- **A rejection is not a measurement.** Only a node that actually served the request feeds the latency average. A 404, an exhausted plan, a `method not found` - the node refused, in microseconds, and crediting that would make the node that serves nothing the fastest one in its tier and hand it all of the traffic.
+- **Every attempt has a deadline** of 500 ms, half the request budget. It is the only thing that catches a node which accepts the connection and then says nothing: a deadline longer than the request budget never fires, because the request gives up first and takes the penalty the stalled node earned down with it.
 - **Probation instead of a half-open state** - a node leaving a penalty keeps the latency it had when it broke, so it re-enters at the back of its tier and is offered a request only once the nodes ahead of it are busy. Its first successful answer clears the penalty and pulls the average back down.
 - **Fail-open** - if _every_ node is under a penalty at once (a shared outage, a DNS blip, a provider-wide 429), the request path drops the check for that request and walks the ranked list anyway rather than answering 502 with a healthy config.
 - **Graceful shutdown** - SIGINT/SIGTERM drain via `axum`'s graceful shutdown, followed by a final quota flush.
@@ -194,13 +196,13 @@ Prometheus metrics on `/metrics` (opt-in), pre-provisioned Grafana dashboard in 
 
 - `rpc_requests` / `rpc_request_duration` - client-facing outcomes and end-to-end latency histograms (p50/p95/p99).
 - `rpc_upstream_attempts` / `rpc_upstream_duration` - per-node, per-outcome attempt counters and latency (success, rate_limit, transport_error, retryable/forwarded errors).
-- `rpc_upstream_skips` - per-node counter for nodes passed over without a network call, labelled by reason: `rate_limit`, `quota_exhausted`, `method_unsupported`, `saturated`, `penalized`.
+- `rpc_upstream_skips` - per-node counter for nodes passed over on a routing round, labelled by reason: `rate_limit`, `quota_exhausted`, `method_unsupported`, `saturated`, `penalized`. A request that walks the table more than once - waiting out a rate limit, or failing open over a fully penalized set - counts a skip per round, so this counts skips and not requests.
 - `rpc_node_quota_used` / `rpc_node_quota_threshold` - credits spent this period per node, against the spillover threshold it is heading for.
 - `rpc_node_healthy`, `rpc_healthy_nodes` - which nodes are free of penalties right now, and how many.
 - `rpc_node_latency_ema` - the moving average of a node's answered attempts, in seconds, so it plots against `rpc_upstream_duration` directly.
 - `rpc_sleep_queue_size` - requests currently parked waiting for a rate-limit window.
 
-`GET /health` returns structured JSON: overall status (`ok` / `degraded` / `critical`), per-node up/down state, tier, and the latency its own traffic has measured. A node no request has reached yet reports no latency rather than a placeholder.
+`GET /health` returns structured JSON: overall status (`ok` / `degraded` / `critical`), per-node state, tier, and the latency the node's own traffic has measured. Per-node state is `up`, `down`, or `unknown` - health is inferred from traffic, so a node no request has reached yet has not been found well, it has not been asked. An `unknown` node counts as available in the summary, because the router will offer it a request, and it reports no latency rather than a placeholder.
 
 See [`monitoring/README.md`](monitoring/README.md) for the local Prometheus + Grafana docker-compose setup, or
 [`examples/full_observability`](examples/full_observability) for the same stack with the balancer containerized alongside it.
