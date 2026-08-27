@@ -2,7 +2,7 @@
 //! router walks it in, and the quota counters it bills against.
 //!
 //! Cheap to clone and cloned into every task that needs it — the state lives
-//! behind `Arc`s, so a handler, the health check loop and the flusher all see
+//! behind `Arc`s, so a handler, the ranking loop and the flusher all see
 //! the same topology and the same counters.
 //!
 //! What lives here is the state and the three operations that replace it whole:

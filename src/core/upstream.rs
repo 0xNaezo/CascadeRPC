@@ -21,14 +21,18 @@ use crate::core::node::RpcNode;
 use crate::metrics::Outcome;
 use crate::protocol::rpc_payload::RpcErrorOnly;
 
-/// Backstop on a single HTTP request to an upstream.
+/// Deadline on a single HTTP attempt against an upstream.
 ///
-/// Every caller wraps a shorter budget of its own around a request — the router
-/// its global timeout, the probe its per-attempt one — so this only bounds the
-/// case where a caller forgets to. It is deliberately the loosest of the three:
-/// a backstop that fires first would silently replace the budget the caller
-/// meant to enforce.
-pub const HTTP_BACKSTOP: Duration = Duration::from_secs(2);
+/// Deliberately shorter than the router's global budget, and it is the only
+/// thing that ever catches a node which accepts a connection and then says
+/// nothing. A deadline longer than the global budget would never fire: the
+/// router's timeout would drop this future first, taking the penalty that a
+/// stalled node has earned down with it, and the node would stay first in the
+/// routing order black-holing every request.
+///
+/// Half the global budget, so a request that loses its first node to a stall
+/// still has room to be answered by the next one.
+pub const ATTEMPT_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Upstream bodies up to this size are always parsed, larger ones only when
 /// they contain an `"error"` key. Any plausible non-JSON upstream answer (a
@@ -67,15 +71,17 @@ pub enum Attempt {
 /// Returns an error if the client cannot be initialized, e.g. a TLS backend
 /// failure.
 pub fn client() -> reqwest::Result<Client> {
-    Client::builder().timeout(HTTP_BACKSTOP).build()
+    Client::builder().timeout(ATTEMPT_TIMEOUT).build()
 }
 
 /// Performs one HTTP attempt against a node, classifies the result, and folds
 /// what it says about the node into the node.
 ///
 /// Every path out of here has recorded exactly one upstream attempt, which is
-/// what makes the `outcome` label a partition of the attempts, and has either
-/// updated the node's latency or penalized it.
+/// what makes the `outcome` label a partition of the attempts. A node that
+/// failed is penalized and a node that served the request is measured; a node
+/// that merely rejected the request is left alone, because a rejection says
+/// nothing about how well the node is running.
 pub async fn attempt(client: &Client, node: &RpcNode, body: Bytes) -> Attempt {
     let started = Instant::now();
 
@@ -89,9 +95,9 @@ pub async fn attempt(client: &Client, node: &RpcNode, body: Bytes) -> Attempt {
     match sent {
         Ok(response) => classify_response(node, response, started).await,
         Err(e) => {
-            // DNS, connection, TLS, or the client's own timeout: the node did
-            // not answer at all, which is the clearest signal it gives.
-            node.penalize(started, 0);
+            // DNS, connection, TLS, or the attempt deadline: the node did not
+            // answer at all, which is the clearest signal it gives.
+            node.penalize(0);
             node.metrics
                 .record_attempt(Outcome::TransportError, started.elapsed().as_secs_f64());
             debug!(node = %node.name, error = %e, "upstream HTTP request failed");
@@ -108,8 +114,8 @@ pub async fn attempt(client: &Client, node: &RpcNode, body: Bytes) -> Attempt {
 /// Two questions are answered here and they are not the same one. Whether the
 /// *request* is settled decides what the client gets; whether the *node* is
 /// well decides whether it keeps taking traffic. A 404 settles the request and
-/// says nothing bad about the node; a 503 says the node is unwell whether or
-/// not its body is forwarded.
+/// says nothing either way about the node; a 503 says the node is unwell
+/// whether or not its body is forwarded.
 async fn classify_response(node: &RpcNode, response: Response, started: Instant) -> Attempt {
     let status_code = response.status();
 
@@ -125,7 +131,7 @@ async fn classify_response(node: &RpcNode, response: Response, started: Instant)
         Ok(body) => body,
         Err(e) => {
             // The node accepted the request and then cut the answer short.
-            node.penalize(started, 0);
+            node.penalize(0);
             node.metrics
                 .record_attempt(Outcome::BodyError, started.elapsed().as_secs_f64());
             debug!(
@@ -139,9 +145,12 @@ async fn classify_response(node: &RpcNode, response: Response, started: Instant)
     };
 
     if is_final_status(status_code) {
-        // The request's problem, not the node's: it answered, promptly and
-        // correctly, that this body is not one it will serve.
-        node.observe_answer(started);
+        // The request's problem, not the node's, so the node is neither
+        // penalized nor credited with an answer. Crediting it would be worse
+        // than doing nothing: a node that rejects everything does so in
+        // microseconds, and the latency average is what the ranking sorts on —
+        // the node refusing every request would become the fastest one in its
+        // tier and take all of the traffic.
         node.metrics
             .record_attempt(Outcome::ForwardedHttpError, started.elapsed().as_secs_f64());
 
@@ -155,7 +164,7 @@ async fn classify_response(node: &RpcNode, response: Response, started: Instant)
                 // An RPC endpoint that answers with something other than JSON is
                 // not serving RPC right now — a gateway error page, an auth
                 // wall, a truncated body.
-                node.penalize(started, retry_after_s);
+                node.penalize(retry_after_s);
                 node.metrics
                     .record_attempt(Outcome::InvalidJson, started.elapsed().as_secs_f64());
                 debug!(
@@ -170,7 +179,8 @@ async fn classify_response(node: &RpcNode, response: Response, started: Instant)
 
         if let Some(err) = parse_error.error {
             if !is_retryable_json_rpc_error(err.code) {
-                node.observe_answer(started);
+                // A rejection, not an answer: same reasoning as a final status
+                // above. `method not found` costs the node nothing to produce.
                 node.metrics
                     .record_attempt(Outcome::ForwardedRpcError, started.elapsed().as_secs_f64());
 
@@ -179,7 +189,7 @@ async fn classify_response(node: &RpcNode, response: Response, started: Instant)
 
             // The node itself declined: out of capacity, behind on its ledger,
             // internally broken. Whichever it is, stop sending to it.
-            node.penalize(started, retry_after_s);
+            node.penalize(retry_after_s);
             node.metrics
                 .record_attempt(Outcome::RetryableRpcError, started.elapsed().as_secs_f64());
             debug!(
@@ -193,9 +203,13 @@ async fn classify_response(node: &RpcNode, response: Response, started: Instant)
     }
 
     if status_code.is_success() {
-        node.observe_answer(started);
+        // The one path that measures the node: it did the work and returned
+        // it. One clock read, shared by the average and the histogram.
+        let round_trip = started.elapsed();
+
+        node.observe_answer(round_trip);
         node.metrics
-            .record_attempt(Outcome::Success, started.elapsed().as_secs_f64());
+            .record_attempt(Outcome::Success, round_trip.as_secs_f64());
 
         return Attempt::Done(status_code, body);
     }
@@ -205,7 +219,7 @@ async fn classify_response(node: &RpcNode, response: Response, started: Instant)
     // body. The body still goes to the client — retrying it on another node
     // would not improve what this one already said — but the node is held out
     // of rotation, which is the whole point of watching for these.
-    node.penalize(started, retry_after_s);
+    node.penalize(retry_after_s);
     node.metrics
         .record_attempt(Outcome::ForwardedHttpError, started.elapsed().as_secs_f64());
 

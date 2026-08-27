@@ -181,8 +181,8 @@ mod tests {
             .collect()
     }
 
-    /// An upstream that answers `getHealth` with `ok`, so the probe round a
-    /// reload ends with returns on its first attempt instead of timing out.
+    /// An upstream that answers every request with a valid JSON-RPC body, for
+    /// the reload tests that route a request through the set they published.
     async fn spawn_ok_node() -> String {
         let app = Router::new().route(
             "/",
@@ -239,12 +239,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["fresh-b", "fresh-a"]
         );
-        assert!(
-            topology.all[0]
-                .latency
-                .ema_us
-                .load(Ordering::Relaxed)
-                == u32::MAX,
+        assert_eq!(
+            topology.all[0].latency.ema_us.load(Ordering::Relaxed),
+            crate::core::node::UNMEASURED,
             "a reload must not dial the new nodes"
         );
     }

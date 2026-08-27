@@ -15,7 +15,7 @@ use std::sync::atomic::Ordering;
 use tokio::time::{Duration, Instant, MissedTickBehavior, interval};
 use tracing::{debug, error};
 
-use crate::core::node::seconds_since_start;
+use crate::core::node::{UNMEASURED, seconds_since_start};
 use crate::core::rpc::RpcClient;
 use crate::core::topology::Topology;
 use crate::metrics;
@@ -77,11 +77,13 @@ impl RankLoop {
             let penalized = node.is_penalized(now_s);
             available += usize::from(!penalized);
 
+            let ema_us = node.latency.ema_us.load(Ordering::Relaxed);
+
             metrics::set_node_state(
                 &node.name,
                 node.tier,
                 penalized,
-                node.latency.ema_us.load(Ordering::Relaxed),
+                (ema_us != UNMEASURED).then_some(ema_us),
             );
         }
 

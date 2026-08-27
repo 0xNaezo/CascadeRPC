@@ -29,11 +29,12 @@ use crate::quotas::state::MAX_NODES;
 /// included.
 const GLOBAL_TIMEOUT: Duration = Duration::from_secs(1);
 
-// Shorter than the backstop on a single HTTP request, on purpose: one upstream
-// may not spend the whole budget on its own. The other way round the backstop
-// would fire first and this budget would never be the thing that bounds a
-// request.
-const _: () = assert!(GLOBAL_TIMEOUT.as_millis() <= upstream::HTTP_BACKSTOP.as_millis());
+// Longer than the deadline on a single HTTP attempt, on purpose: one upstream
+// may not spend the whole budget on its own, and a node that stalls has to hit
+// its own deadline while this future is still alive to record the penalty. The
+// other way round this timeout fires first, the attempt is dropped mid-flight,
+// and the stalled node is never penalized at all.
+const _: () = assert!(upstream::ATTEMPT_TIMEOUT.as_millis() < GLOBAL_TIMEOUT.as_millis());
 
 // `route` tracks the nodes a request has already tried in a `u64` bitmask, one
 // bit per quota slot. The two numbers are set in different modules, so the
