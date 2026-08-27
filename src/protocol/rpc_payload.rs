@@ -14,17 +14,6 @@ pub struct RpcErrorOnly {
     pub error: Option<RpcError>,
 }
 
-/// A `getHealth` response. Both fields default to `None`, so a body carrying
-/// neither parses and simply reads as unhealthy.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct RpcHealthResponse {
-    #[serde(default)]
-    pub result: Option<String>,
-
-    #[serde(default)]
-    pub error: Option<RpcError>,
-}
-
 /// A JSON-RPC error reduced to its code; the message is forwarded to the client
 /// inside the original body and never inspected.
 #[derive(Debug, Serialize, Deserialize)]

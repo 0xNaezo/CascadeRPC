@@ -1,10 +1,11 @@
 //! Routing one client request: pick a node, bill it, send, and decide whether
 //! the answer is final or the next node gets a turn.
 //!
-//! The order is not decided here — the health check loop publishes it and this
-//! walks it front to back, taking the first node that will accept the request.
-//! What this module owns is everything after that choice: the global time
-//! budget, quota booking, and when to give up.
+//! The order is not decided here — [`crate::core::ranking`] publishes it and
+//! this walks it front to back, taking the first node that will accept the
+//! request. What this module owns is everything after that choice: skipping the
+//! nodes serving a penalty, the global time budget, quota booking, and when to
+//! give up.
 //!
 //! What an individual answer *means* is [`crate::core::upstream`]'s job; this
 //! only acts on the verdict.
@@ -16,7 +17,7 @@ use tokio::sync::SemaphorePermit;
 use tokio::time::{Instant, timeout};
 use tracing::trace;
 
-use crate::core::node::{RpcNode, Unavailable};
+use crate::core::node::{RpcNode, Unavailable, seconds_since_start};
 use crate::core::rpc::RpcClient;
 use crate::core::upstream::{self, Attempt};
 use crate::metrics::{self, RequestOutcome, SkipReason};
@@ -131,7 +132,12 @@ impl RpcClient {
     ) -> Result<(StatusCode, Bytes), (StatusCode, Bytes)> {
         let request_started = Instant::now();
 
-        let result = self.dispatch(&body_bytes).await;
+        // The penalty clock, taken from the instant this request is already
+        // being measured against. A second read of the clock per request buys
+        // nothing at the rates this serves.
+        let result = self
+            .dispatch(&body_bytes, seconds_since_start(request_started))
+            .await;
 
         let outcome = match result {
             Ok(_) => RequestOutcome::Forwarded,
@@ -147,12 +153,16 @@ impl RpcClient {
     /// The id is resolved once, here, and stays valid for every retry round
     /// below: custom-method ids are append-only, so a SIGHUP landing mid-request
     /// can add names but never renumber the one already in hand.
-    async fn dispatch(&self, body_bytes: &Bytes) -> Result<(StatusCode, Bytes), RouteError> {
+    async fn dispatch(
+        &self,
+        body_bytes: &Bytes,
+        now_s: u32,
+    ) -> Result<(StatusCode, Bytes), RouteError> {
         let method = extract_method(body_bytes)?;
         let method_id = CUSTOM_METHODS.resolve(method);
 
         // `?` peels off the timeout layer; what is left is the routing outcome.
-        timeout(GLOBAL_TIMEOUT, self.route(body_bytes, method_id))
+        timeout(GLOBAL_TIMEOUT, self.route(body_bytes, method_id, now_s))
             .await
             .map_err(|_| RouteError::Timeout)?
     }
@@ -164,15 +174,30 @@ impl RpcClient {
     /// A node serves the request at most once, however many rounds the sleeping
     /// takes: one attempt, one quota booking. Only a rate-limited node comes
     /// back around, which is what the sleep is for.
+    ///
+    /// Nodes serving a penalty are skipped without being marked tried, so the
+    /// fail-open round below can come back for them. That check is here and not
+    /// in the ranking because a node that broke a moment ago must stop taking
+    /// traffic now rather than at the next ranking round — at this balancer's
+    /// rates a second of routing to a dead node is a hundred thousand requests
+    /// billed against a quota for nothing.
     async fn route(
         &self,
         body_bytes: &Bytes,
         method_id: usize,
+        now_s: u32,
     ) -> Result<(StatusCode, Bytes), RouteError> {
         // One bit per quota slot: `node.id` is below `MAX_NODES` by
         // construction, `assign_ids` rejects larger configs. Without it every
         // round would book the cost of a steadily failing node all over again.
         let mut tried: u64 = 0;
+
+        // Set once every node has turned out to be penalized and nothing else
+        // is left to wait for. Answering 502 while nodes are merely under a
+        // penalty the balancer itself imposed is worse than offering the
+        // request to the best of them — a shared outage, a DNS blip or a
+        // provider-wide 429 penalizes the whole set at once.
+        let mut ignore_penalty = false;
 
         loop {
             // Reloaded once per attempt round, so a config swap reaches the
@@ -182,18 +207,29 @@ impl RpcClient {
             // round-trip, and an `arc_swap` guard held across that await burns
             // one of the eight per-thread debt slots for the whole request. With
             // hundreds of tasks per worker the slots stay empty, every `load`
-            // falls back to the slow path anyway, and the writer in the health
-            // check loop pays for it too. One honest `Arc` clone per round is
+            // falls back to the slow path anyway, and the writer in the ranking
+            // loop pays for it too. One honest `Arc` clone per round is
             // cheaper than a guard nobody can afford to hold.
             let topology = self.topology.load_full();
 
             let mut best_time: Option<Duration> = None;
             let mut saturated = None;
+            let mut penalized = false;
 
-            for node in &topology.active {
+            for node in &topology.ranked {
                 let bit = 1u64 << node.id;
 
                 if tried & bit != 0 {
+                    continue;
+                }
+
+                // Deliberately not marked tried: the fail-open round comes back
+                // for these, and it walks the ranked list so it comes back for
+                // the best of them first.
+                if !ignore_penalty && node.is_penalized(now_s) {
+                    node.metrics.record_skip(SkipReason::Penalized);
+                    penalized = true;
+
                     continue;
                 }
 
@@ -237,7 +273,20 @@ impl RpcClient {
             // kept for the one case it was meant for: it happens only after
             // the request has been offered to every other node, and the global
             // budget still bounds it.
+            //
+            // A busy node is preferred over a penalized one: busy says the node
+            // is working and in demand, penalized says it answered badly.
             let Some(node) = saturated else {
+                // Fail open. Every remaining node is under a penalty, so drop
+                // the check and walk the same ranked list again — this time the
+                // penalized nodes are admitted, marked tried, and the round
+                // terminates on its own.
+                if penalized && !ignore_penalty {
+                    ignore_penalty = true;
+
+                    continue;
+                }
+
                 return Err(RouteError::AllNodesFailed);
             };
 

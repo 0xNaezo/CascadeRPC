@@ -1,13 +1,15 @@
 //! The `/health` endpoint. Its JSON shape is a contract for whatever is
 //! scraping it, so the field names are asserted explicitly.
 //!
-//! The handler reads only the per-node atomics, so these tests flip those
-//! directly instead of standing up upstreams and waiting for a health check.
+//! The handler reads only the per-node atomics, so these tests write those
+//! directly instead of standing up upstreams and driving traffic through them.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use axum::{extract::State, response::IntoResponse};
+use tokio::time::Instant;
 use cascaderpc::{core::rpc::RpcClient, server::health};
 use serde_json::Value;
 
@@ -33,8 +35,20 @@ fn set_state(client: &RpcClient, name: &str, up: bool, latency_ms: u32) {
         .find(|node| node.name == name)
         .unwrap_or_else(|| panic!("no node named {name}"));
 
-    target.status.healthy.store(up, Ordering::Relaxed);
-    target.status.latency.store(latency_ms, Ordering::Relaxed);
+    // Saturating so a test can pass the `u32::MAX` sentinel through unchanged
+    // and mean "nothing has measured this node".
+    target
+        .latency
+        .ema_us
+        .store(latency_ms.saturating_mul(1_000), Ordering::Relaxed);
+
+    if up {
+        target.penalty.until_s.store(0, Ordering::Relaxed);
+    } else {
+        // Backdated by a minute so the penalty is unambiguously live however
+        // long the test takes to reach the handler.
+        target.penalize(Instant::now() + Duration::from_mins(1), 0);
+    }
 }
 
 async fn health_json(client: &RpcClient) -> Value {

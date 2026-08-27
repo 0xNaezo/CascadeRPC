@@ -16,7 +16,7 @@ use std::time::Duration;
 
 mod common;
 
-use common::{HEALTH_OK_BODY, OK_BODY, free_port, spawn_mock};
+use common::{NO_ERROR_BODY, OK_BODY, free_port, spawn_mock};
 
 /// Absolute: the balancer runs with its working directory in a scratch folder,
 /// so every path it is handed has to be too.
@@ -214,7 +214,7 @@ where
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_balancer_serves_a_request_end_to_end() {
-    let upstream = spawn_mock(200, HEALTH_OK_BODY).await;
+    let upstream = spawn_mock(200, NO_ERROR_BODY).await;
     let scratch = Scratch::new("serve");
     let port = free_port().await;
     scratch.write_config(&config(port, false, &[("only", &upstream.url)]));
@@ -226,12 +226,12 @@ async fn the_balancer_serves_a_request_end_to_end() {
     // Config read from disk, listener bound, upstream reached, answer
     // forwarded — the whole path, with nothing stubbed.
     assert_eq!(response.status(), 200);
-    assert_eq!(response.text().await.unwrap(), HEALTH_OK_BODY);
+    assert_eq!(response.text().await.unwrap(), NO_ERROR_BODY);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sigterm_flushes_usage_before_exiting() {
-    let upstream = spawn_mock(200, HEALTH_OK_BODY).await;
+    let upstream = spawn_mock(200, NO_ERROR_BODY).await;
     let scratch = Scratch::new("flush");
     let port = free_port().await;
     scratch.write_config(&config(port, false, &[("only", &upstream.url)]));
@@ -256,7 +256,7 @@ async fn sigterm_flushes_usage_before_exiting() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn usage_survives_a_restart() {
-    let upstream = spawn_mock(200, HEALTH_OK_BODY).await;
+    let upstream = spawn_mock(200, NO_ERROR_BODY).await;
     let scratch = Scratch::new("restart");
     let port = free_port().await;
     scratch.write_config(&config(port, false, &[("only", &upstream.url)]));
@@ -278,7 +278,7 @@ async fn usage_survives_a_restart() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_restart_across_a_billing_boundary_starts_from_zero() {
-    let upstream = spawn_mock(200, HEALTH_OK_BODY).await;
+    let upstream = spawn_mock(200, NO_ERROR_BODY).await;
     let scratch = Scratch::new("rollover");
     let port = free_port().await;
     scratch.write_config(&config(port, false, &[("only", &upstream.url)]));
@@ -300,7 +300,7 @@ async fn a_restart_across_a_billing_boundary_starts_from_zero() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_corrupt_quotas_file_stops_the_process() {
-    let upstream = spawn_mock(200, HEALTH_OK_BODY).await;
+    let upstream = spawn_mock(200, NO_ERROR_BODY).await;
     let scratch = Scratch::new("corrupt");
     let port = free_port().await;
     scratch.write_config(&config(port, false, &[("only", &upstream.url)]));
@@ -355,8 +355,8 @@ async fn an_invalid_config_exits_nonzero() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sighup_applies_a_new_node_set() {
-    let first = spawn_mock(200, HEALTH_OK_BODY).await;
-    let second = spawn_mock(200, HEALTH_OK_BODY).await;
+    let first = spawn_mock(200, NO_ERROR_BODY).await;
+    let second = spawn_mock(200, NO_ERROR_BODY).await;
 
     let scratch = Scratch::new("sighup_ok");
     let port = free_port().await;
@@ -384,7 +384,7 @@ async fn sighup_applies_a_new_node_set() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sighup_with_a_broken_config_keeps_serving() {
-    let upstream = spawn_mock(200, HEALTH_OK_BODY).await;
+    let upstream = spawn_mock(200, NO_ERROR_BODY).await;
     let scratch = Scratch::new("sighup_bad");
     let port = free_port().await;
     scratch.write_config(&config(port, false, &[("only", &upstream.url)]));
@@ -404,7 +404,7 @@ async fn sighup_with_a_broken_config_keeps_serving() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_metrics_endpoint_is_off_unless_the_config_enables_it() {
-    let upstream = spawn_mock(200, HEALTH_OK_BODY).await;
+    let upstream = spawn_mock(200, NO_ERROR_BODY).await;
     let scratch = Scratch::new("metrics_off");
     let port = free_port().await;
     scratch.write_config(&config(port, false, &[("only", &upstream.url)]));
@@ -424,7 +424,7 @@ async fn the_metrics_endpoint_is_off_unless_the_config_enables_it() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn quota_gauges_are_published_at_startup() {
-    let upstream = spawn_mock(200, HEALTH_OK_BODY).await;
+    let upstream = spawn_mock(200, NO_ERROR_BODY).await;
     let scratch = Scratch::new("metrics_on");
     let port = free_port().await;
     scratch.write_config(&config(port, true, &[("only", &upstream.url)]));

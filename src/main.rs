@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
 use cascaderpc::{
-    core::{healthcheck::HealthCheckLoop, node::RpcNode, reload, rpc::RpcClient},
+    core::{node::RpcNode, ranking::RankLoop, reload, rpc::RpcClient},
     metrics,
     protocol::registry::CUSTOM_METHODS,
     provider::load_config::{Settings, build_nodes},
@@ -55,7 +55,7 @@ async fn main() -> Result<()> {
     roll_over_periods(&rpc_client);
     publish_quota_gauges(&rpc_client);
 
-    tokio::spawn(HealthCheckLoop::run_healthcheck_loop(rpc_client.clone()));
+    tokio::spawn(RankLoop::run_rank_loop(rpc_client.clone()));
     tokio::spawn(start_disk_flusher(rpc_client.clone()));
     #[cfg(unix)]
     tokio::spawn(reload::watch_sighup(

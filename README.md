@@ -83,12 +83,12 @@ These are raw proxy throughput on loopback with zero node latency - the ceiling 
 What changed, in descending order of measured impact:
 
 1. **Metric handles resolved once, not per request.** Every `counter!`/`histogram!` macro call re-emitted its metric description, and the Prometheus recorder takes a single process-wide `Mutex` to check whether that description is already registered - ~4 lock acquisitions and ~14 allocations per request, i.e. a serialization point across all workers at six figures of RPS. Descriptions now register once at startup (`metrics::describe_all`), per-node handles live in a `NodeMetrics` struct built in `RpcNode::new`, and global request handles live in a `LazyLock` array indexed by outcome. Metric names and labels are unchanged.
-2. **No `arc_swap::Guard` held across `.await`.** The router held a cheap `load()` proxy across a full upstream round-trip. `arc-swap` has only 8 fast slots per thread, so under hundreds of concurrent tasks per worker every load degraded to the slow path and slowed down the health checker's `store()` as well. The router now takes one `load_full()` per retry round.
+2. **No `arc_swap::Guard` held across `.await`.** The router held a cheap `load()` proxy across a full upstream round-trip. `arc-swap` has only 8 fast slots per thread, so under hundreds of concurrent tasks per worker every load degraded to the slow path and slowed down the ranking loop's `store()` as well. The router now takes one `load_full()` per retry round.
 3. **Response validation gated properly.** Any upstream response under 64 KB was fully deserialized just to look for an `error` key - and RPC response bodies are orders of magnitude larger than request bodies. The threshold dropped to 512 bytes (still covering every real error body and gateway junk response), and the `memchr` `Finder` for `"error"` is built once in a static instead of per response.
 4. **Method extraction without a JSON parse.** The request's `method` field is now read by a bounded leading-byte scan, with a fallback to `serde_json` for anything unusual (escapes, batch bodies, missing key), so correctness comes free from the slow path.
-5. **`RpcNode` layout: five fewer allocations, no false sharing.** The node's limiter, semaphore, health flag and latency were each behind their own `Arc` inside a node that is itself always `Arc<RpcNode>` - five allocations, five pointer hops, and no padding, so one node's health flag could share a cache line with another node's token bucket. The fields are inline now, split across two `#[repr(align(64))]` cells: `NodeLimits` (written on every attempt) and `NodeStatus` (written once per health round, read on every ranking).
+5. **`RpcNode` layout: five fewer allocations, no false sharing.** The node's limiter, semaphore, health flag and latency were each behind their own `Arc` inside a node that is itself always `Arc<RpcNode>` - five allocations, five pointer hops, and no padding, so one node's health flag could share a cache line with another node's token bucket. The fields are inline now, split across three `#[repr(align(64))]` cells by write frequency: `NodeLimits` (written on every admission), `NodeLatency` (written on every answer), and `NodePenalty` (read on every request, written only on a failure, so the line stays shared across cores instead of ping-ponging).
 
-Smaller wins in the same loop: `lto = "fat"` + `codegen-units = 1` in the release profile; `release_max_level_info` compiling `trace!`/`debug!` out of release builds; a `const` `HeaderValue` for `content-type` instead of re-validating the string per request; `is_final_status` as a `matches!` instead of a 26-element linear scan; `State<Arc<RpcClient>>` instead of cloning four `Arc`s per request; a single `DefaultClock` static shared by every limiter instead of one constructed per rate-limited attempt; and a `Bytes::from_static` health-probe body instead of `json!` + `to_string()` per probe.
+Smaller wins in the same loop: `lto = "fat"` + `codegen-units = 1` in the release profile; `release_max_level_info` compiling `trace!`/`debug!` out of release builds; a `const` `HeaderValue` for `content-type` instead of re-validating the string per request; `is_final_status` as a `matches!` instead of a 26-element linear scan; `State<Arc<RpcClient>>` instead of cloning four `Arc`s per request; a single `DefaultClock` static shared by every limiter instead of one constructed per rate-limited attempt.
 
 > The Run 1 / Run 2 figures above were measured before this pass and are kept as the baseline they were; they are not a measurement of the current code.
 
@@ -96,12 +96,12 @@ Smaller wins in the same loop: `lto = "fat"` + `codegen-units = 1` in the releas
 
 ## Why it's fast
 
-- **Lock-free routing table (`arc-swap`).** The hot path never takes a lock: every request does an atomic pointer load of the current routing table. The health-check loop builds a new table off to the side and swaps it in atomically.
+- **Lock-free routing table (`arc-swap`).** The hot path never takes a lock: every request does an atomic pointer load of the current routing table. The ranking loop builds a new table off to the side and swaps it in atomically.
 - **Zero-copy request forwarding.** The client's request body is captured as `Bytes` and proxied to upstream as-is - no deserialization, no re-serialization, cheap reference-counted clones between retries.
 - **Minimal response parsing.** Upstream responses are only deserialized into a tiny `error`-field-only struct (`RpcErrorOnly`) - just enough to decide "forward or retry", and only when the body is small or actually contains `"error"`. The response body itself is passed back to the client untouched.
 - **Pricing is an array index.** Each provider's TOML is compiled once into a flat `ProviderCostTable`; the method name is resolved to an id once per request, and pricing an attempt on any node is one bounds-checked load.
 - **Metrics off the registry.** Every counter and histogram handle is resolved at construction time, so recording an attempt is an atomic increment, not a registry lookup behind a global mutex.
-- **Concurrent burst health probing.** Every 10 s a `JoinSet` probes all nodes in parallel (3 attempts, 500 ms timeout each), then sorts survivors by `(tier, measured latency)` and publishes the new table.
+- **Zero-cost passive probing.** There is no probe traffic and no health endpoint being polled. Every request a client pays for is also the measurement: an answered attempt folds its round trip into the node's latency EMA (an integer shift, no float, on a cache line of its own), and a 429, a 5xx, a timeout or an unparseable body takes the node out of rotation on the spot. Once a second a loop re-sorts the table by `(tier, latency EMA)` from atomics it already has - it never dials anything.
 - **Smart fallback state machine.** Per request:
   1. **Fail-fast** - walk the sorted node list; skip any node whose token bucket is empty (no network call, remember its earliest-refill time), whose concurrency permits are all in use, whose monthly quota is spent, or which does not price the requested method.
   2. **Earliest-available wait** - if _every_ node is rate-limited, sleep exactly until the soonest bucket refills (minimum `NotUntil` from `governor`), not a fixed backoff.
@@ -119,8 +119,9 @@ Smaller wins in the same loop: `lto = "fat"` + `codegen-units = 1` in the releas
 - **Token-bucket rate limiting per node** (`governor`) - provider RPS limits enforced locally, before any network I/O.
 - **Per-node concurrency caps** (`tokio::sync::Semaphore`) - a node at its `max_concurrent` is skipped, not queued on: the request spills to the next node instead of waiting for a permit.
 - **Config hot reload on SIGHUP** - node set and price lists are re-read without a restart; a reload that fails to apply is logged and dropped, and the balancer keeps serving what it already has.
-- **Anti-flapping health checks** - 3 probes per cycle before declaring a node healthy; state transitions logged once, not spammed.
-- **Fail-open** - if _all_ nodes fail their health checks (e.g. a monitoring artifact), the balancer keeps routing to the full node list rather than going dark.
+- **Zero-cost health** - node health is inferred from the traffic already flowing, so no provider credit is ever spent asking a node how it is. A failed attempt penalizes the node for 5 s; the penalty is fixed rather than exponential because a node that is still broken fails its first re-admitted request and is penalized again, which is the same backoff without the bookkeeping. `Retry-After` on a 429 extends the cooldown but cannot shorten it.
+- **Probation instead of a half-open state** - a node leaving a penalty keeps the latency it had when it broke, so it re-enters at the back of its tier and is offered a request only once the nodes ahead of it are busy. Its first successful answer clears the penalty and pulls the average back down.
+- **Fail-open** - if _every_ node is under a penalty at once (a shared outage, a DNS blip, a provider-wide 429), the request path drops the check for that request and walks the ranked list anyway rather than answering 502 with a healthy config.
 - **Graceful shutdown** - SIGINT/SIGTERM drain via `axum`'s graceful shutdown, followed by a final quota flush.
 - **Config via TOML + env** - API keys are injected with `$VAR` substitution in URLs, never stored in config files.
 
@@ -193,12 +194,13 @@ Prometheus metrics on `/metrics` (opt-in), pre-provisioned Grafana dashboard in 
 
 - `rpc_requests` / `rpc_request_duration` - client-facing outcomes and end-to-end latency histograms (p50/p95/p99).
 - `rpc_upstream_attempts` / `rpc_upstream_duration` - per-node, per-outcome attempt counters and latency (success, rate_limit, transport_error, retryable/forwarded errors).
-- `rpc_upstream_skips` - per-node counter for nodes passed over without a network call, labelled by reason: `rate_limit`, `quota_exhausted`, `method_unsupported`, `saturated`.
+- `rpc_upstream_skips` - per-node counter for nodes passed over without a network call, labelled by reason: `rate_limit`, `quota_exhausted`, `method_unsupported`, `saturated`, `penalized`.
 - `rpc_node_quota_used` / `rpc_node_quota_threshold` - credits spent this period per node, against the spillover threshold it is heading for.
-- `rpc_node_healthy`, `rpc_healthy_nodes`, `rpc_healthcheck_duration` - health-check state and timing.
+- `rpc_node_healthy`, `rpc_healthy_nodes` - which nodes are free of penalties right now, and how many.
+- `rpc_node_latency_ema` - the moving average of a node's answered attempts, in seconds, so it plots against `rpc_upstream_duration` directly.
 - `rpc_sleep_queue_size` - requests currently parked waiting for a rate-limit window.
 
-`GET /health` returns structured JSON: overall status (`ok` / `degraded` / `critical`), per-node up/down state, tier, and last measured latency.
+`GET /health` returns structured JSON: overall status (`ok` / `degraded` / `critical`), per-node up/down state, tier, and the latency its own traffic has measured. A node no request has reached yet reports no latency rather than a placeholder.
 
 See [`monitoring/README.md`](monitoring/README.md) for the local Prometheus + Grafana docker-compose setup, or
 [`examples/full_observability`](examples/full_observability) for the same stack with the balancer containerized alongside it.

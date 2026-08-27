@@ -13,7 +13,7 @@
 //! then looks the key up in the registry. At request rates that mutex is the
 //! serialization point of the whole server. A `Counter` is an `Arc`-like handle
 //! straight to the storage — `increment` touches neither the registry nor the
-//! lock. What stays on the macros is what fires once a probe round or once a
+//! lock. What stays on the macros is what fires once a ranking round or once a
 //! minute, where the cost is not worth a handle to hold.
 //!
 //! Nothing here knows what a node or a request is — [`NodeMetrics`] is built
@@ -84,14 +84,18 @@ pub enum SkipReason {
     /// Node was at its concurrency cap, so the request went to the next node
     /// instead of queueing on this one.
     Saturated,
+    /// Node is serving a penalty from a failed attempt and is not being sent
+    /// traffic until it expires.
+    Penalized,
 }
 
 impl SkipReason {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::RateLimit,
         Self::QuotaExhausted,
         Self::MethodUnsupported,
         Self::Saturated,
+        Self::Penalized,
     ];
     const COUNT: usize = Self::ALL.len();
 
@@ -101,6 +105,7 @@ impl SkipReason {
             Self::QuotaExhausted => "quota_exhausted",
             Self::MethodUnsupported => "method_unsupported",
             Self::Saturated => "saturated",
+            Self::Penalized => "penalized",
         }
     }
 }
@@ -285,33 +290,37 @@ pub fn sleeping_on_rate_limit() -> GaugeGuard {
     GaugeGuard::new(SLEEP_QUEUE.clone())
 }
 
-/// Records one health probe: how long it took, and the verdict it reached.
+/// Publishes what real traffic currently says about one node: whether it is
+/// serving a penalty, and the latency average its answers have built up.
 ///
-/// The verdict is a gauge and not a counter because that is the question asked
-/// of it — "is this node up right now" — and the histogram beside it is what
-/// says whether a node about to be marked down is merely slow.
+/// Gauges and not counters because that is the question asked of them — "is
+/// this node taking traffic right now, and how fast is it" — and the two are
+/// published together so a node marked down can be read against how slow it had
+/// become first.
 ///
-/// On the macros and not on held handles: one probe round per node per
-/// interval is nowhere near the rate that makes the registry hurt.
-pub fn record_probe(node: &str, tier: u8, healthy: bool, duration_seconds: f64) {
-    let outcome = if healthy { "healthy" } else { "unhealthy" };
-
-    histogram!(
-        "rpc_healthcheck_duration",
-        "node" => node.to_owned(),
-        "outcome" => outcome,
-    )
-    .record(duration_seconds);
+/// `ema_us` is reported in seconds, the base unit a Prometheus histogram of the
+/// same latency is already in, so the two are comparable without a conversion
+/// in the query. A node nothing has answered for reports the sentinel and is
+/// skipped rather than published as 4295 seconds.
+///
+/// On the macros and not on held handles: once per node per ranking round is
+/// nowhere near the rate that makes the registry hurt.
+pub fn set_node_state(node: &str, tier: u8, penalized: bool, ema_us: u32) {
     gauge!(
         "rpc_node_healthy",
         "node" => node.to_owned(),
         "tier" => tier.to_string(),
     )
-    .set(if healthy { 1.0 } else { 0.0 });
+    .set(if penalized { 0.0 } else { 1.0 });
+
+    if ema_us != u32::MAX {
+        gauge!("rpc_node_latency_ema", "node" => node.to_owned())
+            .set(f64::from(ema_us) / 1_000_000.0);
+    }
 }
 
-/// Records how many nodes the latest probe round left the router to choose
-/// from.
+/// Records how many nodes the latest ranking round left the router free to
+/// choose from.
 pub fn set_healthy_nodes(count: usize) {
     gauge!("rpc_healthy_nodes").set(u32::try_from(count).unwrap_or(u32::MAX));
 }
@@ -369,18 +378,18 @@ pub fn describe_all() {
         "rpc_sleep_queue_size",
         "Number of requests currently sleeping while all RPC nodes are rate-limited"
     );
-    describe_histogram!(
-        "rpc_healthcheck_duration",
-        Unit::Seconds,
-        "Time spent completing an RPC node healthcheck"
-    );
     describe_gauge!(
         "rpc_node_healthy",
-        "Whether an RPC node passed its latest healthcheck"
+        "Whether an RPC node is free of penalties from its recent traffic"
     );
     describe_gauge!(
         "rpc_healthy_nodes",
-        "Number of RPC nodes that passed the latest healthcheck"
+        "Number of RPC nodes not currently serving a penalty"
+    );
+    describe_gauge!(
+        "rpc_node_latency_ema",
+        Unit::Seconds,
+        "Moving average of an RPC node's answered attempts"
     );
     describe_gauge!(
         "rpc_node_quota_used",

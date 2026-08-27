@@ -135,7 +135,7 @@ entirely by the free tier-2 node. `critical` means nothing is left to route to.
 | **Why did traffic skip a node?**                     | `rpc_upstream_skips` by `node` and `reason`: `rate_limit`, `quota_exhausted`, `method_unsupported`, `saturated`                                                                   |
 | How close is a node to dropping out?                 | `rpc_node_quota_used` against `rpc_node_quota_threshold`, both by `node`                                                                                                          |
 | Is a node up? How many are?                          | `rpc_node_healthy` by `node`, `rpc_healthy_nodes`                                                                                                                                 |
-| Are health checks themselves slow?                   | `rpc_healthcheck_duration`                                                                                                                                                        |
+| Is a node getting slower?                            | `rpc_node_latency_ema` by `node`                                                                                                                                                  |
 | Are requests parked waiting for a rate-limit window? | `rpc_sleep_queue_size`                                                                                                                                                            |
 
 Counters appear on the scrape with a `_total` suffix, as Prometheus convention

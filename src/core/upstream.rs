@@ -1,21 +1,21 @@
-//! Talking to one upstream node: send the body, and decide what the answer
-//! means.
+//! Talking to one upstream node: send the body, decide what the answer means,
+//! and record what it says about the node.
 //!
-//! Shared by the router and the health probe, which is the reason it is a
-//! module of free functions and not more methods on the client: neither of them
-//! needs anything from the balancer's state to make one HTTP request.
+//! This is the balancer's only source of health information. There is no probe
+//! traffic: every attempt a client pays for is also the measurement, folded
+//! into the node's latency average when it answers and turned into a penalty
+//! when it does not. See [`RpcNode::observe_answer`] and [`RpcNode::penalize`].
 //!
 //! Nothing here chooses a node or retries — that is [`crate::core::router`].
 
 use bytes::Bytes;
 use memchr::memmem;
-use reqwest::header::{CONTENT_TYPE, HeaderValue};
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER};
 use reqwest::{Client, Response, StatusCode};
 use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::time::Instant;
 use tracing::debug;
-use url::Url;
 
 use crate::core::node::RpcNode;
 use crate::metrics::Outcome;
@@ -70,33 +70,28 @@ pub fn client() -> reqwest::Result<Client> {
     Client::builder().timeout(HTTP_BACKSTOP).build()
 }
 
-/// Posts a body to one upstream URL, verbatim. Takes the URL rather than a node
-/// because the health probe has no request to bill and no node state to touch.
-///
-/// # Errors
-///
-/// Returns an error if the request cannot be completed at all: DNS, connection,
-/// TLS, or the client's own timeout. An HTTP error status is a completed
-/// request and comes back as `Ok`.
-pub async fn post(client: &Client, body: Bytes, url: Url) -> reqwest::Result<Response> {
-    client
-        .post(url)
-        .header(CONTENT_TYPE, JSON)
-        .body(body)
-        .send()
-        .await
-}
-
-/// Performs one HTTP attempt against a node and classifies the result.
+/// Performs one HTTP attempt against a node, classifies the result, and folds
+/// what it says about the node into the node.
 ///
 /// Every path out of here has recorded exactly one upstream attempt, which is
-/// what makes the `outcome` label a partition of the attempts.
+/// what makes the `outcome` label a partition of the attempts, and has either
+/// updated the node's latency or penalized it.
 pub async fn attempt(client: &Client, node: &RpcNode, body: Bytes) -> Attempt {
     let started = Instant::now();
 
-    match post(client, body, node.url.clone()).await {
+    let sent = client
+        .post(node.url.clone())
+        .header(CONTENT_TYPE, JSON)
+        .body(body)
+        .send()
+        .await;
+
+    match sent {
         Ok(response) => classify_response(node, response, started).await,
         Err(e) => {
+            // DNS, connection, TLS, or the client's own timeout: the node did
+            // not answer at all, which is the clearest signal it gives.
+            node.penalize(started, 0);
             node.metrics
                 .record_attempt(Outcome::TransportError, started.elapsed().as_secs_f64());
             debug!(node = %node.name, error = %e, "upstream HTTP request failed");
@@ -107,13 +102,30 @@ pub async fn attempt(client: &Client, node: &RpcNode, body: Bytes) -> Attempt {
 }
 
 /// Decides whether an upstream response is final or the next node should be
-/// tried, recording the per-attempt metrics for either case.
+/// tried, recording the per-attempt metrics and the node's health for either
+/// case.
+///
+/// Two questions are answered here and they are not the same one. Whether the
+/// *request* is settled decides what the client gets; whether the *node* is
+/// well decides whether it keeps taking traffic. A 404 settles the request and
+/// says nothing bad about the node; a 503 says the node is unwell whether or
+/// not its body is forwarded.
 async fn classify_response(node: &RpcNode, response: Response, started: Instant) -> Attempt {
     let status_code = response.status();
+
+    // Read before the body is consumed, and only on the one status that carries
+    // it — a header lookup on every response buys nothing.
+    let retry_after_s = if status_code == StatusCode::TOO_MANY_REQUESTS {
+        retry_after_secs(response.headers())
+    } else {
+        0
+    };
 
     let body = match response.bytes().await {
         Ok(body) => body,
         Err(e) => {
+            // The node accepted the request and then cut the answer short.
+            node.penalize(started, 0);
             node.metrics
                 .record_attempt(Outcome::BodyError, started.elapsed().as_secs_f64());
             debug!(
@@ -127,6 +139,9 @@ async fn classify_response(node: &RpcNode, response: Response, started: Instant)
     };
 
     if is_final_status(status_code) {
+        // The request's problem, not the node's: it answered, promptly and
+        // correctly, that this body is not one it will serve.
+        node.observe_answer(started);
         node.metrics
             .record_attempt(Outcome::ForwardedHttpError, started.elapsed().as_secs_f64());
 
@@ -137,6 +152,10 @@ async fn classify_response(node: &RpcNode, response: Response, started: Instant)
         let parse_error: RpcErrorOnly = match serde_json::from_slice(body.as_ref()) {
             Ok(res) => res,
             Err(e) => {
+                // An RPC endpoint that answers with something other than JSON is
+                // not serving RPC right now — a gateway error page, an auth
+                // wall, a truncated body.
+                node.penalize(started, retry_after_s);
                 node.metrics
                     .record_attempt(Outcome::InvalidJson, started.elapsed().as_secs_f64());
                 debug!(
@@ -151,12 +170,16 @@ async fn classify_response(node: &RpcNode, response: Response, started: Instant)
 
         if let Some(err) = parse_error.error {
             if !is_retryable_json_rpc_error(err.code) {
+                node.observe_answer(started);
                 node.metrics
                     .record_attempt(Outcome::ForwardedRpcError, started.elapsed().as_secs_f64());
 
                 return Attempt::Done(status_code, body);
             }
 
+            // The node itself declined: out of capacity, behind on its ledger,
+            // internally broken. Whichever it is, stop sending to it.
+            node.penalize(started, retry_after_s);
             node.metrics
                 .record_attempt(Outcome::RetryableRpcError, started.elapsed().as_secs_f64());
             debug!(
@@ -169,15 +192,38 @@ async fn classify_response(node: &RpcNode, response: Response, started: Instant)
         }
     }
 
-    let outcome = if status_code.is_success() {
-        Outcome::Success
-    } else {
-        Outcome::ForwardedHttpError
-    };
+    if status_code.is_success() {
+        node.observe_answer(started);
+        node.metrics
+            .record_attempt(Outcome::Success, started.elapsed().as_secs_f64());
+
+        return Attempt::Done(status_code, body);
+    }
+
+    // A status that is neither final nor a success, over a body carrying no
+    // JSON-RPC error of its own: a 429 or a 5xx with a plain-text or empty
+    // body. The body still goes to the client — retrying it on another node
+    // would not improve what this one already said — but the node is held out
+    // of rotation, which is the whole point of watching for these.
+    node.penalize(started, retry_after_s);
     node.metrics
-        .record_attempt(outcome, started.elapsed().as_secs_f64());
+        .record_attempt(Outcome::ForwardedHttpError, started.elapsed().as_secs_f64());
 
     Attempt::Done(status_code, body)
+}
+
+/// How many seconds an upstream asked to be left alone for, or `0` when it
+/// asked for nothing this can act on.
+///
+/// Delta-seconds only. `Retry-After` may also carry an HTTP-date, which fails
+/// the parse here and falls back to the balancer's own penalty — a date is rare
+/// from an RPC provider, and the fallback is the same order of magnitude.
+fn retry_after_secs(headers: &HeaderMap) -> u32 {
+    headers
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(0)
 }
 
 /// Whether an HTTP status settles the request on its own, with no reason to
@@ -265,5 +311,32 @@ mod tests {
         assert!(is_retryable_json_rpc_error(-32000)); // server error
         assert!(is_retryable_json_rpc_error(-32603)); // internal error
         assert!(is_retryable_json_rpc_error(0)); // no error
+    }
+
+    fn headers_with(retry_after: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_str(retry_after).unwrap());
+
+        headers
+    }
+
+    #[test]
+    fn retry_after_reads_delta_seconds() {
+        assert_eq!(retry_after_secs(&headers_with("30")), 30);
+        // Providers do pad the value; a header the balancer cannot read is a
+        // cooldown it silently shortens to its own default.
+        assert_eq!(retry_after_secs(&headers_with(" 30 ")), 30);
+    }
+
+    #[test]
+    fn retry_after_falls_back_to_zero_on_anything_else() {
+        // Absent, an HTTP-date, or nonsense: the caller applies its own penalty
+        // rather than reading a zero cooldown out of an unparseable header.
+        assert_eq!(retry_after_secs(&HeaderMap::new()), 0);
+        assert_eq!(
+            retry_after_secs(&headers_with("Wed, 21 Oct 2015 07:28:00 GMT")),
+            0
+        );
+        assert_eq!(retry_after_secs(&headers_with("-5")), 0);
     }
 }

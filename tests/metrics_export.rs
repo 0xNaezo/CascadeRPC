@@ -353,8 +353,8 @@ async fn an_unlimited_node_reports_a_threshold_it_cannot_reach() {
 async fn the_node_health_gauge_carries_the_tier_label() {
     handle();
 
-    metrics::record_probe("p-up", 2, true, 0.01);
-    metrics::record_probe("p-down", 0, false, 0.5);
+    metrics::set_node_state("p-up", 2, false, 12_000);
+    metrics::set_node_state("p-down", 0, true, 500_000);
 
     // The tier is on the gauge so an alert can say "every tier-0 node is down"
     // without joining against the config.
@@ -367,14 +367,28 @@ async fn the_node_health_gauge_carries_the_tier_label() {
         0.0
     );
 
-    // The histogram beside it is what says whether a node about to be marked
-    // down is merely slow.
+    // The average beside it is what says whether a node about to be penalized
+    // had merely become slow, and it is published in seconds so it compares
+    // directly against `rpc_upstream_duration`.
     assert_eq!(
-        expect_series(
-            "rpc_healthcheck_duration_seconds_count",
-            &[r#"node="p-down""#, r#"outcome="unhealthy""#]
-        ),
-        1.0
+        expect_series("rpc_node_latency_ema", &[r#"node="p-down""#]),
+        0.5
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_node_nothing_has_answered_for_publishes_no_latency() {
+    handle();
+
+    metrics::set_node_state("p-fresh", 0, false, u32::MAX);
+
+    // The sentinel would render as 4295 seconds, which reads on a dashboard as
+    // a node that is up and catastrophically slow rather than as one no request
+    // has reached yet.
+    assert!(
+        !scrape().contains(r#"rpc_node_latency_ema{node="p-fresh"}"#),
+        "the unmeasured sentinel was published as a latency"
     );
 }
 
@@ -404,7 +418,7 @@ async fn every_metric_renders_help_and_type() {
     node.record_attempt(Outcome::Success, 0.01);
     node.record_skip(SkipReason::RateLimit);
     metrics::record_request(RequestOutcome::Forwarded, 0.01);
-    metrics::record_probe("h-node", 0, true, 0.01);
+    metrics::set_node_state("h-node", 0, false, 10_000);
     metrics::set_healthy_nodes(1);
     metrics::set_node_quota("h-node", 1, 2);
     drop(metrics::sleeping_on_rate_limit());
@@ -417,7 +431,7 @@ async fn every_metric_renders_help_and_type() {
         "rpc_requests",
         "rpc_request_duration",
         "rpc_sleep_queue_size",
-        "rpc_healthcheck_duration",
+        "rpc_node_latency_ema",
         "rpc_node_healthy",
         "rpc_healthy_nodes",
         "rpc_upstream_skips",

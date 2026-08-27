@@ -7,7 +7,7 @@
 use anyhow::Result;
 use tracing::{error, info, warn};
 
-use crate::core::{healthcheck::HealthCheckLoop, rpc::RpcClient};
+use crate::core::rpc::RpcClient;
 use crate::protocol::registry::CUSTOM_METHODS;
 use crate::provider::load_config::{ServerSettings, Settings, build_nodes};
 
@@ -62,11 +62,11 @@ async fn reload_once(rpc_client: &RpcClient, startup_server: &ServerSettings) ->
     let nodes = build_nodes(settings.nodes, &CUSTOM_METHODS)?;
     let node_count = nodes.len();
 
+    // Publishing is all a reload has to do. There is no health to measure up
+    // front any more: a fresh node is ranked last until its first answer
+    // measures it, and the request path reaches it as soon as the nodes ahead
+    // are busy.
     rpc_client.reload(nodes).await?;
-
-    // The new nodes carry default health, so measure it now instead of routing
-    // on the default until the periodic loop's next tick.
-    HealthCheckLoop::run_once(rpc_client).await;
 
     Ok(node_count)
 }
@@ -218,23 +218,35 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn a_reload_measures_health_before_returning() {
+    async fn a_reload_publishes_a_ranked_table_without_dialling_anything() {
         let url = spawn_ok_node().await;
         let rpc_client = client("old", &url);
 
-        let dir = TempDir::new("reload_probe");
-        dir.config(&config_for(&[("fresh", &url)]));
+        let dir = TempDir::new("reload_ranked");
+        dir.config(&config_for(&[("fresh-b", &url), ("fresh-a", &url)]));
 
         reload_once(&rpc_client, &server()).await.unwrap();
 
-        // A brand-new node carries nothing but default health; without the
-        // probe round the router would rank it on `u32::MAX` for a whole tick.
-        let latency = rpc_client.topology.load().all[0]
-            .status
-            .latency
-            .load(Ordering::Relaxed);
-
-        assert_ne!(latency, u32::MAX, "the reload did not probe the new nodes");
+        // The reload returns a table the router can walk immediately, and every
+        // fresh node is unmeasured, so the ranking holds the config order
+        // rather than inventing one.
+        let topology = rpc_client.topology.load();
+        assert_eq!(
+            topology
+                .ranked
+                .iter()
+                .map(|node| node.name.as_str())
+                .collect::<Vec<_>>(),
+            ["fresh-b", "fresh-a"]
+        );
+        assert!(
+            topology.all[0]
+                .latency
+                .ema_us
+                .load(Ordering::Relaxed)
+                == u32::MAX,
+            "a reload must not dial the new nodes"
+        );
     }
 
     #[tokio::test]

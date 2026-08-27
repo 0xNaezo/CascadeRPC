@@ -19,10 +19,11 @@ use governor::{
 use std::{
     num::NonZeroU32,
     sync::LazyLock,
-    sync::atomic::{AtomicBool, AtomicU32},
+    sync::atomic::{AtomicU32, Ordering},
     time::Duration,
 };
 use tokio::sync::{Semaphore, SemaphorePermit};
+use tokio::time::Instant;
 use url::Url;
 
 use crate::metrics::NodeMetrics;
@@ -42,6 +43,46 @@ pub type DefaultDirectRateLimiter<MW = NoOpMiddleware<<DefaultClock as Clock>::I
 /// bucket's own timestamps and the wait time reported for it on one source
 /// instead of two instances that merely happen to agree.
 static CLOCK: LazyLock<DefaultClock> = LazyLock::new(DefaultClock::default);
+
+/// The instant every penalty deadline is measured from.
+///
+/// Deadlines are seconds since this point and not wall-clock time: a penalty is
+/// an interval, and `SystemTime` is not monotonic — an NTP step backwards would
+/// strand a node in its penalty for hours, one forwards would clear it at once.
+///
+/// Seconds and not milliseconds because nothing reads finer: the penalty is
+/// [`PENALTY_SECS`] long and `Retry-After` is delta-seconds by specification.
+/// It also puts the `u32` wrap 136 years out instead of 49.7 days.
+static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// How long a node stays out of rotation after one failed attempt.
+///
+/// Fixed, not exponential: a node that is still broken fails its first
+/// re-admitted attempt and is penalized again, so the backoff falls out of the
+/// cycle for free. A permanently dead node costs 12 attempts a minute, which is
+/// nothing next to the counter and the reset that an explicit exponent needs.
+const PENALTY_SECS: u32 = 5;
+
+/// The EMA's smoothing shift: `alpha = 1 / 2^LATENCY_SHIFT`.
+///
+/// A shift and not a float multiply — this runs on every answered attempt.
+const LATENCY_SHIFT: u32 = 3;
+
+/// Latency of a node nothing has measured yet. Sorts last in
+/// [`crate::core::topology::Topology::rank`], so an unknown node is offered the
+/// request only once every measured one has turned it down.
+const UNMEASURED: u32 = u32::MAX;
+
+/// Seconds from [`EPOCH`] to `at`, the unit every penalty deadline is in.
+///
+/// Takes the instant rather than reading the clock: both callers already have
+/// one — the router the instant it stamped the request with, the upstream layer
+/// the instant it started the attempt at — and a clock read per request is not
+/// free at the rates this balancer is built for.
+#[must_use]
+pub fn seconds_since_start(at: Instant) -> u32 {
+    u32::try_from(at.saturating_duration_since(*EPOCH).as_secs()).unwrap_or(u32::MAX)
+}
 
 /// What [`RpcNode::new`] needs to build a node, gathered into one struct
 /// because the list is long enough that positional arguments stop being
@@ -74,14 +115,30 @@ pub struct NodeLimits {
     pub concurrency: Semaphore,
 }
 
-/// What the last probe measured for a node, on a cache line of its own.
+/// The latency a node's own traffic has measured for it, on a cache line of
+/// its own.
 ///
-/// Written once per health round and read on every ranking — the opposite
-/// traffic to [`NodeLimits`], which is why the two do not share a line.
+/// Write-hot: every answered attempt updates it. Read only by the ranking loop,
+/// once a second. It sits apart from [`NodePenalty`] for exactly that reason —
+/// sharing a line would invalidate the penalty on every answer, and the penalty
+/// is read by every request.
 #[repr(align(64))]
-pub struct NodeStatus {
-    pub healthy: AtomicBool,
-    pub latency: AtomicU32,
+pub struct NodeLatency {
+    /// Exponential moving average of answered attempts, in microseconds.
+    /// [`UNMEASURED`] until the node answers for the first time.
+    pub ema_us: AtomicU32,
+}
+
+/// How long a node is held out of rotation, on a cache line of its own.
+///
+/// Read-mostly, the opposite traffic to [`NodeLatency`]: every request reads it
+/// while only a failed attempt writes it, so the line stays shared across cores
+/// and the read costs nothing beyond an L1 hit.
+#[repr(align(64))]
+pub struct NodePenalty {
+    /// Seconds from [`EPOCH`] until which the node is skipped. `0` means the
+    /// node has never failed.
+    pub until_s: AtomicU32,
 }
 
 /// Why a node cannot take an attempt right now.
@@ -110,7 +167,8 @@ pub struct RpcNode {
     pub url: Url,
     pub limits: NodeLimits,
     pub tier: u8,
-    pub status: NodeStatus,
+    pub latency: NodeLatency,
+    pub penalty: NodePenalty,
     pub method_costs: ProviderCostTable,
     /// Usage past which the router stops routing to this node: `monthly_limit`
     /// scaled by `spillover_percent`. Traffic spills to the next tier a little
@@ -125,8 +183,8 @@ pub struct RpcNode {
 }
 
 impl RpcNode {
-    /// Creates a node with no quota slot yet and no measured latency, assumed
-    /// healthy until the first probe says otherwise.
+    /// Creates a node with no quota slot yet, no measured latency and no
+    /// penalty against it.
     ///
     /// # Errors
     ///
@@ -161,9 +219,11 @@ impl RpcNode {
                 concurrency: Semaphore::new(config.max_concurrent),
             },
             tier: config.tier,
-            status: NodeStatus {
-                healthy: AtomicBool::new(true),
-                latency: AtomicU32::new(u32::MAX),
+            latency: NodeLatency {
+                ema_us: AtomicU32::new(UNMEASURED),
+            },
+            penalty: NodePenalty {
+                until_s: AtomicU32::new(0),
             },
             method_costs: config.method_costs,
             spillover_threshold,
@@ -214,6 +274,66 @@ impl RpcNode {
             .rate_limiting
             .check()
             .map_err(|err| err.wait_time_from(CLOCK.now()))
+    }
+
+    /// Whether the node is serving out a penalty at `now_s`.
+    ///
+    /// One relaxed load of a read-mostly cache line, and the only thing the
+    /// request path asks about a node's health. `now_s` comes in from the
+    /// caller — see [`seconds_since_start`].
+    #[must_use]
+    pub fn is_penalized(&self, now_s: u32) -> bool {
+        now_s < self.penalty.until_s.load(Ordering::Relaxed)
+    }
+
+    /// Folds one answered attempt into the node's latency, and clears any
+    /// penalty standing against it.
+    ///
+    /// `started` is the instant the attempt began, which the caller already
+    /// holds for its own metrics — measuring the round trip costs no extra
+    /// clock read.
+    ///
+    /// The read-modify-write is three relaxed operations and not a CAS loop: a
+    /// lost update under concurrency drops one sample out of an average, which
+    /// is the kind of error an average is made of. Paying a retry loop per
+    /// answer to avoid it would be the more expensive mistake.
+    pub fn observe_answer(&self, started: Instant) {
+        let sample_us = u32::try_from(started.elapsed().as_micros()).unwrap_or(UNMEASURED - 1);
+
+        let ema_us = self.latency.ema_us.load(Ordering::Relaxed);
+        let next_us = if ema_us == UNMEASURED {
+            sample_us
+        } else {
+            (ema_us - (ema_us >> LATENCY_SHIFT)).saturating_add(sample_us >> LATENCY_SHIFT)
+        };
+
+        self.latency.ema_us.store(next_us, Ordering::Relaxed);
+
+        // Guarded so the common path leaves the read-mostly penalty line
+        // shared: a node that is not penalized — every node, nearly always —
+        // reads a zero and writes nothing. The store is for the node that just
+        // answered while serving a penalty, which is how a recovered node
+        // returns to rotation without waiting the deadline out.
+        if self.penalty.until_s.load(Ordering::Relaxed) != 0 {
+            self.penalty.until_s.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Holds the node out of rotation after a failed attempt.
+    ///
+    /// `retry_after_s` is what the upstream asked for on a 429, or `0` when it
+    /// asked for nothing; the longer of it and [`PENALTY_SECS`] wins, so a
+    /// provider can extend its own cooldown but never shorten it below what the
+    /// balancer would have applied anyway.
+    ///
+    /// The latency EMA is deliberately left alone: a node coming out of a
+    /// penalty keeps the estimate it had when it broke, so it re-enters at the
+    /// back of its tier and is offered a request only once the nodes ahead of it
+    /// are busy. That is a probation period at the cost of not writing a field.
+    pub fn penalize(&self, at: Instant, retry_after_s: u32) {
+        let until_s = seconds_since_start(at).saturating_add(PENALTY_SECS.max(retry_after_s));
+
+        self.penalty.until_s.store(until_s, Ordering::Relaxed);
     }
 }
 
@@ -288,23 +408,88 @@ mod tests {
     }
 
     #[test]
-    fn a_new_node_starts_healthy_with_no_measured_latency() {
+    fn a_new_node_carries_no_measurement_and_no_penalty() {
         let node = node_with(1, 1, "http://localhost:9").unwrap();
 
-        // Assumed up until the first probe says otherwise, and sorted last by
-        // `Topology::rank` until one measures it.
-        assert!(
-            node.status
-                .healthy
-                .load(std::sync::atomic::Ordering::Relaxed)
-        );
-        assert_eq!(
-            node.status
-                .latency
-                .load(std::sync::atomic::Ordering::Relaxed),
-            u32::MAX
-        );
+        // Nothing has measured it, so `Topology::rank` sorts it last and the
+        // request path offers it a request only once the measured nodes have
+        // turned one down.
+        assert_eq!(node.latency.ema_us.load(Ordering::Relaxed), UNMEASURED);
+        assert!(!node.is_penalized(0));
         assert_eq!(node.id, 0, "the real slot is handed out by assign_ids");
+    }
+
+    #[test]
+    fn the_first_answer_sets_the_average_rather_than_averaging_the_sentinel() {
+        // Folding `UNMEASURED` into the average would leave the node reading as
+        // multi-second for its first several answers, i.e. dead last in the
+        // ranking long after it started answering in microseconds.
+        let node = node_with(1, 1, "http://localhost:9").unwrap();
+
+        node.observe_answer(Instant::now());
+
+        let first = node.latency.ema_us.load(Ordering::Relaxed);
+        assert!(first < 1_000_000, "first sample was averaged in: {first}");
+    }
+
+    #[test]
+    fn the_average_converges_on_a_steady_latency() {
+        let node = node_with(1, 1, "http://localhost:9").unwrap();
+        node.latency.ema_us.store(80_000, Ordering::Relaxed);
+
+        // A stream of near-instant answers has to pull the average down; with
+        // `alpha = 1/8` thirty samples is well past the time constant.
+        for _ in 0..30 {
+            node.observe_answer(Instant::now());
+        }
+
+        let ema = node.latency.ema_us.load(Ordering::Relaxed);
+        assert!(ema < 8_000, "average did not converge downwards: {ema}");
+    }
+
+    #[test]
+    fn a_penalty_expires_on_its_own() {
+        let node = node_with(1, 1, "http://localhost:9").unwrap();
+        let at = Instant::now();
+        let now_s = seconds_since_start(at);
+
+        node.penalize(at, 0);
+
+        assert!(node.is_penalized(now_s), "penalty did not take effect");
+        assert!(
+            !node.is_penalized(now_s + PENALTY_SECS),
+            "penalty outlived its deadline"
+        );
+    }
+
+    #[test]
+    fn retry_after_extends_a_penalty_but_cannot_cut_it_short() {
+        let node = node_with(1, 1, "http://localhost:9").unwrap();
+        let at = Instant::now();
+        let now_s = seconds_since_start(at);
+
+        node.penalize(at, PENALTY_SECS * 4);
+        assert!(node.is_penalized(now_s + PENALTY_SECS * 3), "upstream asked for longer and was ignored");
+
+        // The other direction: a provider asking for one second must not buy
+        // itself a shorter cooldown than the balancer would have applied.
+        node.penalty.until_s.store(0, Ordering::Relaxed);
+        node.penalize(at, 1);
+        assert!(node.is_penalized(now_s + PENALTY_SECS - 1));
+    }
+
+    #[test]
+    fn an_answer_clears_a_standing_penalty() {
+        // Reached when every node is penalized at once: the router fails open,
+        // offers the request anyway, and the node answers. Leaving the penalty
+        // standing would keep the whole balancer failing open until it expired.
+        let node = node_with(1, 1, "http://localhost:9").unwrap();
+        let at = Instant::now();
+
+        node.penalize(at, 0);
+        node.observe_answer(at);
+
+        assert!(!node.is_penalized(seconds_since_start(at)));
     }
 
     #[tokio::test]
@@ -344,21 +529,32 @@ mod tests {
 
     #[test]
     fn the_hot_cells_sit_on_cache_lines_of_their_own() {
-        // The whole point of `#[repr(align(64))]` on `NodeLimits` and
-        // `NodeStatus`: a health round writing `status` must not invalidate the
-        // line the router reads `limits` from. Dropping the attribute, or
-        // putting either field back behind an `Arc`, breaks this silently.
+        // Three different traffic patterns, three lines. `limits` is written by
+        // every admission, `latency` by every answer, `penalty` is read by every
+        // request and written almost never. Sharing a line, the answers would
+        // invalidate the penalty on every core that is only reading it.
+        // Dropping the attribute, or putting a field back behind an `Arc`,
+        // breaks this silently.
         let node = node_with(1, 1, "http://localhost:9").unwrap();
 
-        let limits = std::ptr::from_ref(&node.limits).addr();
-        let status = std::ptr::from_ref(&node.status).addr();
+        let cells = [
+            ("limits", std::ptr::from_ref(&node.limits).addr()),
+            ("latency", std::ptr::from_ref(&node.latency).addr()),
+            ("penalty", std::ptr::from_ref(&node.penalty).addr()),
+        ];
 
-        assert_eq!(limits % 64, 0, "limits are not on a line boundary");
-        assert_eq!(status % 64, 0, "status is not on a line boundary");
-        assert!(
-            limits.abs_diff(status) >= 64,
-            "limits and status share a cache line"
-        );
+        for (name, address) in cells {
+            assert_eq!(address % 64, 0, "{name} is not on a line boundary");
+        }
+
+        for (i, (left, right)) in cells.iter().zip(&cells[1..]).enumerate() {
+            assert!(
+                left.1.abs_diff(right.1) >= 64,
+                "{} and {} share a cache line (pair {i})",
+                left.0,
+                right.0
+            );
+        }
     }
 
     #[tokio::test]
