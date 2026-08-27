@@ -33,6 +33,7 @@ use cascaderpc::{
 };
 use metrics_exporter_prometheus::PrometheusHandle;
 use reqwest::StatusCode;
+use reqwest::header::{HeaderValue, RETRY_AFTER};
 
 // ---------------------------------------------------------------------------
 // Request/response bodies
@@ -49,19 +50,16 @@ pub const SERVER_ERROR_BODY: &str =
     r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"server error"}}"#;
 /// Valid JSON with no `error` member — what `classify_response` treats as final.
 pub const NO_ERROR_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"result":"ok"}"#;
-/// What `get_health` accepts as a healthy node.
-pub const HEALTH_OK_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"result":"ok"}"#;
-/// Parses fine but `result != "ok"`, so the node is marked unhealthy while
-/// still reporting a real latency (unlike a node that never answers).
-pub const HEALTH_BAD_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"result":"behind"}"#;
 /// A JSON-RPC batch. The balancer does not support batching.
 pub const BATCH_BODY: &str = r#"[{"jsonrpc":"2.0","method":"getBalance","id":1}]"#;
-/// Says `ok` *and* carries an error member. The health check must read the
-/// error, not the result.
-pub const HEALTH_ERROR_BODY: &str =
-    r#"{"jsonrpc":"2.0","id":1,"result":"ok","error":{"code":-32000}}"#;
 /// A gateway error page: 200, but nothing a JSON-RPC client can read.
 pub const NOT_JSON_BODY: &str = "<html>502 Bad Gateway</html>";
+/// A rate-limit notice in plain text, the shape a gateway in front of a node
+/// answers a 429 with. Unparseable, so the router moves on to the next node.
+pub const RATE_LIMITED_BODY: &str = "429 Too Many Requests";
+/// A 429 body that *is* valid JSON and carries no JSON-RPC error member —
+/// nothing left for the router to act on, so it goes back to the client.
+pub const RATE_LIMITED_JSON_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"result":"rate limited"}"#;
 
 // ---------------------------------------------------------------------------
 // Mock upstream node
@@ -71,6 +69,8 @@ struct MockState {
     status: u16,
     body: &'static str,
     latency: Duration,
+    /// Sent as `Retry-After` when set, for the penalty path that reads it.
+    retry_after: Option<&'static str>,
     /// Answers 500 to this many requests before serving `body`, for testing
     /// the retry paths that only a transient failure reaches.
     fail_first: usize,
@@ -109,10 +109,19 @@ async fn handle_rpc(State(state): State<Arc<MockState>>) -> impl IntoResponse {
     state.in_flight.fetch_sub(1, Ordering::SeqCst);
 
     if seen < state.fail_first {
-        return (StatusCode::INTERNAL_SERVER_ERROR, "upstream is unwell");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "upstream is unwell").into_response();
     }
 
-    (StatusCode::from_u16(state.status).unwrap(), state.body)
+    let status = StatusCode::from_u16(state.status).unwrap();
+    let mut response = (status, state.body).into_response();
+
+    if let Some(seconds) = state.retry_after {
+        response
+            .headers_mut()
+            .insert(RETRY_AFTER, HeaderValue::from_static(seconds));
+    }
+
+    response
 }
 
 /// Spawns a mock RPC node on an ephemeral port that answers instantly.
@@ -131,11 +140,27 @@ pub async fn spawn_flaky_mock(body: &'static str, fail_first: usize) -> Mock {
     spawn_mock_flaky(200, body, Duration::ZERO, fail_first).await
 }
 
+/// Spawns a mock that answers `429` with a `Retry-After` of `seconds`, the way
+/// a provider signals its own cooldown.
+pub async fn spawn_rate_limited_mock(seconds: &'static str) -> Mock {
+    spawn_mock_inner(429, RATE_LIMITED_BODY, Duration::ZERO, 0, Some(seconds)).await
+}
+
 async fn spawn_mock_flaky(
     status: u16,
     body: &'static str,
     latency: Duration,
     fail_first: usize,
+) -> Mock {
+    spawn_mock_inner(status, body, latency, fail_first, None).await
+}
+
+async fn spawn_mock_inner(
+    status: u16,
+    body: &'static str,
+    latency: Duration,
+    fail_first: usize,
+    retry_after: Option<&'static str>,
 ) -> Mock {
     let requests = Arc::new(AtomicUsize::new(0));
     let max_in_flight = Arc::new(AtomicUsize::new(0));
@@ -143,6 +168,7 @@ async fn spawn_mock_flaky(
         status,
         body,
         latency,
+        retry_after,
         fail_first,
         requests: requests.clone(),
         in_flight: Arc::new(AtomicUsize::new(0)),
@@ -166,20 +192,6 @@ async fn spawn_mock_flaky(
         requests,
         max_in_flight,
     }
-}
-
-/// Mock that answers `getHealth` with `result: "ok"` after `latency`.
-///
-/// `get_health` times each probe out at 500ms, so `latency` must stay well
-/// under that or the node reads as unhealthy.
-pub async fn spawn_health_mock(latency: Duration) -> Mock {
-    spawn_mock_latency(200, HEALTH_OK_BODY, latency).await
-}
-
-/// Mock that answers, but with a `result` the health check rejects. The node
-/// ends up unhealthy *with a real latency*, unlike [`dead_url`].
-pub async fn spawn_unhealthy_mock() -> Mock {
-    spawn_mock(200, HEALTH_BAD_BODY).await
 }
 
 /// A URL nothing is listening on.

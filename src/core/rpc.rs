@@ -7,8 +7,9 @@
 //!
 //! What lives here is the state and the three operations that replace it whole:
 //! building it, reloading it, and seeding it from disk. Routing is in
-//! [`crate::core::router`], probing in [`crate::core::health`], and the node set
-//! itself in [`crate::core::topology`]; this module owns what all of them share.
+//! [`crate::core::router`], ranking in [`crate::core::ranking`], and the node
+//! set itself in [`crate::core::topology`]; this module owns what all of them
+//! share.
 
 use anyhow::Result;
 use arc_swap::ArcSwap;
@@ -17,7 +18,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use tokio::sync::Mutex;
 
 use crate::core::{
-    node::RpcNode,
+    node::{RpcNode, seconds_since_start},
     topology::{NodeHealth, Topology, assign_ids},
     upstream,
 };
@@ -36,7 +37,7 @@ pub struct RpcClient {
     /// One pooled HTTP client for every upstream. Its timeout is only a
     /// backstop — see [`crate::core::upstream`], where it is built.
     pub client: Client,
-    /// The live node set and routing order, republished whole by a health check
+    /// The live node set and routing order, republished whole by a ranking
     /// round or a reload. Read with `load()` on the request path, never locked.
     pub topology: Arc<ArcSwap<Topology>>,
     /// Usage counters, indexed by `node.id`. Billed on admission, before the
@@ -127,7 +128,7 @@ impl RpcClient {
     /// [`crate::quotas::period::rollover_if_new_period`] resolves them right
     /// after.
     ///
-    /// Overwrites the counters, so it must run before the healthcheck loop, the
+    /// Overwrites the counters, so it must run before the ranking loop, the
     /// flusher and the server are started.
     pub fn load_quotas(&self, quotas: &BTreeMap<String, NodeUsage>) {
         let mut periods = lock_periods(&self.periods);
@@ -140,13 +141,16 @@ impl RpcClient {
         }
     }
 
-    /// What the last health check round measured, per node.
+    /// What real traffic currently says about each node.
     ///
     /// Costs nothing and never dials an upstream, so the HTTP layer can answer
-    /// `/health` from it directly.
+    /// `/health` from it directly. The clock is read here, once per call, which
+    /// is an operator endpoint rather than the request path.
     #[must_use]
     pub fn health_snapshot(&self) -> Vec<NodeHealth> {
-        self.topology.load().health()
+        self.topology
+            .load()
+            .health(seconds_since_start(tokio::time::Instant::now()))
     }
 }
 
