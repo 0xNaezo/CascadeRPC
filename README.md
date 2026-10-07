@@ -213,17 +213,17 @@ Requires Rust (edition 2024). For a container instead, [`examples/basic_setup`](
 `docker compose up` with no API keys.
 
 ```bash
-git clone <repo-url> && cd cascaderpc
+git clone https://github.com/0xNaezo/CascadeRPC.git && cd CascadeRPC
 
 # 1. Configure nodes
 cp config/balancer_config/config.example.toml config/balancer_config/config.toml
 cp .env.example .env            # API keys, and CONFIG_PATH pointing at the config above
 
 # 2. Run
-cargo run --release
+cargo run --release --bin cascaderpc
 ```
 
-`CONFIG_PATH` is read from the environment (`.env` is loaded at startup), so pointing the balancer at a different config is `CONFIG_PATH=... cargo run --release` without touching the file.
+`CONFIG_PATH` is read from the environment (`.env` is loaded at startup), so pointing the balancer at a different config is `CONFIG_PATH=... cargo run --release --bin cascaderpc` without touching the file.
 
 Every node needs a `provider_pricing_path` - a node whose price list is missing or unreadable fails config load rather than routing unpriced traffic.
 
@@ -244,7 +244,7 @@ curl -s http://localhost:3000/health | jq
 cargo run --release --bin mock_node
 
 # Terminal 2: balancer pointed at the mocks
-CONFIG_PATH=config/balancer_config/mock_nodes.toml cargo run --release
+CONFIG_PATH=config/balancer_config/mock_nodes.toml cargo run --release --bin cascaderpc
 
 # Terminal 3: monitoring stack (Grafana on :3001, Prometheus on :9090)
 GRAFANA_ADMIN_PASSWORD=<password> docker compose -f monitoring/docker-compose.yml up -d
